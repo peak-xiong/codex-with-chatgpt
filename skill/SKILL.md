@@ -157,6 +157,19 @@ machine state, starts the one tunnel-owned `serve-machine --stdio` gateway, and
 reports the selected Tunnel identity without returning secrets. Do not copy the
 Skill into individual workspaces.
 
+For an update over a healthy existing machine installation, use the updated
+source entrypoint and reuse its protected configuration without asking the user
+for the original key-file path again:
+
+```sh
+c2c machine setup --reuse-existing --json
+```
+
+This mode requires an existing official Tunnel configuration and cannot be
+combined with `--tunnel-id` or `--runtime-key-file`. Use the first-time form
+with both explicit values only for initial setup, a tunnel change, or key
+rotation.
+
 In ChatGPT create exactly this connector:
 
 ```text

@@ -39,6 +39,7 @@ import {
   type SkillStatusResult,
 } from "../config/skill-install.js";
 import {
+  resolveMachineSetupOptions,
   runRollbackSteps,
   shouldRestorePreviousGateway,
   type RollbackStep,
@@ -423,13 +424,28 @@ const machine = program
 machine
   .command("setup")
   .description("Install and configure the official OpenAI Secure MCP Tunnel")
-  .requiredOption("--tunnel-id <id>", "OpenAI tunnel id")
-  .requiredOption("--runtime-key-file <path>", "file containing the tunnel runtime key")
+  .option("--tunnel-id <id>", "OpenAI tunnel id for first-time setup")
+  .option("--runtime-key-file <path>", "private runtime-key file for first-time setup")
+  .option("--reuse-existing", "reuse the installed tunnel id and protected runtime key", false)
   .option("--json", "machine-readable output", false)
-  .action(async (opts: { tunnelId: string; runtimeKeyFile: string; json: boolean }) => {
+  .action(async (opts: {
+    tunnelId?: string;
+    runtimeKeyFile?: string;
+    reuseExisting: boolean;
+    json: boolean;
+  }) => {
     try {
       const payload = await withMachineSetupLock(async () => {
         const previousConfig = readOpenAiTunnelConfig();
+        const setup = resolveMachineSetupOptions(opts, previousConfig);
+        if (setup.reuseExisting) {
+          const runtimeKey = fs.lstatSync(previousConfig!.runtimeKeyFile, { throwIfNoEntry: false });
+          if (!runtimeKey || runtimeKey.isSymbolicLink() || !runtimeKey.isFile()) {
+            throw new Error(
+              "The installed OpenAI tunnel runtime key is unavailable; provide a private key file explicitly",
+            );
+          }
+        }
         const previousConfigFile = snapshotPrivateFile(openAiTunnelConfigFile());
         const previousRuntimeKeyFile = snapshotPrivateFile(openAiTunnelRuntimeKeyPath());
         const previousGateway = await observeMachineRuntime();
@@ -451,12 +467,13 @@ machine
           skill = nextSkill;
           const binaryPath = await installOpenAiTunnelClient();
           const nextDraft = createOpenAiTunnelConfig({
-            tunnelId: opts.tunnelId,
+            tunnelId: setup.tunnelId,
             binaryPath,
+            runtimeKeyFile: setup.reuseExisting ? previousConfig!.runtimeKeyFile : undefined,
             associationId:
-              previousConfig?.tunnelId === opts.tunnelId ? previousConfig.associationId : undefined,
+              previousConfig?.tunnelId === setup.tunnelId ? previousConfig.associationId : undefined,
             associationNonce:
-              previousConfig?.tunnelId === opts.tunnelId ? previousConfig.associationNonce : undefined,
+              previousConfig?.tunnelId === setup.tunnelId ? previousConfig.associationNonce : undefined,
           });
           draft = nextDraft;
           const configChanged =
@@ -468,12 +485,14 @@ machine
             previousConfig.profileName !== nextDraft.profileName ||
             previousConfig.profileDir !== nextDraft.profileDir;
           requiresFreshRuntime = configChanged || nextRuntime.changed;
-          installOpenAiRuntimeKey(path.resolve(opts.runtimeKeyFile), nextDraft.runtimeKeyFile);
-          const installedRuntimeKey = fs.readFileSync(nextDraft.runtimeKeyFile);
-          const runtimeKeyChanged =
-            previousRuntimeKeyFile === null ||
-            !previousRuntimeKeyFile.bytes.equals(installedRuntimeKey);
-          requiresFreshRuntime ||= runtimeKeyChanged;
+          if (setup.runtimeKeySourceFile !== null) {
+            installOpenAiRuntimeKey(path.resolve(setup.runtimeKeySourceFile), nextDraft.runtimeKeyFile);
+            const installedRuntimeKey = fs.readFileSync(nextDraft.runtimeKeyFile);
+            const runtimeKeyChanged =
+              previousRuntimeKeyFile === null ||
+              !previousRuntimeKeyFile.bytes.equals(installedRuntimeKey);
+            requiresFreshRuntime ||= runtimeKeyChanged;
+          }
           if (requiresFreshRuntime && previousConfig) {
             oldSupervisorStopped = await stopMachineGateway({
               config: previousConfig,

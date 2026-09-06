@@ -1,10 +1,46 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  resolveMachineSetupOptions,
   runRollbackSteps,
   shouldRestorePreviousGateway,
 } from "../src/config/setup-transaction.js";
 
 describe("machine setup rollback", () => {
+  it("requires complete first-time credentials", () => {
+    expect(() => resolveMachineSetupOptions({ reuseExisting: false }, null)).toThrow(
+      /provide both --tunnel-id and --runtime-key-file/i,
+    );
+    expect(() => resolveMachineSetupOptions({
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      reuseExisting: false,
+    }, null)).toThrow(/provide both/i);
+    expect(resolveMachineSetupOptions({
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      runtimeKeyFile: "/private/runtime.key",
+      reuseExisting: false,
+    }, null)).toEqual({
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      runtimeKeySourceFile: "/private/runtime.key",
+      reuseExisting: false,
+    });
+  });
+
+  it("reuses an existing tunnel only when explicitly requested", () => {
+    const existing = { tunnelId: "tunnel_0123456789abcdef0123456789abcdef" };
+    expect(resolveMachineSetupOptions({ reuseExisting: true }, existing)).toEqual({
+      tunnelId: existing.tunnelId,
+      runtimeKeySourceFile: null,
+      reuseExisting: true,
+    });
+    expect(() => resolveMachineSetupOptions({ reuseExisting: true }, null)).toThrow(
+      /no existing OpenAI Secure MCP Tunnel configuration/i,
+    );
+    expect(() => resolveMachineSetupOptions({
+      reuseExisting: true,
+      tunnelId: existing.tunnelId,
+    }, existing)).toThrow(/cannot be combined/i);
+  });
+
   it("keeps a previously stopped Gateway stopped when its running supervisor is stopped", () => {
     expect(shouldRestorePreviousGateway("stopped", true)).toBe(false);
     expect(shouldRestorePreviousGateway("unknown", true)).toBe(false);

@@ -54,6 +54,21 @@ c2c autostart disable --json
 This command is currently supported on macOS LaunchAgents. It is optional on
 other platforms and does not change the machine connection itself.
 
+## Updating an existing installation without the original key-file path
+
+From the updated, clean source checkout, reuse the installed official Tunnel
+configuration and protected runtime key explicitly:
+
+```sh
+node bin/c2c.js machine setup --reuse-existing --json
+```
+
+Do not use the older globally installed entrypoint for this update. Reuse is
+rejected when the machine configuration or protected key is missing, and it
+cannot be combined with `--tunnel-id` or `--runtime-key-file`. In that case,
+complete first-time setup with both explicit values. A deliberate tunnel change
+or key rotation also requires both values.
+
 ## `machine setup` says the runtime key is invalid
 
 Pass the path to the file containing the OpenAI Secure MCP Tunnel runtime key:

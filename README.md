@@ -78,9 +78,13 @@ check the OS, Git, Node.js, Corepack, this task's in-app browser capability,
 and any existing C2C installation.
 Confirm the source directory before cloning and building. Preserve existing
 changes, installation settings, and sessions; do not overwrite or clean them.
-After preflight and a clean source build, pause and guide me through creating
-my own official Secure MCP Tunnel. Wait for my tunnel ID and the absolute path
-to a private runtime-key file.
+If a healthy C2C installation already uses an official Secure MCP Tunnel, reuse
+its installed tunnel ID and protected runtime key through
+`machine setup --reuse-existing`; do not recreate the tunnel or ask for the key
+again.
+Otherwise, after preflight and a clean source build, pause and guide me through
+creating my own official Secure MCP Tunnel. Wait for my tunnel ID and the
+absolute path to a private runtime-key file.
 Do not guess accounts, organizations, workspaces, tunnel IDs, or credentials.
 Do not inspect, display, or upload the key contents. If permissions, login,
 or consent are missing, explain the user action needed. Do not switch accounts,
@@ -93,8 +97,8 @@ references for Codex or users checking its work.
 
 | Operation | Responsible party |
 | --- | --- |
-| Choose the account/organization/workspace, create or select a cloud tunnel, associate the workspace | User confirms in OpenAI's official UI; an administrator may need to grant access |
-| Obtain the runtime key, save it privately, complete login and consent | User; share only the file path with Codex |
+| Choose the account/organization/workspace, create or select a cloud tunnel, associate the workspace | User confirms in OpenAI's official UI for first-time setup; an administrator may need to grant access |
+| Obtain the runtime key, save it privately, complete login and consent | User for first-time setup or key rotation; share only the file path with Codex |
 | Check the environment, build, install globally, run diagnostics | Codex executes locally, not in a ChatGPT conversation |
 | Create or reuse the ChatGPT connector | User in the confirmed ChatGPT workspace; Codex then verifies it |
 
@@ -146,9 +150,12 @@ Keep this checkout for future updates. `git status --short` must be empty
 before installation. If you have changes, preserve them or use a separate clean
 clone; do not reset or delete your work just to satisfy the installer.
 
-### 3. Create your own tunnel and prepare the key
+### 3. Create your own tunnel and prepare the key (first installation only)
 
 This stage happens in OpenAI's official UI, **not through local `machine setup`**.
+Skip it when preflight confirms a healthy existing C2C installation backed by
+the official Secure MCP Tunnel. Existing-install updates use the protected key
+already managed by C2C and must not recreate the tunnel or request its key again.
 
 1. Open [Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels)
    and confirm the account and intended organization in the organization
@@ -219,12 +226,25 @@ node bin/c2c.js machine setup \
   --runtime-key-file "/absolute/private/path/tunnel-runtime.key" --json
 ```
 
+For a healthy existing installation, use the updated source entrypoint and the
+explicit reuse mode instead. It does not read the key into the conversation or
+accept an arbitrary replacement path:
+
+```sh
+node bin/c2c.js machine setup --reuse-existing --json
+```
+
+`--reuse-existing` is rejected when no valid machine configuration exists and
+cannot be combined with `--tunnel-id` or `--runtime-key-file`. To change the
+tunnel or rotate its key, use the first-time form with both explicit values.
+
 Expect `ok: true` and `configured: true`. Setup deploys the verified runtime,
 installs the global Skill and `c2c` launcher, installs the project's pinned
-official tunnel client, privately copies the runtime key, and starts the one
-tunnel-owned gateway. **It does not create a cloud tunnel, associate a ChatGPT
-workspace, or create the ChatGPT connector**; the first two must already be
-completed in step 3.
+official tunnel client, and starts the one tunnel-owned gateway. The first-time
+form privately copies the supplied runtime key; reuse mode leaves the protected
+installed key in place. **Setup does not create a cloud tunnel, associate a
+ChatGPT workspace, or create the ChatGPT connector**; for first-time setup, the
+first two must already be completed in step 3.
 
 The official generic tutorial's `tunnel-client init/run` commands and sample
 MCP server are for standalone integrations. Here, `machine setup` manages
@@ -372,15 +392,15 @@ git status --short
 git pull --ff-only
 corepack pnpm install --frozen-lockfile
 corepack pnpm build
-node bin/c2c.js machine setup \
-  --tunnel-id "<YOUR_TUNNEL_ID>" \
-  --runtime-key-file "/absolute/private/path/tunnel-runtime.key" --json
+node bin/c2c.js machine setup --reuse-existing --json
 c2c skill status --json
 c2c machine doctor --no-fix --json
 ```
 
-Proceed past the status check only when it is empty. Use the same tunnel/key
-and keep the existing connector; updates do not require per-project installs.
+Proceed past the status check only when it is empty. Reuse the installed
+tunnel/key and keep the existing connector; updates do not require the original
+key-file path or per-project installs. Use the two-argument first-time form only
+for a deliberate tunnel change or key rotation.
 Run setup with the **updated source entrypoint** shown above, not the old
 installed `c2c`, which would reuse its own runtime. The Skill obtains fresh
 authorizations after restart and preserves established Project/chat mappings.
@@ -419,6 +439,7 @@ the machine-wide capacity of 100 active session/page leases.
 | --- | --- |
 | `corepack` or `c2c` not found | Install Corepack for your Node version; check the launcher and PATH from step 4 |
 | `machine setup` is an unknown command | Check the repository/branch and rebuild step 2; older OAuth releases use a different architecture |
+| `--reuse-existing` reports no configuration or key | This machine has no reusable official Tunnel setup; complete steps 3–4 with your own tunnel ID and private key-file path |
 | Installer requires clean Git source | Use a Git clone and preserve your changes before installing; a ZIP download is insufficient |
 | Tunnel absent in ChatGPT | Verify the selected account/workspace, tunnel association, and Read + Use permissions |
 | Machine not ready | Run `c2c machine doctor --no-fix --json`; check network/key permissions and the one managed client |

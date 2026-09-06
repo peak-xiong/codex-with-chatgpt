@@ -51,9 +51,22 @@ c2c machine setup \
   --runtime-key-file <runtime-key-file>
 ```
 
-This installs or updates the one global Skill, installs the pinned official
-OpenAI Secure MCP Tunnel client, stores its configuration in protected machine
-state, installs the runtime key by file copy, and starts the tunnel-owned child:
+That two-argument form is required for first-time setup, a tunnel change, or
+runtime-key rotation. To deploy an updated clean source revision over a healthy
+existing installation without requesting the original key-file path again, run:
+
+```sh
+c2c machine setup --reuse-existing
+```
+
+Reuse is explicit, requires an existing protected machine configuration, and
+cannot be combined with either first-time option. It preserves the tunnel
+association, protected runtime key, connector, and saved Project/chat routes.
+
+Both forms install or update the one global Skill and pinned official OpenAI
+Secure MCP Tunnel client, store configuration in protected machine state, and
+start the tunnel-owned child. First-time setup copies the supplied runtime key;
+reuse mode leaves the protected installed key in place:
 
 ```text
 c2c serve-machine --stdio --port 0

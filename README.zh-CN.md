@@ -64,8 +64,11 @@ Tunnel 认证或 C2C 的短期任务授权。本项目不调用模型 API，但�
 先阅读 README.zh-CN.md 的安装说明，检查操作系统、Git、Node.js、Corepack、
 当前任务的内置浏览器能力，以及已有的 C2C 安装。
 确认源码目录后再克隆和构建；保留已有修改、安装配置和会话，不覆盖或清理它们。
-完成前置检查和干净源码构建后暂停，指导我创建自己的官方 Secure MCP Tunnel，
-并等待我提供 Tunnel ID 和私有运行密钥文件的绝对路径。
+如果已有健康的 C2C 安装正在使用官方 Secure MCP Tunnel，通过
+`machine setup --reuse-existing` 复用已安装的 Tunnel ID 和受保护运行密钥；不要
+重建 Tunnel，也不要再次索要密钥。否则，完成前置检查和干净源码构建后暂停，指导我
+创建自己的官方 Secure MCP Tunnel，并等待我提供 Tunnel ID 和私有运行密钥文件的
+绝对路径。
 不要猜测账号、组织、工作区、Tunnel ID 或凭据，不要查看、回显或上传密钥内容。
 缺少权限或遇到登录、授权步骤时，说明需要我完成的操作；不要自行切换账号、
 扩大权限，或改用公网 URL、OAuth、其他隧道方案。
@@ -76,8 +79,8 @@ Tunnel 认证或 C2C 的短期任务授权。本项目不调用模型 API，但�
 
 | 操作 | 谁来完成 |
 | --- | --- |
-| 选择账号/组织/工作区，创建或选择云端 Tunnel，关联工作区 | 用户在 OpenAI 官方页面确认；缺少权限时联系管理员 |
-| 获取运行密钥并存入私有文件，完成登录和授权 | 用户操作；只把文件路径交给 Codex |
+| 选择账号/组织/工作区，创建或选择云端 Tunnel，关联工作区 | 首次安装时由用户在 OpenAI 官方页面确认；缺少权限时联系管理员 |
+| 获取运行密钥并存入私有文件，完成登录和授权 | 首次安装或轮换密钥时由用户操作；只把文件路径交给 Codex |
 | 检查环境、构建源码、全局安装、诊断 | Codex 在本地执行，不在 ChatGPT 对话中执行 |
 | 创建/复用 ChatGPT 连接器 | 用户在已确认的 ChatGPT 工作区中完成，随后由 Codex 验证 |
 
@@ -120,9 +123,11 @@ git status --short
 保留这个源码目录以便后续升级。安装前 `git status --short` 应无输出。已有修改时，
 先妥善保存，或另外克隆一份干净源码；不要为通过安装检查而重置或删除自己的工作。
 
-### 3. 创建自己的 Tunnel 并准备密钥文件
+### 3. 创建自己的 Tunnel 并准备密钥文件（仅首次安装）
 
 这一阶段在 OpenAI 官方页面完成，**不是本地 `machine setup` 的功能**。
+如果前置检查已经确认存在由官方 Secure MCP Tunnel 支撑的健康 C2C 安装，则跳过本节。
+升级时复用 C2C 已经保护保存的密钥，不重建 Tunnel，也不再次索要密钥。
 
 1. 打开 [Platform 的 Tunnel 设置](https://platform.openai.com/settings/organization/tunnels)，
    确认当前账号和左上方/组织选择器中的目标组织。页面位置可能变化，应以实际 UI 为准。
@@ -177,10 +182,22 @@ node bin/c2c.js machine setup \
   --runtime-key-file "/absolute/private/path/tunnel-runtime.key" --json
 ```
 
+已有健康安装时，改用更新后源码入口的显式复用模式。该模式不会把密钥读入对话，
+也不接受任意替换路径：
+
+```sh
+node bin/c2c.js machine setup --reuse-existing --json
+```
+
+没有有效机器配置时，`--reuse-existing` 会拒绝执行；它也不能和 `--tunnel-id`、
+`--runtime-key-file` 同时使用。需要更换 Tunnel 或轮换密钥时，必须使用同时提供
+两个显式参数的首次安装形式。
+
 预期返回 `ok: true`、`configured: true`。安装器会部署经校验的运行时，安装全局
-Skill 和 `c2c` 命令入口，安装本项目固定版本的官方 Tunnel 客户端，私密复制密钥，
-并启动唯一的 Tunnel 托管网关。**它不会创建云端 Tunnel、关联 ChatGPT 工作区，
-也不会在 ChatGPT 中创建连接器**；前两项必须已在第 3 步完成。
+Skill 和 `c2c` 命令入口，安装本项目固定版本的官方 Tunnel 客户端，并启动唯一的
+Tunnel 托管网关。首次安装形式会私密复制用户提供的密钥；复用模式保留已经保护保存的
+密钥。**安装器不会创建云端 Tunnel、关联 ChatGPT 工作区，也不会在 ChatGPT 中创建
+连接器**；首次安装时，前两项必须已在第 3 步完成。
 
 官方通用教程中的 `tunnel-client init/run` 和示例 MCP 服务用于独立接入。
 本项目由 `machine setup` 管理这些本地组件，**不要再并行执行那套示例**，也不要为
@@ -305,16 +322,16 @@ git status --short
 git pull --ff-only
 corepack pnpm install --frozen-lockfile
 corepack pnpm build
-node bin/c2c.js machine setup \
-  --tunnel-id "<YOUR_TUNNEL_ID>" \
-  --runtime-key-file "/absolute/private/path/tunnel-runtime.key" --json
+node bin/c2c.js machine setup --reuse-existing --json
 c2c skill status --json
 c2c machine doctor --no-fix --json
 ```
 
-只有状态检查无输出时才继续。使用同一个 Tunnel 和密钥，保留现有连接器，不必逐项目
-升级。安装命令必须使用上述**更新后源码的入口**，不要改为旧的全局 `c2c`，否则会
-复用它自身的旧运行时。重启后 Skill 取得新授权，既有 Project/Chat 映射仍保留。
+只有状态检查无输出时才继续。复用已安装的 Tunnel 和密钥，保留现有连接器；升级时
+不需要原始密钥文件路径，也不必逐项目升级。只有主动更换 Tunnel 或轮换密钥时才使用
+同时提供两个参数的首次安装形式。安装命令必须使用上述**更新后源码的入口**，不要改为
+旧的全局 `c2c`，否则会复用它自身的旧运行时。重启后 Skill 取得新授权，既有
+Project/Chat 映射仍保留。
 `c2c update-check --json` 只检查更新，不执行安装；`checked: false` 也不能证明已是最新版。
 
 ### macOS 登录后自动启动（可选）
@@ -343,6 +360,7 @@ c2c autostart disable --json
 | --- | --- |
 | 找不到 `corepack` 或 `c2c` | 安装适合当前 Node.js 的 Corepack；检查第 4 步的入口和 PATH |
 | 没有 `machine setup` 命令 | 检查仓库/分支并按第 2 步重新构建；旧 OAuth 版本是另一套架构 |
+| `--reuse-existing` 提示没有配置或密钥 | 当前机器没有可复用的官方 Tunnel 配置；使用自己的 Tunnel ID 和私有密钥文件路径完成第 3–4 步 |
 | 安装器要求干净 Git 源码 | 使用 Git 克隆并先保存自己的修改，不能用 ZIP 代替 |
 | ChatGPT 中看不到 Tunnel | 检查账号/工作区、Tunnel 关联和 Read + Use 权限 |
 | 机器未 ready | 执行 `c2c machine doctor --no-fix --json`，检查网络、密钥权限和唯一的托管客户端 |
