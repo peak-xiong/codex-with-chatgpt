@@ -12,14 +12,29 @@ writes, shell execution, tests, git operations, and recovery locally.
 
 ## ChatGPT-first delegation
 
-The default delegation policy is `CHATGPT_FIRST`:
+The default delegation policy is `CHATGPT_FIRST`, but only for evidence-closed
+subtasks whose required inputs are available to the ChatGPT page or its current
+authorized tools:
 
 - `RESEARCH` covers Web Search, current facts, external documentation, source
   comparison, and read-only workspace discovery.
 - `PLAN` covers architecture, implementation options, migrations, API design,
   documentation, and other synthesis based on MCP reads.
-- `REVIEW` covers recorded local status, diffs, tests, and bounded execution
-  output after Codex has executed locally.
+- `REVIEW` covers the current working-tree diff and execution evidence already
+  recorded for the same local session, task, and iteration.
+
+Task labels do not establish capability. The connector does not read arbitrary
+commits, refs, PR diffs, parent commits, historical source snapshots, sensitive
+files, or data outside the registered workspace. It also cannot edit files, run
+commands or tests, mutate Git/PR state, deploy services, change accounts or
+permissions, or verify final runtime success. Codex keeps those responsibilities
+and either performs them locally or prepares a bounded, verified workspace
+artifact before delegating only the remaining analysis.
+
+For mixed tasks, Codex first resolves refs and gathers or records missing
+evidence; ChatGPT then researches, plans, or reviews the supported read-only
+question; Codex finally applies changes and verifies the result. A known
+capability gap is not sent merely to produce a predictable `BLOCKED` response.
 
 Web Search is a built-in ChatGPT capability rather than a Connector MCP tool;
 the resulting answer still returns through `submit_control_result`. Control

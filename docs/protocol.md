@@ -442,6 +442,42 @@ verified `surface commit` operation may write the Project/chat route. Route
 fields that appear inside a checkpoint remain mirrors of the committed route
 and are never promoted to top-level session routing.
 
+## Delegation capability gate
+
+`CHATGPT_FIRST` applies to evidence-closed subtasks, not to broad business task
+names. Before creating a mailbox request, the host must map every required input
+and operation to a currently available page capability, C2C read tool, or
+approved read-only plugin operation.
+
+Supported delegation inputs are:
+
+- ChatGPT-native Web Search and external HTTP(S) sources actually consulted.
+- Bounded reads and searches in the currently registered workspace.
+- Current Git working-tree comparisons: unstaged, staged, or working tree versus
+  `HEAD`.
+- Execution records and bounded output already registered for the exact local
+  session, task, and iteration.
+- Task-scoped, preflight-approved third-party read operations.
+
+The host must not delegate operations that require arbitrary commit/ref/PR or
+merge-base resolution, historical source snapshots, another workspace,
+sensitive files, local writes, commands/tests, Git or PR mutations, deployment,
+account/permission changes, credentials, or final execution verification.
+Instead, split mixed work: Codex gathers and verifies local evidence, ChatGPT
+analyzes the evidence-closed question, and Codex executes and verifies the
+result.
+
+For a historical Git review, Codex may create a bounded workspace artifact only
+after resolving the requested ref and parent and verifying that it contains the
+complete changed-file list and diff. ChatGPT may review that artifact, but it
+does not resolve the ref, approve deployment, or claim that commit-matched source
+is available unless the host provided and verified it. If the evidence cannot
+be made complete, keep the review local and do not open a control request.
+
+Known missing capability or evidence is a host preflight failure, not a reason
+to create a request that is expected to return `BLOCKED`. `BLOCKED` remains the
+terminal result for a gap discovered after otherwise valid delegation.
+
 ## Capability contract
 
 For a control turn, the harness opens a mailbox request and issues a capability
@@ -463,6 +499,13 @@ localSessionId, taskId, iteration, phase
 requestId (required outside BOOT; forbidden for BOOT)
 compactionEpoch, generation, scopes, bootEpoch
 ```
+
+Use least-privilege scopes after the delegation gate passes. Web-only research
+needs only `c2c.result.write`; workspace analysis adds `workspace.read` and
+`workspace.search` plus `git.read` only when current Git state is relevant;
+execution review adds `execution.read` only when a matching record already
+exists. A scope authorizes a supported tool but does not create missing evidence
+or add arbitrary-ref Git access.
 
 To cancel before expiry:
 

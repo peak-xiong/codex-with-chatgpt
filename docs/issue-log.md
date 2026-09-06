@@ -21,6 +21,13 @@
 
 ## 最新回传验收修复
 
+- C2C-026 收紧 ChatGPT-first 分派：任务名称不再直接决定是否派发，必须先完成证据闭包
+  检查。ChatGPT 继续优先承担网页检索、当前工作区只读分析、规划、当前 working-tree
+  Diff 审查和同关联执行记录审查；任意 commit/ref/PR 历史审查、命令/测试、文件与
+  Git/PR 写入、部署、账号权限和最终验收留在 Codex。混合任务先由 Codex 解析 ref、
+  生成并核验受限证据，再只派发可完成的分析部分；已知缺口不再通过创建必然
+  `BLOCKED` 的请求来发现。
+
 - 针对 crush 工作区的验收报告，确认纯本地 RESEARCH 被 `sources.min(1)` 错误要求提供外部 URL。现在允许 `sources: []`，本地证据写入 conclusions 的相对文件路径/行号；仍拒绝 `workspace:/`、`file://` 和带凭据的外部 URL，不伪造引用。
 - `control open --json` 返回当前阶段的 `resultContract`，包含必需回传工具、合法 payload 示例和失败处理约束；Skill 与协议同步更新。逐消息检查 `submit_control_result` 实际可用性；状态工具可选，Codex 仍以精确 mailbox received/acknowledged 为准。
 - 本地 MCP SDK 测试覆盖两个工作区并行、每个工作区连续两轮本地读取和回传确认，验证工具仍列出且写入标注未被改为只读。这不等同于网页工具持续可用。
@@ -36,6 +43,7 @@
 | C2C-023 | 本地运行时更新后，ChatGPT 全局应用仍缓存旧 MCP schema | 要求在 Gateway 健康时对同一个全局应用执行 Manage > Refresh，并核对当前回调参数；真实刷新后已完成 received/acknowledged 验收，不创建或逐项目安装新 Connector。 |
 | C2C-024 | 宿主终态结果绕过新结果 16 KiB 聚合字节限制 | 页面解析与 mailbox 落盘前均复用新结果解析器；覆盖精确字节边界、UTF-8、无生命周期副作用和后续有效完成。历史结果只读上限保持 32 KiB。 |
 | C2C-025 | 安装提示把首次配置与已有安装升级混为一谈 | 新增显式 `machine setup --reuse-existing`，只在已有官方 Tunnel 配置和受保护密钥存在时复用；禁止与首次安装参数混用。中英文安装说明、协议、Skill 和排障文档区分首次安装、升级、Tunnel 更换及密钥轮换。 |
+| C2C-026 | ChatGPT-first 仅按任务类型分派，导致任意 commit/ref 审查和部署判定在已知工具缺口下仍被派发 | 增加证据闭包门禁、支持/禁止能力矩阵、最小 scope 指引及混合任务拆分；已知缺口留在 Codex，只有有效分派后才允许用 BLOCKED 报告新发现的缺口。 |
 
 ## 本机收口结果
 

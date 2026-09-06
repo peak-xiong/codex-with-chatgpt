@@ -20,29 +20,68 @@ command output into ChatGPT; it can read bounded data through MCP.
 
 ## ChatGPT-first delegation
 
-Classify every request before doing local analysis. When the task is answerable
-by the ChatGPT page or the connector's read-only MCP tools, open a correlated
-control turn and delegate it to the session's exact ChatGPT page. This keeps
-large research and discovery contexts out of the local Codex conversation.
+Delegate only an **evidence-closed subtask**: before opening a control turn,
+confirm that the ChatGPT page or the currently authorized tools can obtain every
+fact needed for the requested deliverable. A task name such as "review this PR"
+or "check the backend" is not enough. Known capability gaps must be handled or
+split locally before delegation; do not open a request merely to obtain a
+predictable `BLOCKED` result.
 
 - Use `RESEARCH` for current facts, external documentation, Web Search, source
-  comparison, and workspace discovery. ChatGPT may use its built-in Web Search;
-  that search is a ChatGPT capability, not a local MCP tool. Require concise
-  conclusions and any external HTTP(S) sources actually consulted. Local-only
-  research uses `sources: []` and cites relative files/lines in `conclusions`.
+  comparison, and current-workspace discovery. ChatGPT may use its built-in Web
+  Search; that search is a ChatGPT capability, not a local MCP tool. Require
+  concise conclusions and any external HTTP(S) sources actually consulted.
+  Local-only research uses `sources: []` and cites relative files/lines in
+  `conclusions`.
 - Use `PLAN` for architecture, implementation options, API design, migration
-  steps, documentation outlines, and other synthesis based on MCP reads.
-- Use `REVIEW` after local execution. Ask ChatGPT to inspect the recorded status,
-  diff, tests, and bounded output through MCP and return only actionable findings.
-- Do not duplicate ChatGPT's read-only searches or repeat large file reads in
-  the local Codex turn. Read locally only for routing/security checks,
-  implementation, execution, or final verification.
+  steps, documentation outlines, and synthesis only when every required input
+  is available through Web Search, bounded current-workspace reads, or an
+  explicitly authorized read-only plugin.
+- Use `REVIEW` only for the current working tree (`unstaged`, `staged`, or
+  working tree versus `HEAD`) and for execution evidence already registered for
+  the exact local session, task, and iteration. The connector cannot resolve or
+  read an arbitrary commit, branch, tag, PR diff, parent commit, or historical
+  source snapshot.
+- For a historical commit/ref/PR review, Codex must first resolve the ref and
+  parent, verify the changed-file inventory, and create a bounded workspace
+  artifact containing the complete review evidence. Delegate only the analysis
+  of that verified artifact; if commit-matched source is still unavailable,
+  keep the review local.
+- Do not duplicate ChatGPT's completed read-only searches or repeat large file
+  reads locally. Codex still performs routing/security checks, evidence
+  preparation, implementation, execution, and final verification.
 - Keep prompts small and results concise. The mailbox payload is bounded; prefer
   evidence, decisions, citations, and next actions over copied source text.
-- ChatGPT remains advisory and read-only. It must not edit files, run commands,
-  handle credentials, or replace local verification. If ChatGPT cannot complete
-  a delegable task, return `BLOCKED` or ask the user rather than silently
-  redoing the full analysis locally.
+- ChatGPT remains advisory and read-only. It must not edit files, run commands or
+  tests, mutate Git or PR state, deploy services, change accounts or permissions,
+  handle credentials, or make the final claim that an execution/deployment
+  succeeded. These responsibilities stay with Codex or the user.
+
+### Delegation capability gate
+
+Apply this gate before every `control open`:
+
+| Candidate subtask | Delegate when | Keep local when |
+| --- | --- | --- |
+| Web research and external comparison | ChatGPT Web Search is available and the answer can cite consulted HTTP(S) sources | Login, consent, unavailable search, or private data is required |
+| Current-workspace discovery and analysis | `workspace_info`, `list_directory`, `read_file`, or `search_workspace` can read all required inputs | The task needs another workspace, sensitive files, generated files outside the workspace, or command execution |
+| Planning and synthesis | All premises are covered by available web, workspace, or approved plugin reads | The plan depends on unresolved refs, runtime state, credentials, or uncollected evidence |
+| Working-tree review | `git_status` and `git_diff` cover the current unstaged/staged/HEAD comparison | The requested target is a commit, branch, tag, PR, merge base, or historical snapshot |
+| Execution review | `c2c record` already registered changed files, tests, and any bounded output for this exact session/task/iteration | No matching execution record exists, or ChatGPT would need to run/re-run a command |
+| Third-party read-only lookup | The exact tool and account were verified by the current-chat plugin preflight | The tool is missing, needs authorization, has unknown/write effects, or the account is unverified |
+
+For mixed tasks, split ownership instead of rejecting the whole task:
+
+1. Codex resolves refs, gathers missing evidence, records execution, and performs
+   all writes or commands.
+2. ChatGPT researches, compares, plans, or reviews only the evidence-closed
+   question.
+3. Codex consumes the mailbox result, makes the execution decision, applies
+   changes, and verifies the final state.
+
+If a required unsupported operation remains after splitting, do not delegate
+that subtask. Explain locally that it remains with Codex; `BLOCKED` is reserved
+for a capability or evidence failure discovered after a valid delegation.
 
 The delegation policy moves analysis work to ChatGPT; it does not grant new
 workspace permissions and does not change the one-page-per-session routing or
@@ -598,6 +637,18 @@ c2c control open \
 Save both `RESULT_REQUEST_ID` and `CONTEXT_ID`. An already-open request is
 never silently replaced; inspect or cancel it instead.
 
+Do not run `control open` until the delegation capability gate above passes.
+Select the smallest scopes that cover the evidence-closed subtask:
+
+- Web-only research: `c2c.result.write`.
+- Current-workspace research or planning: `workspace.read,workspace.search,git.read,c2c.result.write`.
+- Working-tree review: `workspace.read,workspace.search,git.read,c2c.result.write`.
+- Registered execution review: add `execution.read`.
+
+Tool scopes do not create missing evidence. In particular, `git.read` does not
+add arbitrary-ref support, and `execution.read` does not create a missing
+`c2c record` entry.
+
 Use the returned `deliveryPrompt` verbatim in the exact owned ChatGPT message,
 alongside the actual task question and any required plugin policy. It already
 contains this request's correlation, current delivery instructions and phase
@@ -670,9 +721,11 @@ with the `C2C_HOST_OBSERVED_RESULT` marker and one schema-valid allowed
 finish automatically without pretending an MCP receipt exists.
 ```
 
-For `EXECUTED`, record command, changed files, tests and output locally, then
-ask ChatGPT to inspect those records through MCP. Never paste the diff or claim
-a visible response is the result.
+For `EXECUTED`, record command, changed files, tests and output locally. Ask
+ChatGPT to inspect them only after confirming the exact record exists and the
+requested diff is one of the supported current-working-tree comparisons. Keep
+historical commit/ref review and missing-record diagnosis local. Never paste the
+diff or claim a visible response is the result.
 
 Wait on the same request. Before the first wait, read
 `<checkout>/docs/protocol.md`, "Waiting and terminal observations". Preserve
