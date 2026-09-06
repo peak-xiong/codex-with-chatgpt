@@ -101,6 +101,7 @@ function claimSurface(localSessionId: string, tabId = `tab-${localSessionId}`): 
   ]);
   expect(claimed.command.status).toBe(0);
   const lease = claimed.body.lease as { generation: number; tabId: string };
+  const bootRequestId = receiveBoot(localSessionId);
   const committed = runJson([
     "surface",
     "commit",
@@ -112,10 +113,42 @@ function claimSurface(localSessionId: string, tabId = `tab-${localSessionId}`): 
     String(lease.generation),
     "--tab-id",
     lease.tabId,
+    "--boot-request",
+    bootRequestId,
     "--chat-url",
     `https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/${localSessionId}`,
   ]);
   expect(committed.command.status).toBe(0);
+}
+
+function receiveBoot(localSessionId: string): string {
+  const taskId = `boot-${localSessionId}`;
+  const opened = runJson([
+    "control",
+    "open",
+    "-w",
+    workspace,
+    "--local-session",
+    localSessionId,
+    "--task",
+    taskId,
+    "--iteration",
+    "0",
+    "--phase",
+    "BOOT",
+  ]);
+  expect(opened.command.status, JSON.stringify(opened)).toBe(0);
+  const request = opened.body.request as { requestId: string };
+  submitControlResult(new Workspace(workspace).id, {
+    requestId: request.requestId,
+    localSessionId,
+    taskId,
+    iteration: 0,
+    phase: "BOOT",
+    kind: "BOOT",
+    payload: {},
+  });
+  return request.requestId;
 }
 
 describe("control CLI correlation", () => {
@@ -125,21 +158,42 @@ describe("control CLI correlation", () => {
     const args = ["--local-session", localSessionId, "--task", "task-observe", "--iteration", "0", "--phase", "PLAN"];
     const opened = runJson(["control", "open", ...args]);
     expect(opened.command.status).toBe(0);
-    expect(opened.body.wait).toMatchObject({ outcome: "pending", nextAction: "inspect_exact_response" });
+    expect(opened.body.wait).toMatchObject({ outcome: "pending", nextAction: "mark_send_attempted" });
     const request = opened.body.request as { requestId: string; expiresAt: string };
     const page = opened.body.surface as { tabId: string; chatUrl: string; generation: number };
     const lookup = [...args, "--request", request.requestId];
+    const pageIdentity = {
+      tabId: page.tabId,
+      generation: page.generation,
+      observedUrl: page.chatUrl,
+      observedAt: new Date().toISOString(),
+      responseToRequestId: request.requestId,
+    };
+    const sendAttempted = runJson(["control", "observe", ...lookup, "--page-observation", JSON.stringify({
+      ...pageIdentity, observationSequence: 1, state: "send_attempted",
+    })]);
+    expect(sendAttempted.command.status).toBe(0);
+    expect(sendAttempted.body.wait).toMatchObject({ nextAction: "confirm_send" });
+    const sent = runJson(["control", "observe", ...lookup, "--page-observation", JSON.stringify({
+      ...pageIdentity, observationSequence: 2, state: "sent",
+    })]);
+    expect(sent.command.status).toBe(0);
+    expect(sent.body.wait).toMatchObject({ nextAction: "inspect_response_start" });
+    const responseId = `response-${request.requestId}`;
+    const responseCreated = runJson(["control", "observe", ...lookup, "--page-observation", JSON.stringify({
+      ...pageIdentity, observationSequence: 3, responseId, state: "response_created",
+    })]);
+    expect(responseCreated.command.status).toBe(0);
+    expect(responseCreated.body.wait).toMatchObject({ nextAction: "inspect_exact_response" });
     const renewed = runJson(["control", "observe", ...lookup, "--page-observation", JSON.stringify({
-      tabId: page.tabId, generation: page.generation, observedUrl: page.chatUrl,
-      observedAt: new Date().toISOString(), responseToRequestId: request.requestId, state: "generating",
+      ...pageIdentity, observedAt: new Date().toISOString(), observationSequence: 4, responseId, state: "generating",
     })]);
     expect(renewed.command.status, JSON.stringify(renewed)).toBe(0);
     expect(renewed.body).toMatchObject({ status: "pending", requestId: request.requestId, wait: { nextAction: "inspect_exact_response" } });
     expect(Date.parse((renewed.body.request as { expiresAt: string }).expiresAt)).toBeGreaterThan(Date.parse(request.expiresAt));
     const observation = {
-      tabId: page.tabId, generation: page.generation, observedUrl: page.chatUrl,
-      observedAt: new Date().toISOString(), responseToRequestId: request.requestId,
-      state: "blocked", responseIsFinal: true, reason: "capability_invalid",
+      ...pageIdentity, observedAt: new Date().toISOString(), observationSequence: 5, responseId,
+      state: "final", responseIsFinal: true, reason: "capability_invalid",
       source: "model_reported", errorCode: "TOKEN_REVOKED",
       terminalResult: {
         kind: "BLOCKED",
@@ -253,6 +307,7 @@ describe("control CLI correlation", () => {
     expect((claimed.body.lease as Record<string, unknown>).chatUrl).toBeUndefined();
 
     const generation = (claimed.body.lease as { generation: number }).generation;
+    const bootRequestId = receiveBoot("session-project-candidate");
     const committed = runJson([
       "surface",
       "commit",
@@ -264,6 +319,8 @@ describe("control CLI correlation", () => {
       String(generation),
       "--tab-id",
       "tab-project-candidate",
+      "--boot-request",
+      bootRequestId,
       "--chat-url",
       "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/project-first-chat",
     ]);

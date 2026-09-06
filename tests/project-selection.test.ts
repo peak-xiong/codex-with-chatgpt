@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { validateProjectSelection } from "../src/session/project-selection.js";
 import { MachineGateway } from "../src/gateway/machine-gateway.js";
-import { cleanup, isolateStateDir, makeTmpDir, projectSelection } from "./helpers.js";
+import { cleanup, isolateStateDir, makeTmpDir, projectSelection, receiveBootResult } from "./helpers.js";
 
 const url = "https://chatgpt.com/g/g-p-test-project/project";
 const dirs: string[] = [];
@@ -31,9 +31,16 @@ describe("first Project provenance", () => {
     const restarted = new MachineGateway();
     const resumed = { ...restarted.registerWorkspace(root), localSessionId: identity.localSessionId };
     expect(restarted.surfaceGet(resumed).lease?.projectSelection?.source).toBe("user-confirmed");
-    restarted.surfaceCommit(resumed, candidate, { chatUrl: url.replace("/project", "/c/chat-a") });
+    const bootRequestId = receiveBootResult(restarted, resumed, candidate);
+    restarted.surfaceCommit(resumed, candidate, {
+      bootRequestId,
+      chatUrl: url.replace("/project", "/c/chat-a"),
+    });
     expect(restarted.surfaceGet(resumed).projectUrl).toBe(url);
-    expect(() => restarted.surfaceCommit(resumed, candidate, { chatUrl: url.replace("/project", "/c/chat-b") })).toThrow(/fresh generation/);
+    expect(() => restarted.surfaceCommit(resumed, candidate, {
+      bootRequestId,
+      chatUrl: url.replace("/project", "/c/chat-b"),
+    })).toThrow(/fresh generation/);
     expect(restarted.surfaceGet(resumed).binding?.chatUrl).toContain("chat-a");
     const turn = {
       workspaceId: resumed.workspaceId, projectId: resumed.projectId, registrationId: resumed.registrationId,

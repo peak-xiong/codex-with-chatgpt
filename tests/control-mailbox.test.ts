@@ -12,7 +12,10 @@ import {
   getControlResultStatus,
   openControlResultRequest,
   pruneControlMailbox,
+  recordControlHostFailure,
   reportControlProgress,
+  requireBootControlResult,
+  renewControlResultRequest,
   retireControlResultSession,
   submitControlResult,
   waitForControlResult,
@@ -86,6 +89,124 @@ afterEach(() => {
 });
 
 describe("control result mailbox", () => {
+  it("normalizes retained request, active, renewal, and host-failure records", () => {
+    const request = openControlResultRequest(WORKSPACE_A, {
+      localSessionId: "session-legacy",
+      ...correlation(),
+      ttlMs: 60_000,
+    });
+    const mailbox = getControlMailboxDir(WORKSPACE_A);
+    const requestPath = path.join(mailbox, "requests", `${request.requestId}.json`);
+    const activePath = path.join(mailbox, "active", "session-legacy.json");
+    const toLegacyRequest = (value: Record<string, unknown>) => {
+      const { surfaceGeneration: _surfaceGeneration, surfaceTabId: _surfaceTabId, ...legacy } = value;
+      return { ...legacy, schemaVersion: 1 };
+    };
+    const current = JSON.parse(fs.readFileSync(requestPath, "utf8")) as Record<string, unknown>;
+    const legacy = toLegacyRequest(current);
+    fs.writeFileSync(requestPath, JSON.stringify(legacy));
+    fs.writeFileSync(activePath, JSON.stringify(legacy));
+    renewControlResultRequest(
+      WORKSPACE_A,
+      request.requestId,
+      "session-legacy",
+      correlation(),
+      () => new Date(Date.now() + 120_000).toISOString(),
+    );
+    const renewalPath = path.join(mailbox, "renewals", `${request.requestId}.json`);
+    const renewal = JSON.parse(fs.readFileSync(renewalPath, "utf8")) as {
+      request: Record<string, unknown>;
+      expiresAt: string;
+    };
+    fs.writeFileSync(renewalPath, JSON.stringify({ request: legacy, expiresAt: renewal.expiresAt }));
+
+    submitControlResult(WORKSPACE_A, planInput(request.requestId, { localSessionId: "session-legacy" }));
+    expect(getActiveControlResultStatus(WORKSPACE_A, "session-legacy")).toMatchObject({
+      status: "received",
+      request: { schemaVersion: 2, surfaceGeneration: null, surfaceTabId: null },
+      result: { kind: "PLAN" },
+    });
+    expect(acknowledgeControlResult(
+      WORKSPACE_A,
+      request.requestId,
+      "session-legacy",
+      correlation(),
+    ).status).toBe("acknowledged");
+
+    const failed = openControlResultRequest(WORKSPACE_A, {
+      localSessionId: "session-legacy-failure",
+      ...correlation(1),
+    });
+    recordControlHostFailure(WORKSPACE_A, failed.requestId, "session-legacy-failure", correlation(1), {
+      tabId: "tab-legacy-failure",
+      generation: 1,
+      observedUrl: "https://chatgpt.com/g/g-p-example/c/chat-example",
+      observedAt: new Date().toISOString(),
+      responseToRequestId: failed.requestId,
+      observationSequence: 4,
+      responseId: "response-legacy-failure",
+      state: "final",
+      responseIsFinal: true,
+      reason: "callback_missing",
+      source: "host_observed",
+    });
+    const markerPath = path.join(mailbox, "cancelled", `${failed.requestId}.json`);
+    const marker = JSON.parse(fs.readFileSync(markerPath, "utf8")) as {
+      hostFailure: Record<string, unknown>;
+    };
+    const {
+      observationSequence: _observationSequence,
+      responseId: _responseId,
+      ...oldFailure
+    } = marker.hostFailure;
+    marker.hostFailure = { ...oldFailure, state: "blocked" };
+    fs.writeFileSync(markerPath, JSON.stringify(marker));
+    expect(getControlResultStatus(
+      WORKSPACE_A,
+      failed.requestId,
+      "session-legacy-failure",
+      correlation(1),
+    )).toMatchObject({
+      status: "cancelled",
+      hostFailure: { state: "final", responseId: `legacy-${failed.requestId}` },
+    });
+  });
+
+  it("does not promote a retained request with unknown tab identity into BOOT authority", () => {
+    const request = openControlResultRequest(WORKSPACE_A, {
+      localSessionId: "session-legacy-boot",
+      taskId: "boot-legacy",
+      iteration: 0,
+      phase: "BOOT",
+      surfaceGeneration: 7,
+      surfaceTabId: "tab-legacy-boot",
+    });
+    const requestPath = path.join(
+      getControlMailboxDir(WORKSPACE_A),
+      "requests",
+      `${request.requestId}.json`,
+    );
+    const stored = JSON.parse(fs.readFileSync(requestPath, "utf8")) as Record<string, unknown>;
+    const { surfaceTabId: _surfaceTabId, ...transitional } = stored;
+    fs.writeFileSync(requestPath, JSON.stringify({ ...transitional, schemaVersion: 1 }));
+    submitControlResult(WORKSPACE_A, {
+      requestId: request.requestId,
+      localSessionId: "session-legacy-boot",
+      taskId: "boot-legacy",
+      iteration: 0,
+      phase: "BOOT",
+      kind: "BOOT",
+      payload: {},
+    });
+    expect(() => requireBootControlResult(
+      WORKSPACE_A,
+      request.requestId,
+      "session-legacy-boot",
+      7,
+      "tab-legacy-boot",
+    )).toThrow(/candidate surface generation/);
+  });
+
   it("preserves unconsumed results beyond request TTL and discovers their exact correlation", () => {
     const request = openControlResultRequest(WORKSPACE_A, { localSessionId: "session-a", ...correlation() });
     const receipt = submitControlResult(WORKSPACE_A, planInput(request.requestId));
@@ -98,6 +219,33 @@ describe("control result mailbox", () => {
     acknowledgeControlResult(WORKSPACE_A, request.requestId, "session-a", correlation());
     expect(getActiveControlResultStatus(WORKSPACE_A, "session-a")).toBeNull();
     expect(pruneControlMailbox(WORKSPACE_A, eightDaysLater)).toBe(1);
+  });
+
+  it("does not replace a received result after TTL until the consumer acknowledges it", () => {
+    const startedAt = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(startedAt);
+    const request = openControlResultRequest(WORKSPACE_A, {
+      localSessionId: "session-a",
+      ...correlation(),
+      ttlMs: 1_000,
+    });
+    submitControlResult(WORKSPACE_A, planInput(request.requestId));
+    clock.mockReturnValue(startedAt + 1_001);
+
+    expect(() => openControlResultRequest(WORKSPACE_A, {
+      localSessionId: "session-a",
+      ...correlation(1),
+    })).toThrow(/unfinished request/);
+    expect(getActiveControlResultStatus(WORKSPACE_A, "session-a")).toMatchObject({
+      requestId: request.requestId,
+      status: "received",
+    });
+
+    acknowledgeControlResult(WORKSPACE_A, request.requestId, "session-a", correlation());
+    expect(openControlResultRequest(WORKSPACE_A, {
+      localSessionId: "session-a",
+      ...correlation(1),
+    }).requestId).not.toBe(request.requestId);
   });
 
   it("opens a request and accepts one structured result", () => {

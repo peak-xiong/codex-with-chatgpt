@@ -410,17 +410,19 @@ c2c surface claim \
 
 If a saved chat exists, add `--chat-url <chat-url>`. The lease records
 `tabId`, Project URL, optional chat URL, owner epoch, expiry and `generation`,
-but does not persist a candidate route. Issue a least-privilege BOOT context
-from the captured registration before the boot check:
+but does not persist a candidate route. Open a least-privilege BOOT mailbox
+request and capability before the boot check:
 
 ```sh
-c2c machine context issue \
-  --workspace-id <workspaceId> --project-id <projectId> \
-  --registration-id <registrationId> \
+c2c control open \
   --local-session <localSessionId> --task <bootTaskId> \
-  --iteration 0 --phase BOOT --generation <generation> \
-  --scopes workspace.read --ttl-ms 300000 --json
+  --iteration 0 --phase BOOT \
+  --scopes workspace.read,c2c.result.write --ttl-ms 300000 --json
 ```
+
+Save its exact `RESULT_REQUEST_ID`, `CONTEXT_ID`, `deliveryPrompt`, and
+candidate `generation`. BOOT uses the same protected mailbox lifecycle as
+other phases; page text and host observations cannot authorize a route commit.
 
 Renew long waits with `c2c surface renew --generation <generation> --tab-id
 <exact-tab-id>`. Release uses the same exact pair. To replace a live, expired,
@@ -480,9 +482,11 @@ or clear the checkpoint for recoverable page failures.
 
 Use exact replacement generation/tab flags from the latest surface view. Reuse
 an already claimed candidate after interruption and revalidate it; reject stale
-observations and commits. Run BOOT on the candidate, cancel BOOT, then commit its
-verified chat URL. A replacement gets a fresh context; resume only the unresolved
-question. See `<checkout>/docs/protocol.md`, "Page recovery", for the lifecycle.
+observations and commits. Run BOOT on the candidate, receive its MCP result, then
+commit the verified chat URL with that exact BOOT request. A failed BOOT is
+cancelled before releasing the candidate. A replacement gets a fresh context;
+resume only the unresolved question. See `<checkout>/docs/protocol.md`, "Page
+recovery", for the lifecycle.
 
 ### Page model selection
 
@@ -497,36 +501,36 @@ through semantic UI before sending; if unavailable, report that limitation.
 Every new conversation must be in Chat mode, not Work mode. If a visible
 switcher shows Work, create a new Chat conversation from the Project page.
 
-Send the boot prompt from `docs/protocol.md` after claiming the page. Include
-the returned BOOT `CONTEXT_ID` and require it as `context_id` for every tool
-call. Then
-verify with:
+Send the BOOT `deliveryPrompt` from `control open` verbatim after claiming the
+page. Add the expected workspace ID, Project ID, workspace name and this check:
 
 ```text
 Use the "Codex with ChatGPT" connector: call workspace_info and read one
-hello-style top-level file. Reply with workspaceId, projectId and workspace name
-only after they match the expected registered workspace.
+hello-style top-level file. Only after workspaceId, projectId and workspace name
+match the expected registered workspace, submit kind BOOT with payload {} through
+submit_control_result. If they do not match, submit BLOCKED. Do this before the
+final page reply.
 ```
 
-Confirm both opaque IDs match the captured registration, and independently
-confirm the observed Project/chat URL. A workspace name alone is insufficient.
-If either check fails, cancel the BOOT
-context, release the candidate lease, and do not save the URL or issue a
-control turn. A boot check has no mailbox request; inspect only the answer
-paired with that exact prompt, never the latest answer.
+Accept only a `received` BOOT mailbox result for the exact request and candidate
+generation, and independently confirm the observed Project/chat URL. A workspace
+name or page answer alone is insufficient. A `BLOCKED`, host-observed terminal
+result, missing callback, mismatched URL or stale generation fails verification.
+Cancel the exact pending BOOT request when necessary, release the candidate
+lease, and do not save the URL or issue another control turn.
 
 After a successful check, inspect the current page URL. If ChatGPT created the
 first conversation, it must be a `/g/<project>/c/<chat>` URL belonging to the
-claimed Project. Revoke the BOOT context and commit the exact verified lease
-through the coordinated surface operation, supplying that observed URL.
-`surface commit` also saves the
-Project/chat route for this local session:
+claimed Project. Commit the exact verified lease through the coordinated surface
+operation, supplying that observed URL and the real BOOT mailbox request.
+`surface commit` atomically verifies and acknowledges that BOOT receipt, revokes
+its remaining capability, and saves the Project/chat route for this local session:
 
 ```sh
-c2c machine context cancel --context-id <bootContextId> --json
 c2c surface commit \
   --local-session <localSessionId> \
   --generation <generation> --tab-id <exact-tab-id> \
+  --boot-request <boot-request-id> \
   --chat-url <observed-chat-url> --json
 ```
 
@@ -741,10 +745,30 @@ c2c control wait \
 
 Each call waits at most 30 seconds; this is an automatic host check interval,
 not a task deadline or a handoff to the user. Tasks may run for half an hour
-or longer. After a pending slice, follow
-`wait.nextAction`: for `inspect_exact_response`, resolve the exact owned tab
-and inspect only the response paired with this request's prompt and its
-generation state. Never classify quoted historical BLOCKED text or another
+or longer. After a pending slice, follow `wait.nextAction` exactly:
+
+- `mark_send_attempted`: record `send_attempted` immediately before the send.
+- `confirm_send`: after the same-tab URL check, record `sent` only when the
+  semantic send action succeeded.
+- `inspect_response_start`: record `response_created` with the exact new
+  `responseId` when it appears. Record `response_start_failed` only when the
+  exact send exposes an explicit send or response error, with `evidence` set to
+  `explicit_send_error` or `explicit_response_error`. A temporarily absent
+  response remains `unknown` and is rechecked automatically.
+- `inspect_exact_response`: record `generating`, `final`, or `unknown` for that
+  same `responseId`.
+
+Every event carries a strictly increasing `observationSequence`. `unknown`
+does not advance the last confirmed lifecycle stage, so the next action remains
+the check required by that stage. Exact replays
+are idempotent; never reuse a sequence for different evidence, skip a required
+transition, or replace the response identity. `page_lost` and
+`authority_invalid` are terminal observations for the affected session only.
+Use `authority_invalid` only after the exact request capability actually
+returned a revoked, expired, or stale-binding error; the Gateway rejects it
+while any matching capability remains live.
+Resolve the exact owned tab and inspect only the response paired with this
+request's prompt. Never classify quoted historical BLOCKED text or another
 response as this turn's failure. This is a bounded health check, not the normal
 result-reading path; do not repeatedly read the full conversation.
 

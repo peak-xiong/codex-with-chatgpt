@@ -14,7 +14,11 @@ import {
 describe("control result prompt contract", () => {
   it.each(CONTROL_PHASES)("supplies schema-valid examples for every allowed %s result", (phase) => {
     const contract = controlResultContract(phase);
-    expect(contract.requiredTools).toEqual(["submit_control_result"]);
+    expect(contract.requiredTools).toEqual(
+      phase === "BOOT"
+        ? ["workspace_info", "read_file", "submit_control_result"]
+        : ["submit_control_result"],
+    );
     expect(contract.examples.map((example) => example.kind)).toEqual(allowedKindsForPhase(phase));
     for (const example of contract.examples) {
       expect(parseControlResultSubmission(example)).toMatchObject(example);
@@ -34,9 +38,11 @@ describe("control result prompt contract", () => {
 
   it.each(CONTROL_PHASES)("renders all %s delivery instructions with the exact runtime correlation", (phase) => {
     const request = {
-      schemaVersion: 1 as const, requestId: "request-fixture", workspaceId: "workspace-fixture",
+      schemaVersion: 2 as const, requestId: "request-fixture", workspaceId: "workspace-fixture",
       localSessionId: "session-fixture", taskId: "task-fixture", iteration: 7, phase,
       allowedKinds: allowedKindsForPhase(phase),
+      surfaceGeneration: 1,
+      surfaceTabId: "tab-fixture",
       createdAt: "2026-01-01T00:00:00.000Z", expiresAt: "2026-01-01T00:30:00.000Z",
     };
     const contextId = "synthetic-context-for-test";

@@ -12,6 +12,7 @@ import {
 } from "./helpers.js";
 import { threadSessionFile } from "../src/session/state.js";
 import { Workspace } from "../src/workspace/manager.js";
+import { submitControlResult } from "../src/control/mailbox.js";
 
 const projectRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const cliEntry = path.join(projectRoot, "src", "cli", "index.ts");
@@ -42,6 +43,31 @@ function runJson(stateDir: string, args: string[]): { command: CliResult; body: 
   const command = runCli(stateDir, [...args, "--json"]);
   const lines = command.stdout.trim().split("\n").filter(Boolean);
   return { command, body: JSON.parse(lines.at(-1) ?? "{}") as Record<string, any> };
+}
+
+function receiveBootForCliSurface(
+  stateDir: string,
+  workspace: string,
+  workspaceId: string,
+  localSessionId: string,
+): string {
+  const taskId = `boot-${localSessionId}`;
+  const opened = runJson(stateDir, [
+    "control", "open", "-w", workspace, "--local-session", localSessionId,
+    "--task", taskId, "--iteration", "0", "--phase", "BOOT",
+  ]);
+  expect(opened.command.status, JSON.stringify(opened)).toBe(0);
+  const requestId = opened.body.request.requestId as string;
+  submitControlResult(workspaceId, {
+    requestId,
+    localSessionId,
+    taskId,
+    iteration: 0,
+    phase: "BOOT",
+    kind: "BOOT",
+    payload: {},
+  });
+  return requestId;
 }
 
 describe("machine CLI lifecycle", () => {
@@ -109,6 +135,12 @@ describe("machine CLI lifecycle", () => {
       "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/session-cli-machine",
     ]);
     expect(claimed.command.status).toBe(0);
+    const bootRequestId = receiveBootForCliSurface(
+      stateDir,
+      workspace,
+      identity.workspaceId,
+      "session-cli-machine",
+    );
     const committed = runJson(stateDir, [
       "surface",
       "commit",
@@ -120,6 +152,8 @@ describe("machine CLI lifecycle", () => {
       String(claimed.body.lease.generation),
       "--tab-id",
       "tab-cli-machine",
+      "--boot-request",
+      bootRequestId,
       "--chat-url",
       "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/session-cli-machine",
     ]);
@@ -178,15 +212,10 @@ describe("machine CLI lifecycle", () => {
     expect(missingRequest.body.error).toMatch(/request/);
 
     const issued = runJson(stateDir, [
-      "machine",
-      "context",
-      "issue",
-      "--workspace-id",
-      identity.workspaceId,
-      "--project-id",
-      identity.projectId,
-      "--registration-id",
-      identity.registrationId,
+      "control",
+      "open",
+      "-w",
+      workspace,
       "--local-session",
       "session-cli-machine",
       "--task",
@@ -195,12 +224,8 @@ describe("machine CLI lifecycle", () => {
       "0",
       "--phase",
       "PLAN",
-      "--request",
-      "request-cli-machine",
       "--compaction-epoch",
       "0",
-      "--generation",
-      "1",
       "--scopes",
       "workspace.read,c2c.result.write",
     ]);
@@ -254,7 +279,7 @@ describe("machine CLI lifecycle", () => {
       ok: true,
       retired: true,
       revokedContexts: 0,
-      mailbox: { activeRequestCleared: false },
+      mailbox: { activeRequestCleared: true },
     });
 
     const unregistered = runJson(stateDir, [
@@ -341,9 +366,16 @@ describe("machine CLI lifecycle", () => {
       "--tab-id", "tab-cli-reconcile", "--project-url", projectUrl, "--chat-url", chatUrl,
     ]);
     expect(claimed.command.status).toBe(0);
+    const bootRequestId = receiveBootForCliSurface(
+      stateDir,
+      workspace,
+      registration.workspaceId,
+      localSessionId,
+    );
     const committed = runJson(stateDir, [
       "surface", "commit", "-w", workspace, "--local-session", localSessionId,
       "--generation", String(claimed.body.lease.generation), "--tab-id", "tab-cli-reconcile",
+      "--boot-request", bootRequestId,
       "--chat-url", chatUrl,
     ]);
     expect(committed.command.status).toBe(0);

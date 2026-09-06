@@ -196,11 +196,6 @@ function parseControlPhase(value: string): ControlPhase {
   return phase as ControlPhase;
 }
 
-function parseMachinePhase(value: string): "BOOT" | ControlPhase {
-  const phase = value.trim().toUpperCase();
-  return phase === "BOOT" ? phase : parseControlPhase(phase);
-}
-
 function parseControlCorrelation(opts: {
   task: string;
   iteration: string;
@@ -819,7 +814,7 @@ machineContext
   .requiredOption("--iteration <n>")
   .requiredOption("--phase <phase>", "BOOT, RESEARCH, PLAN, or REVIEW")
   .requiredOption("--generation <n>")
-  .option("--request <id>", "exact mailbox request id (required for non-BOOT phases)")
+  .option("--request <id>", "exact mailbox request id (required for every phase)")
   .option("--compaction-epoch <n>", "compaction epoch", "0")
   .option("--local-session <id>")
   .option("--scopes <scope,...>")
@@ -845,12 +840,12 @@ machineContext
     json: boolean;
   }) => {
     try {
-      const phase = parseMachinePhase(opts.phase);
-      if (phase !== "BOOT" && opts.request === undefined) {
-        throw new Error("--request is required for non-BOOT machine context turns");
-      }
+      const phase = parseControlPhase(opts.phase);
       const workspace = new Workspace(resolveWorkspace());
       assertCurrentWorkspaceIdentity(workspace, opts.workspaceId, opts.projectId);
+      if (opts.request === undefined) {
+        throw new Error("--request is required for every machine context turn, including BOOT");
+      }
       const runtime = (await ensureMachineGateway()).runtime;
       const grant = await issueMachineTurn(runtime, {
         workspaceId: opts.workspaceId,
@@ -860,9 +855,7 @@ machineContext
         taskId: validateControlId(opts.task, "task id"),
         iteration: parseControlIteration(opts.iteration),
         phase,
-        requestId: opts.request
-          ? validateControlId(opts.request, "request id")
-          : undefined,
+        requestId: validateControlId(opts.request, "request id"),
         scopes: parseScopes(opts.scopes),
         modelId: opts.modelId,
         effort: opts.effort,
@@ -1197,6 +1190,7 @@ surface
   .requiredOption("--generation <n>", "exact verified page generation")
   .requiredOption("--tab-id <id>", "exact verified in-app browser tab id")
   .requiredOption("--chat-url <url>", "observed ChatGPT chat URL created inside that Project")
+  .requiredOption("--boot-request <id>", "exact BOOT mailbox request received through MCP")
   .option("--json", "machine-readable output", false)
   .action(async (opts: {
     workspace?: string;
@@ -1204,6 +1198,7 @@ surface
     generation: string;
     tabId: string;
     chatUrl: string;
+    bootRequest: string;
     json: boolean;
   }) => {
     try {
@@ -1217,6 +1212,7 @@ surface
         throw new Error("generation or tab-id does not match the current surface lease");
       }
       const { binding, session: saved } = await commitMachineSurface(machine.runtime, machine.identity, lease, {
+        bootRequestId: validateControlId(opts.bootRequest, "BOOT request id"),
         chatUrl: opts.chatUrl,
         connectorName: OPENAI_CONNECTOR_NAME,
       });
@@ -1526,19 +1522,21 @@ control
       const page = surface.lease;
       if (!page) throw new Error("Claim this local session's ChatGPT page before opening a control turn.");
       const binding = surface.binding;
-      if (
+      if (correlation.phase !== "BOOT" && (
         !binding ||
         binding.lastGeneration !== page.generation ||
         binding.tabId !== page.tabId ||
         binding.projectUrl !== page.projectUrl ||
         binding.chatUrl !== page.chatUrl
-      ) {
+      )) {
         throw new Error("Commit this local session's verified ChatGPT page before opening a control turn.");
       }
       const plugins = opts.plugins?.split(",").map((id) => id.trim());
       const pluginIntent = pluginIntentSchema.parse(opts.pluginIntent ?? "task");
-      const scopes = pluginIntent === "identity-discovery" && opts.scopes === undefined
-        ? ["c2c.result.write"] : parseScopes(opts.scopes);
+      const scopes = correlation.phase === "BOOT" && opts.scopes === undefined
+        ? ["workspace.read", "c2c.result.write"]
+        : pluginIntent === "identity-discovery" && opts.scopes === undefined
+          ? ["c2c.result.write"] : parseScopes(opts.scopes);
       const pluginPreflight = opts.pluginPreflight === undefined ? undefined : pluginPreflightSchema.parse(JSON.parse(opts.pluginPreflight));
       if (pluginIntent === "task" && pluginPreflight?.plugins.some((plugin) => plugin.usesGitHub || /github/i.test(plugin.id))) {
         const identity = inspectRepositoryIdentity(workspace.root, opts.githubRemote);

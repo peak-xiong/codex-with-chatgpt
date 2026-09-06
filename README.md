@@ -491,7 +491,7 @@ Every control turn receives a short-lived `CONTEXT_ID`. Its binding includes:
 ```text
 machine boot + workspaceId + projectId + registrationId
 localSessionId + taskId + iteration + phase
-requestId (required outside BOOT; absent for BOOT)
+requestId (required for every phase, including BOOT)
 compactionEpoch + page generation + requested scopes
 ```
 

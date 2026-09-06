@@ -25,9 +25,9 @@ import {
   getActiveControlResultStatus,
   getControlResultStatus,
   openControlResultRequestWithStatus,
+  observeControlResultRequest,
   reportControlProgress,
-  recordControlHostFailure,
-  renewControlResultRequest,
+  requireBootControlResult,
   retireControlResultSession,
   submitControlResult,
   waitForControlResult,
@@ -69,7 +69,12 @@ import {
   type VerifiedSurfaceRouteCommit,
   SurfaceOwnershipError,
 } from "../session/surface-ownership.js";
-import { normalizeChatUrl, normalizeProjectUrl } from "../session/state.js";
+import {
+  normalizeChatUrl,
+  normalizeProjectUrl,
+  projectIdFromChatUrl,
+  projectIdFromUrl,
+} from "../session/state.js";
 import { parseControlPageObservation, type ControlPageObservation } from "../control/wait-policy.js";
 
 export type SurfaceGenerationValidator = (binding: TurnCapabilityBinding) => void;
@@ -143,6 +148,14 @@ export interface MachineSurfaceView {
   binding: SurfaceBinding | null;
   control: ControlStatus | null;
 }
+
+export type MachineSurfaceCommitOptions = Omit<
+  CommitVerifiedSurfaceRouteOptions,
+  "lease" | "workspaceId"
+> & {
+  /** Exact structured BOOT request whose MCP receipt authorizes this route. */
+  bootRequestId: string;
+};
 
 export interface MachineSurfaceRetireResult extends RetireSurfaceSessionResult {
   /** Number of live turn capabilities revoked before ownership cleanup. */
@@ -273,7 +286,7 @@ export class MachineGateway {
   surfaceCommit(
     identity: MachineSurfaceIdentity,
     lease: SurfaceLeaseRef,
-    options: Omit<CommitVerifiedSurfaceRouteOptions, "lease" | "workspaceId">,
+    options: MachineSurfaceCommitOptions,
   ): VerifiedSurfaceRouteCommit {
     assertChatGPTSurfaceIdentity(lease.browserId, lease.surfaceId);
     this.assertSurfaceMutationAllowed(identity.projectId, identity.localSessionId);
@@ -281,7 +294,35 @@ export class MachineGateway {
     if (lease.projectId !== identity.projectId || lease.localSessionId !== identity.localSessionId) {
       throw new Error("surface lease does not belong to the registered local session");
     }
-    return commitVerifiedSurfaceRoute({ lease, workspaceId: identity.workspaceId, ...options, requireProjectSelection: true });
+    const { bootRequestId, ...routeOptions } = options;
+    const boot = requireBootControlResult(
+      identity.workspaceId,
+      bootRequestId,
+      identity.localSessionId,
+      lease.generation,
+      lease.tabId,
+    );
+    const committed = commitVerifiedSurfaceRoute({
+      lease,
+      workspaceId: identity.workspaceId,
+      ...routeOptions,
+      requireProjectSelection: true,
+    });
+    if (boot.status === "received") {
+      acknowledgeControlResult(identity.workspaceId, bootRequestId, identity.localSessionId, {
+        taskId: boot.request!.taskId,
+        iteration: boot.request!.iteration,
+        phase: "BOOT",
+      });
+    }
+    this.broker.revokeRequest({
+      ...identity,
+      taskId: boot.request!.taskId,
+      iteration: boot.request!.iteration,
+      phase: "BOOT",
+      requestId: bootRequestId,
+    });
+    return committed;
   }
 
   surfaceRenew(identity: MachineSurfaceIdentity, lease: SurfaceLeaseRef, leaseTtlMs?: number): SurfaceLease {
@@ -333,6 +374,24 @@ export class MachineGateway {
    */
   issueTurn(input: IssueTurnCapabilityInput): TurnCapabilityGrant {
     this.registry.lookup(input.workspaceId, input.projectId, input.registrationId);
+    if ((["BOOT", "RESEARCH", "PLAN", "REVIEW"] as const).includes(input.phase as ControlPhase)) {
+      const control = getControlResultStatus(
+        input.workspaceId,
+        input.requestId,
+        input.localSessionId,
+        { taskId: input.taskId, iteration: input.iteration, phase: input.phase as ControlPhase },
+      );
+      if (
+        control.status !== "pending" ||
+        (control.request?.surfaceGeneration !== null &&
+          control.request?.surfaceGeneration !== input.generation)
+      ) {
+        throw new TurnCapabilityError(
+          "BINDING_MISMATCH",
+          "turn capability must bind the exact pending mailbox request and current surface generation",
+        );
+      }
+    }
     if (input.plugins?.length) requireCurrentTurnSurface(input);
     assessPluginPreflight(input, input.plugins?.length
       ? currentSurfaceLease(input.projectId, input.localSessionId) : null, this.broker.bootEpoch);
@@ -420,9 +479,15 @@ export class MachineGateway {
     input: Omit<OpenControlResultRequestInput, "localSessionId"> & { localSessionId?: never },
   ): OpenControlResultRequestStatus {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
+    const surface = currentSurfaceLease(
+      identity.projectId,
+      identity.localSessionId,
+    );
     return openControlResultRequestWithStatus(identity.workspaceId, {
       ...input,
       localSessionId: identity.localSessionId,
+      surfaceGeneration: surface?.generation,
+      surfaceTabId: surface?.tabId,
     });
   }
 
@@ -468,7 +533,16 @@ export class MachineGateway {
     expected: ControlResultCorrelation,
   ): ControlStatus {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
-    return cancelControlResultRequest(identity.workspaceId, requestId, identity.localSessionId, expected);
+    const status = cancelControlResultRequest(
+      identity.workspaceId,
+      requestId,
+      identity.localSessionId,
+      expected,
+    );
+    if (status.status === "cancelled") {
+      this.broker.revokeRequest({ ...identity, ...expected, requestId });
+    }
+    return status;
   }
 
   observeControlPage(
@@ -480,43 +554,107 @@ export class MachineGateway {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
     const observation = parseControlPageObservation(input);
     const status = this.getControlResultStatus(identity, requestId, expected);
+    if (status.status !== "pending" && status.status !== "cancelled") return status;
+    if (
+      status.status === "pending" &&
+      observation.state === "authority_invalid" &&
+      this.broker.hasLiveRequest({ ...identity, ...expected, requestId })
+    ) {
+      throw new TurnCapabilityError(
+        "BINDING_MISMATCH",
+        "authority-invalid observation conflicts with a live capability for this request",
+      );
+    }
+    const lease = currentSurfaceLease(identity.projectId, identity.localSessionId);
     const binding = currentSurfaceBinding(identity.projectId, identity.localSessionId);
     const observedAt = Date.parse(observation.observedAt);
-    const observedUrl = new URL(observation.observedUrl);
-    const canonicalChatUrl = normalizeChatUrl(observation.observedUrl);
+    const observedUrl = "observedUrl" in observation && observation.observedUrl
+      ? new URL(observation.observedUrl)
+      : null;
+    const canonicalChatUrl = observedUrl ? normalizeChatUrl(observedUrl.toString()) : null;
+    const canonicalProjectUrl = observedUrl ? normalizeProjectUrl(observedUrl.toString()) : null;
     const now = Date.now();
+    const requestSurfaceMatches = Boolean(
+      status.request &&
+      status.request.surfaceGeneration === observation.generation &&
+      (
+        status.request.surfaceTabId === observation.tabId ||
+        (
+          status.request.surfaceTabId === null &&
+          binding?.lastGeneration === observation.generation &&
+          binding.tabId === observation.tabId
+        )
+      ),
+    );
+    const liveLeaseMatches = Boolean(
+      lease &&
+      lease.tabId === observation.tabId &&
+      lease.generation === observation.generation,
+    );
+    const mayCloseWithoutLiveLease =
+      observation.state === "page_lost" ||
+      observation.state === "authority_invalid" ||
+      (status.status === "cancelled" && status.hostFailure !== undefined);
+    const bootProjectUrl = status.request?.phase === "BOOT"
+      ? lease?.projectUrl ?? currentProjectUrl(identity.projectId)
+      : null;
+    const candidateBootRoute = Boolean(
+      bootProjectUrl &&
+      (
+        canonicalProjectUrl === bootProjectUrl ||
+        (canonicalChatUrl && projectIdFromChatUrl(canonicalChatUrl) === projectIdFromUrl(bootProjectUrl))
+      ),
+    );
+    const committedRoute = Boolean(
+      binding &&
+      binding.lastGeneration === observation.generation &&
+      binding.chatUrl &&
+      canonicalChatUrl === binding.chatUrl,
+    );
     if (
-      !status.request || observation.responseToRequestId !== requestId || !binding ||
-      binding.tabId !== observation.tabId || binding.lastGeneration !== observation.generation ||
-      !binding.chatUrl || canonicalChatUrl !== binding.chatUrl ||
-      observedUrl.username || observedUrl.password || observedUrl.search || observedUrl.hash ||
+      !status.request || observation.responseToRequestId !== requestId ||
+      !requestSurfaceMatches || (!liveLeaseMatches && !mayCloseWithoutLiveLease) ||
+      (observedUrl !== null && (
+        observedUrl.username || observedUrl.password || observedUrl.search || observedUrl.hash ||
+        (!candidateBootRoute && !committedRoute)
+      )) ||
       observedAt < Date.parse(status.request.createdAt) || observedAt < now - 60_000 || observedAt > now + 5_000
     ) {
       throw new TurnCapabilityError("BINDING_MISMATCH", "page observation does not match this request's current response and owned page");
     }
-    if (observation.state === "unknown" || status.status !== "pending") return status;
     if (this.controlSubmissionSessions.has(this.controlSessionKey(identity.projectId, identity.localSessionId))) {
       return status;
     }
     this.assertSurfaceMutationAllowed(identity.projectId, identity.localSessionId);
-    if (observation.state === "generating") {
-      const lease = requireSurfaceGeneration(identity.projectId, identity.localSessionId, observation.generation);
-      return renewControlResultRequest(identity.workspaceId, requestId, identity.localSessionId, expected, () => {
-        const expiresAt = this.broker.keepAliveRequest({
-          ...identity, ...expected, requestId, generation: observation.generation,
-        }, observedAt);
-        this.surfaceRenew(identity, lease, Math.max(1_000, Date.parse(lease.leaseExpiresAt) - Date.parse(lease.updatedAt)));
-        return expiresAt;
-      });
+    try {
+      const resolved = observeControlResultRequest(
+        identity.workspaceId,
+        requestId,
+        identity.localSessionId,
+        expected,
+        observation,
+        observation.state === "generating" ? () => {
+          if (!lease || !liveLeaseMatches) {
+            throw new TurnCapabilityError("LEASE_NOT_FOUND", "generating observation requires the exact live surface lease");
+          }
+          const expiresAt = this.broker.keepAliveRequest({
+            ...identity, ...expected, requestId, generation: observation.generation,
+          }, observedAt);
+          this.surfaceRenew(identity, lease, Math.max(1_000, Date.parse(lease.leaseExpiresAt) - Date.parse(lease.updatedAt)));
+          return expiresAt;
+        } : undefined,
+      );
+      if (resolved.status === "cancelled") {
+        this.broker.revokeRequest({ ...identity, ...expected, requestId });
+      }
+      return resolved;
+    } catch (error) {
+      const latest = this.getControlResultStatus(identity, requestId, expected);
+      if (latest.status === "cancelled") {
+        this.broker.revokeRequest({ ...identity, ...expected, requestId });
+      }
+      throw error;
     }
-    if (observation.state !== "blocked") return status;
-    const resolved = recordControlHostFailure(identity.workspaceId, requestId, identity.localSessionId, expected, {
-      ...observation, observedUrl: binding.chatUrl,
-    });
-    if (resolved.status === "cancelled") {
-      this.broker.revokeRequest({ ...identity, ...expected, requestId });
-    }
-    return resolved;
   }
 
   /**
@@ -692,7 +830,7 @@ export class MachineGateway {
     const binding = bindingForStatus(this.broker, contextId);
     if (
       binding.requestId === undefined ||
-      (binding.phase !== "RESEARCH" && binding.phase !== "PLAN" && binding.phase !== "REVIEW")
+      (binding.phase !== "BOOT" && binding.phase !== "RESEARCH" && binding.phase !== "PLAN" && binding.phase !== "REVIEW")
     ) {
       throw new TurnCapabilityError("BINDING_MISMATCH", "turn capability is not bound to a control result request");
     }

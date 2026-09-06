@@ -122,15 +122,12 @@ describe("turn capability broker", () => {
     expect(lease.leaseId).toMatch(/^c2c_lease_[A-Za-z0-9_-]{43}$/);
   });
 
-  it("requires an exact mailbox request outside BOOT and forbids one during BOOT", () => {
+  it("requires an exact mailbox request for every phase including BOOT", () => {
     const broker = new TurnCapabilityBroker();
 
     expectCode(() => broker.issue(binding({ requestId: undefined })), "INVALID_BINDING");
-    expectCode(
-      () => broker.issue(binding({ phase: "BOOT", requestId: "request-a" })),
-      "INVALID_BINDING"
-    );
-    expect(() => broker.issue(binding({ phase: "BOOT", requestId: undefined }))).not.toThrow();
+    expect(() => broker.issue(binding({ phase: "BOOT", requestId: "request-a" }))).not.toThrow();
+    expectCode(() => broker.issue(binding({ phase: "BOOT", requestId: undefined as never })), "INVALID_BINDING");
   });
 
   it("accepts only frozen lease objects issued by the same broker instance", () => {

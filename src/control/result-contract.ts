@@ -9,6 +9,7 @@ import {
 /** Prompt scaffolds, not results or proof that a page can call these tools. */
 export function controlResultContract(phase: ControlPhase) {
   const examples = {
+    BOOT: {},
     RESEARCH: {
       question: "<the requested question>",
       summary: "<concise answer based on observed evidence>",
@@ -43,7 +44,9 @@ export function controlResultContract(phase: ControlPhase) {
 
   return {
     phase,
-    requiredTools: ["submit_control_result"],
+    requiredTools: phase === "BOOT"
+      ? ["workspace_info", "read_file", "submit_control_result"]
+      : ["submit_control_result"],
     instructions: [
       "Use the Codex with ChatGPT connector in this exact message. Check that submit_control_result is callable now, not merely mentioned in history, before doing research or analysis.",
       "When get_control_result_status is callable, call it with context_id only and proceed only for the bound pending request. Its absence alone does not block submission; Codex owns mailbox status and acknowledgment.",
@@ -55,6 +58,9 @@ export function controlResultContract(phase: ControlPhase) {
       "If tools are unavailable or a platform approval/safety check blocks a call, stop this turn and report the observed failure; do not bypass it, switch apps or claim successful delivery. Submit BLOCKED only when that same tool is available and permitted.",
       "After an explicit safety/approval block or TOKEN_REVOKED, TOKEN_EXPIRED or STALE_BINDING_EPOCH, do not retry through another call or delivery channel. If no permitted final callback can be sent, finish with a short schema-valid {kind,payload} result under the host-observed marker supplied below so the host can reconcile; do not claim a mailbox receipt.",
       "Only the local mailbox received/acknowledged state proves delivery. A visible answer or successful read is not a receipt.",
+      ...(phase === "BOOT" ? [
+        "For BOOT, call workspace_info and read one bounded hello-style top-level file before submission. Submit kind BOOT with payload {} only after both reads succeed. Do not copy workspace identity into the payload; the gateway derives it from this capability.",
+      ] : []),
     ],
     examples: allowedKindsForPhase(phase).map((kind) => ({ kind, payload: examples[kind] })),
   };

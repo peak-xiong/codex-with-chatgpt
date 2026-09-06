@@ -202,7 +202,8 @@ Before a control message, the local harness:
    iteration, phase)`.
 3. Issues a capability bound to the same correlation, current registration,
    exact mailbox `requestId`, compaction epoch, surface generation and
-   requested scopes. BOOT alone has no mailbox request.
+   requested scopes. BOOT uses the same request binding and its receipt gates
+   the first route commit.
 4. Places `CONTEXT_ID` and `RESULT_REQUEST_ID` in the prompt sent to the owned
    chat.
 

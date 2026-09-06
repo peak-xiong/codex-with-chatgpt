@@ -32,7 +32,7 @@ import {
   currentSurfaceBinding,
   currentProjectUrl,
 } from "../src/session/surface-ownership.js";
-import { cleanup, isolateStateDir, makeTmpDir, projectSelection } from "./helpers.js";
+import { cleanup, isolateStateDir, makeTmpDir, projectSelection, receiveBootResult } from "./helpers.js";
 
 const PROJECT_URL = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
 const CHAT_URL = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/chat-retry";
@@ -106,15 +106,20 @@ describe("coordinated surface route commit", () => {
     });
 
     routeWriteFault.enabled = true;
+    const identity = {
+      workspaceId: registration.workspaceId,
+      projectId: registration.projectId,
+      registrationId: registration.registrationId,
+      localSessionId,
+    };
     expect(() => gateway.surfaceCommit(
-      {
-        workspaceId: registration.workspaceId,
-        projectId: registration.projectId,
-        registrationId: registration.registrationId,
-        localSessionId,
-      },
+      identity,
       lease,
-      { chatUrl: CHAT_URL, connectorName: "Codex with ChatGPT" },
+      {
+        bootRequestId: receiveBootResult(gateway, identity, lease),
+        chatUrl: CHAT_URL,
+        connectorName: "Codex with ChatGPT",
+      },
     )).toThrow(/injected session route write failure/);
     routeWriteFault.enabled = false;
 
@@ -163,7 +168,10 @@ describe("coordinated surface route commit", () => {
       ownerProcessEpoch: "owner-retire-reconcile",
       leaseTtlMs: 60_000,
     });
-    gateway.surfaceCommit(identity, lease, { connectorName: "Codex with ChatGPT" });
+    gateway.surfaceCommit(identity, lease, {
+      bootRequestId: receiveBootResult(gateway, identity, lease),
+      connectorName: "Codex with ChatGPT",
+    });
     updateSession(registration.workspaceId, localSessionId, {
       taskId: "task-retire-reconcile",
       iteration: 1,
@@ -227,7 +235,10 @@ describe("coordinated surface route commit", () => {
       ownerProcessEpoch: "owner-project-unregister",
       leaseTtlMs: 60_000,
     });
-    gateway.surfaceCommit(identity, lease, { connectorName: "Codex with ChatGPT" });
+    gateway.surfaceCommit(identity, lease, {
+      bootRequestId: receiveBootResult(gateway, identity, lease),
+      connectorName: "Codex with ChatGPT",
+    });
     updateSession(registered.workspaceId, localSessionId, {
       taskId: "task-project-unregister",
       iteration: 1,

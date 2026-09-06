@@ -14,6 +14,7 @@ import {
 import { startMachineGatewayServer, type MachineGatewayServer } from "../src/gateway/server.js";
 import { nullLogger } from "../src/logger/index.js";
 import { createMcpServer } from "../src/mcp/server.js";
+import { submitControlResult } from "../src/control/mailbox.js";
 import { cleanup, isolateStateDir, makeTmpDir, projectSelection } from "./helpers.js";
 
 const PROJECT_URL = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
@@ -137,11 +138,35 @@ describe("machine gateway session concurrency", () => {
     expect(new Set(claims.map(({ lease }) => lease.tabId)).size).toBe(SESSION_COUNT);
     expect(new Set(claims.map(({ lease }) => lease.generation)).size).toBe(SESSION_COUNT);
 
+    const bootRequests = await mapWithConcurrency(
+      sessions,
+      ADMIN_REQUEST_CONCURRENCY,
+      (session) => openMailboxRequest(server!.runtime, session.identity, {
+        taskId: `boot-${session.localSessionId}`,
+        iteration: 0,
+        phase: "BOOT",
+        ttlMs: FLOW_TTL_MS,
+      }),
+    );
+    sessions.forEach((session, index) => {
+      const request = bootRequests[index].request;
+      submitControlResult(session.identity.workspaceId, {
+        requestId: request.requestId,
+        localSessionId: session.localSessionId,
+        taskId: request.taskId,
+        iteration: 0,
+        phase: "BOOT",
+        kind: "BOOT",
+        payload: {},
+      });
+    });
+
     await mapWithConcurrency(
       sessions,
       ADMIN_REQUEST_CONCURRENCY,
       (session, index) =>
         commitSurface(server!.runtime, session.identity, claims[index].lease, {
+          bootRequestId: bootRequests[index].request.requestId,
           chatUrl: session.chatUrl,
           connectorName: "Codex with ChatGPT",
         }),

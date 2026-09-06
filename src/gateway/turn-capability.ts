@@ -60,8 +60,8 @@ export interface TurnCapabilityBinding {
   taskId: string;
   iteration: number;
   phase: string;
-  /** Exact mailbox request authorized by this control turn. BOOT has no mailbox request. */
-  requestId?: string;
+  /** Exact mailbox request authorized by this control turn, including BOOT. */
+  requestId: string;
   scopes: readonly string[];
   modelId?: string;
   effort?: string;
@@ -221,17 +221,7 @@ function normalizeBinding(input: TurnCapabilityBinding): TurnCapabilityBinding {
     throw new TurnCapabilityError("INVALID_BINDING", "turn binding is invalid");
   }
   const phase = safeString(input.phase, "phase");
-  const requestId = input.requestId === undefined
-    ? undefined
-    : safeString(input.requestId, "requestId");
-  if (phase === "BOOT" ? requestId !== undefined : requestId === undefined) {
-    throw new TurnCapabilityError(
-      "INVALID_BINDING",
-      phase === "BOOT"
-        ? "BOOT turn capability must not bind a mailbox request"
-        : "control turn capability must bind an exact mailbox request"
-    );
-  }
+  const requestId = safeString(input.requestId, "requestId");
   return Object.freeze({
     workspaceId: safeString(input.workspaceId, "workspaceId"),
     projectId: safeString(input.projectId, "projectId"),
@@ -410,6 +400,30 @@ export class TurnCapabilityBroker {
     }
     record.expiresAt = Math.max(record.expiresAt, Math.min(observedAt, now) + record.ttlMs);
     return new Date(record.expiresAt).toISOString();
+  }
+
+  /** Check whether any nonterminal capability still authorizes one exact request. */
+  hasLiveRequest(binding: TurnRequestBinding): boolean {
+    const expected = {
+      workspaceId: safeString(binding.workspaceId, "workspaceId"),
+      projectId: safeString(binding.projectId, "projectId"),
+      localSessionId: safeString(binding.localSessionId, "localSessionId"),
+      taskId: safeString(binding.taskId, "taskId"),
+      iteration: safeCounter(binding.iteration, "iteration"),
+      phase: safeString(binding.phase, "phase"),
+      requestId: safeString(binding.requestId, "requestId"),
+    };
+    this.prune(this.now());
+    return [...this.records.values()].some((record) =>
+      !this.isTombstone(record.state) &&
+      record.binding.workspaceId === expected.workspaceId &&
+      record.binding.projectId === expected.projectId &&
+      record.binding.localSessionId === expected.localSessionId &&
+      record.binding.taskId === expected.taskId &&
+      record.binding.iteration === expected.iteration &&
+      record.binding.phase === expected.phase &&
+      record.binding.requestId === expected.requestId
+    );
   }
 
   claim(token: string, expectedBinding: TurnCapabilityBinding, options: TurnClaimOptions = {}): TurnLease {

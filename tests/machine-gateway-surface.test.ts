@@ -8,7 +8,7 @@ import {
   reapExpiredSurfaceLeases,
   releaseSurface,
 } from "../src/session/surface-ownership.js";
-import { cleanup, isolateStateDir, makeTmpDir, projectSelection } from "./helpers.js";
+import { cleanup, isolateStateDir, makeTmpDir, projectSelection, receiveBootResult } from "./helpers.js";
 
 const PROJECT_URL = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
 const START = new Date();
@@ -50,6 +50,7 @@ function turn(
   localSessionId: string,
   generation: number,
   taskId: string,
+  requestId: string,
 ): TurnCapabilityBinding {
   return {
     workspaceId: registration.workspaceId,
@@ -59,10 +60,27 @@ function turn(
     taskId,
     iteration: 0,
     phase: "BOOT",
+    requestId,
     scopes: ["workspace.read"],
     compactionEpoch: 0,
     generation,
   };
+}
+
+function issueBootTurn(
+  gateway: MachineGateway,
+  registration: ReturnType<MachineGateway["registerWorkspace"]>,
+  localSessionId: string,
+  generation: number,
+  taskId: string,
+) {
+  const identity = { ...registration, localSessionId };
+  const { request } = gateway.openControlResultRequest(identity, {
+    taskId,
+    iteration: 0,
+    phase: "BOOT",
+  });
+  return { request, grant: gateway.issueTurn(turn(registration, localSessionId, generation, taskId, request.requestId)) };
 }
 
 describe("machine gateway surface invalidation", () => {
@@ -78,16 +96,18 @@ describe("machine gateway surface invalidation", () => {
       projectSelection: projectSelection(PROJECT_URL),
       chatUrl: chatUrl("old"), ownerProcessEpoch: "owner-recover", leaseTtlMs: 60000,
     });
-    gateway.surfaceCommit(identity, first, {});
+    gateway.surfaceCommit(identity, first, { bootRequestId: receiveBootResult(gateway, identity, first) });
     updateSession(registration.workspaceId, identity.localSessionId, {
       taskId: "keep-task", iteration: 2,
       checkpoint: { protocolState: "EXECUTED_LOCAL", originalGoal: "Keep completed work", completedSubtasks: "Tests ran" },
     });
     const other = surface(registration.projectId, "session-other", "tab-other");
-    const otherContext = gateway.issueTurn(turn(registration, "session-other", other.generation, "other-task"));
+    const otherContext = issueBootTurn(gateway, registration, "session-other", other.generation, "other-task").grant;
     const request = gateway.openControlResultRequest(identity, { taskId: "keep-task", iteration: 2, phase: "PLAN" });
     const context = gateway.issueTurn({
-      ...turn(registration, identity.localSessionId, first.generation, "keep-task"), iteration: 2,
+      ...turn(registration, identity.localSessionId, first.generation, "keep-task", request.request.requestId),
+      iteration: 2,
+      phase: "PLAN",
     });
     const replacement = {
       browserId: "iab", surfaceId: "chatgpt", tabId: replacementTab, projectUrl: PROJECT_URL,
@@ -114,7 +134,10 @@ describe("machine gateway surface invalidation", () => {
     expect(candidate.chatUrl).toBeUndefined();
     expect(gateway.turnStatus(context.token).status).toBe("revoked");
     expect(() => gateway.surfaceClaim(identity, { ...replacement, tabId: "stale-retry" })).toThrow();
-    gateway.surfaceCommit(identity, candidate, { chatUrl: chatUrl("new") });
+    gateway.surfaceCommit(identity, candidate, {
+      bootRequestId: receiveBootResult(gateway, identity, candidate),
+      chatUrl: chatUrl("new"),
+    });
     expect(gateway.surfaceGet(identity).binding?.tabId).toBe(replacementTab);
     expect(readSession(registration.workspaceId, identity.localSessionId)).toMatchObject({
       taskId: "keep-task", iteration: 2, url: chatUrl("new"),
@@ -168,7 +191,7 @@ describe("machine gateway surface invalidation", () => {
     const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
     const registration = gateway.registerWorkspace(root);
     const first = surface(registration.projectId, "session-rotation", "tab-one");
-    const context = gateway.issueTurn(turn(registration, "session-rotation", first.generation, "task-rotation"));
+    const context = issueBootTurn(gateway, registration, "session-rotation", first.generation, "task-rotation").grant;
 
     const rotated = surface(registration.projectId, "session-rotation", "tab-two", {
       chatUrl: chatUrl("chat-session-rotation-next"),
@@ -191,17 +214,95 @@ describe("machine gateway surface invalidation", () => {
       chatUrl: undefined,
     });
 
-    const boot = gateway.issueTurn(turn(registration, "session-candidate", candidate.generation, "task-boot"));
+    const bootTurn = issueBootTurn(gateway, registration, "session-candidate", candidate.generation, "task-boot");
+    const boot = bootTurn.grant;
     const claimedBoot = gateway.claimTurn(boot.token, ["workspace.read"]);
     expect(claimedBoot.workspace.id).toBe(registration.workspaceId);
     gateway.releaseTurn(boot.token, claimedBoot.lease);
 
+    submitControlResult(registration.workspaceId, {
+      requestId: bootTurn.request.requestId,
+      localSessionId: "session-candidate",
+      taskId: "task-boot",
+      iteration: 0,
+      phase: "BOOT",
+      kind: "BOOT",
+      payload: {},
+    });
+    acknowledgeControlResult(registration.workspaceId, bootTurn.request.requestId, "session-candidate", {
+      taskId: "task-boot", iteration: 0, phase: "BOOT",
+    });
+    const laterRequest = gateway.openControlResultRequest(
+      { ...registration, localSessionId: "session-candidate" },
+      { taskId: "task-later", iteration: 0, phase: "RESEARCH" },
+    );
     const later = gateway.issueTurn({
-      ...turn(registration, "session-candidate", candidate.generation, "task-later"),
+      ...turn(registration, "session-candidate", candidate.generation, "task-later", laterRequest.request.requestId),
       phase: "RESEARCH",
-      requestId: "request-later",
     });
     expectCode(() => gateway.claimTurn(later.token, ["workspace.read"]), "STALE_BINDING_EPOCH");
+  });
+
+  it("requires a real BOOT receipt and rejects host-observed or raw page evidence", () => {
+    cleanups.push(isolateStateDir());
+    const root = makeTmpDir("gateway-surface-boot-receipt");
+    cleanups.push(root);
+    const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
+    const registration = gateway.registerWorkspace(root);
+    const identity = { ...registration, localSessionId: "session-boot-receipt" };
+    const candidate = surface(registration.projectId, identity.localSessionId, "tab-boot-receipt");
+    const boot = issueBootTurn(gateway, registration, identity.localSessionId, candidate.generation, "task-boot-receipt");
+    const base = {
+      tabId: candidate.tabId,
+      generation: candidate.generation,
+      observedUrl: candidate.chatUrl!,
+      observedAt: new Date().toISOString(),
+      responseToRequestId: boot.request.requestId,
+    };
+    gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-boot-receipt", iteration: 0, phase: "BOOT",
+    }, { ...base, observationSequence: 1, state: "send_attempted" });
+    gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-boot-receipt", iteration: 0, phase: "BOOT",
+    }, { ...base, observationSequence: 2, state: "sent" });
+    gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-boot-receipt", iteration: 0, phase: "BOOT",
+    }, { ...base, observationSequence: 3, responseId: "response-boot-receipt", state: "response_created" });
+
+    expect(() => gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-boot-receipt", iteration: 0, phase: "BOOT",
+    }, {
+      ...base,
+      observationSequence: 4,
+      responseId: "response-boot-receipt",
+      state: "final",
+      responseIsFinal: true,
+      reason: "callback_missing",
+      source: "host_observed",
+      excerpt: "The page says BOOT succeeded",
+    } as never)).toThrow(/raw page text/);
+
+    const observed = gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-boot-receipt", iteration: 0, phase: "BOOT",
+    }, {
+      ...base,
+      observationSequence: 4,
+      responseId: "response-boot-receipt",
+      state: "final",
+      responseIsFinal: true,
+      reason: "callback_missing",
+      source: "host_observed",
+      terminalResult: { kind: "BOOT", payload: {} },
+    });
+    expect(observed).toMatchObject({
+      status: "cancelled",
+      result: null,
+      hostObservedResult: { provenance: "host_observed", result: { kind: "BOOT" } },
+    });
+    expect(() => gateway.surfaceCommit(identity, candidate, {
+      bootRequestId: boot.request.requestId,
+      chatUrl: candidate.chatUrl,
+    })).toThrow(/successful BOOT result received through MCP/);
   });
 
   it("revokes a context when its surface is released", () => {
@@ -211,7 +312,7 @@ describe("machine gateway surface invalidation", () => {
     const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
     const registration = gateway.registerWorkspace(root);
     const owned = surface(registration.projectId, "session-release", "tab-release");
-    const context = gateway.issueTurn(turn(registration, "session-release", owned.generation, "task-release"));
+    const context = issueBootTurn(gateway, registration, "session-release", owned.generation, "task-release").grant;
 
     expect(releaseSurface(owned, new Date(START.getTime() + 1_000))).toBe(true);
     expectCode(() => gateway.claimTurn(context.token, ["workspace.read"]), "STALE_BINDING_EPOCH");
@@ -224,10 +325,14 @@ describe("machine gateway surface invalidation", () => {
     cleanups.push(root);
     const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
     const registration = gateway.registerWorkspace(root);
-    const owned = surface(registration.projectId, "session-expiry", "tab-expiry", { leaseTtlMs: 1_000 });
-    const context = gateway.issueTurn(turn(registration, "session-expiry", owned.generation, "task-expiry"));
+    const claimedAt = new Date();
+    const owned = surface(registration.projectId, "session-expiry", "tab-expiry", {
+      leaseTtlMs: 1_000,
+      now: claimedAt,
+    });
+    const context = issueBootTurn(gateway, registration, "session-expiry", owned.generation, "task-expiry").grant;
 
-    expect(reapExpiredSurfaceLeases(registration.projectId, new Date(START.getTime() + 1_001))).toBe(1);
+    expect(reapExpiredSurfaceLeases(registration.projectId, new Date(claimedAt.getTime() + 1_001))).toBe(1);
     expectCode(() => gateway.claimTurn(context.token, ["workspace.read"]), "STALE_BINDING_EPOCH");
     expect(gateway.turnStatus(context.token).status).toBe("revoked");
   });
@@ -239,7 +344,7 @@ describe("machine gateway surface invalidation", () => {
     const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
     const registration = gateway.registerWorkspace(root);
     const owned = surface(registration.projectId, "session-renew", "tab-renew");
-    const context = gateway.issueTurn(turn(registration, "session-renew", owned.generation, "task-renew"));
+    const context = issueBootTurn(gateway, registration, "session-renew", owned.generation, "task-renew").grant;
     const claimed = gateway.claimTurn(context.token, ["workspace.read"]);
 
     expect(releaseSurface(owned, new Date(START.getTime() + 1_000))).toBe(true);
@@ -261,14 +366,18 @@ describe("machine gateway surface invalidation", () => {
     };
     const owned = surface(registration.projectId, identity.localSessionId, "tab-retire-gateway");
     gateway.surfaceCommit(identity, owned, {
+      bootRequestId: receiveBootResult(gateway, identity, owned),
       chatUrl: chatUrl(`chat-${identity.localSessionId}`),
       connectorName: "Codex with ChatGPT",
     });
     expect(gateway.surfaceGet(identity).projectUrl).toBe(PROJECT_URL);
-    const context = gateway.issueTurn(turn(registration, identity.localSessionId, owned.generation, "task-retire-gateway"));
     const request = gateway.openControlResultRequest(identity, {
       taskId: "task-retire-gateway",
       iteration: 0,
+      phase: "PLAN",
+    });
+    const context = gateway.issueTurn({
+      ...turn(registration, identity.localSessionId, owned.generation, "task-retire-gateway", request.request.requestId),
       phase: "PLAN",
     });
 

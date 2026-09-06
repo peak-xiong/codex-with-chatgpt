@@ -3,8 +3,8 @@ import path from "node:path";
 import { z } from "zod";
 import { redact } from "../logger/index.js";
 
-export const CONTROL_PHASES = ["RESEARCH", "PLAN", "REVIEW"] as const;
-export const CONTROL_RESULT_KINDS = ["RESEARCH", "PLAN", "REVIEW", "DONE", "BLOCKED"] as const;
+export const CONTROL_PHASES = ["BOOT", "RESEARCH", "PLAN", "REVIEW"] as const;
+export const CONTROL_RESULT_KINDS = ["BOOT", "RESEARCH", "PLAN", "REVIEW", "DONE", "BLOCKED"] as const;
 export const CONTROL_PROGRESS_STATES = ["SEARCHING", "READING_CODE", "SYNTHESIZING"] as const;
 export const MAX_CONTROL_RESULT_BYTES = 16 * 1024;
 export const MAX_STORED_CONTROL_RESULT_BYTES = 32 * 1024;
@@ -15,6 +15,7 @@ export type ControlPhase = (typeof CONTROL_PHASES)[number];
 export type ControlResultKind = (typeof CONTROL_RESULT_KINDS)[number];
 export type ControlProgressState = (typeof CONTROL_PROGRESS_STATES)[number];
 
+export const BOOT_ALLOWED_KINDS = ["BOOT", "BLOCKED"] as const;
 export const RESEARCH_ALLOWED_KINDS = ["RESEARCH", "BLOCKED"] as const;
 export const PLAN_ALLOWED_KINDS = ["PLAN", "BLOCKED"] as const;
 export const REVIEW_ALLOWED_KINDS = ["REVIEW", "DONE", "BLOCKED"] as const;
@@ -203,6 +204,7 @@ function createControlPayloadSchemas(limits: ControlPayloadLimits) {
     recommendation: boundedText(limits.findingText),
   }).strict();
   return {
+    boot: z.object({}).strict().describe("BOOT payload; verified identity is derived from the bound capability"),
     research: z.object({
       question: boundedText(limits.question),
       summary: boundedText(limits.summary),
@@ -240,6 +242,7 @@ function createControlPayloadSchemas(limits: ControlPayloadLimits) {
 
 const currentPayloadSchemas = createControlPayloadSchemas(CURRENT_PAYLOAD_LIMITS);
 const storedPayloadSchemas = createControlPayloadSchemas(STORED_PAYLOAD_LIMITS);
+export const bootPayloadSchema = currentPayloadSchemas.boot;
 export const researchPayloadSchema = currentPayloadSchemas.research;
 export const planPayloadSchema = currentPayloadSchemas.plan;
 export const reviewPayloadSchema = currentPayloadSchemas.review;
@@ -248,6 +251,7 @@ export const blockedPayloadSchema = currentPayloadSchemas.blocked;
 
 function createControlResultSubmissionSchema(payloads: ReturnType<typeof createControlPayloadSchemas>) {
   return z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("BOOT"), payload: payloads.boot }).strict(),
     z.object({ kind: z.literal("RESEARCH"), payload: payloads.research }).strict(),
     z.object({ kind: z.literal("PLAN"), payload: payloads.plan }).strict(),
     z.object({ kind: z.literal("REVIEW"), payload: payloads.review }).strict(),
@@ -264,6 +268,7 @@ function createSubmitControlResultInputSchema(payloads: ReturnType<typeof create
     iteration: z.number().int().min(0).max(MAX_C2C_ITERATION),
   };
   return z.discriminatedUnion("kind", [
+    z.object({ ...correlation, phase: z.literal("BOOT"), kind: z.literal("BOOT"), payload: payloads.boot }).strict(),
     z.object({ ...correlation, phase: z.literal("RESEARCH"), kind: z.literal("RESEARCH"), payload: payloads.research }).strict(),
     z.object({ ...correlation, phase: z.literal("PLAN"), kind: z.literal("PLAN"), payload: payloads.plan }).strict(),
     z.object({ ...correlation, phase: z.literal("REVIEW"), kind: z.literal("REVIEW"), payload: payloads.review }).strict(),
@@ -310,7 +315,7 @@ export interface ControlResultCorrelation {
 }
 
 export interface ControlResultRequest {
-  schemaVersion: 1;
+  schemaVersion: 2;
   requestId: string;
   workspaceId: string;
   localSessionId: string;
@@ -318,6 +323,10 @@ export interface ControlResultRequest {
   iteration: number;
   phase: ControlPhase;
   allowedKinds: ControlResultKind[];
+  /** Surface generation that authorized this request, or null for isolated mailbox use. */
+  surfaceGeneration: number | null;
+  /** Exact browser tab that authorized this request, paired with surfaceGeneration. */
+  surfaceTabId: string | null;
   createdAt: string;
   expiresAt: string;
 }
@@ -375,6 +384,7 @@ export interface ControlProgressReceipt {
 }
 
 export function allowedKindsForPhase(phase: ControlPhase): ControlResultKind[] {
+  if (phase === "BOOT") return [...BOOT_ALLOWED_KINDS];
   if (phase === "RESEARCH") return [...RESEARCH_ALLOWED_KINDS];
   return phase === "PLAN" ? [...PLAN_ALLOWED_KINDS] : [...REVIEW_ALLOWED_KINDS];
 }

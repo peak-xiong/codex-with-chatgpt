@@ -8,11 +8,11 @@ import {
 } from "../src/control/mailbox.js";
 import { appendExecutionRecord } from "../src/execution/records.js";
 import { CONTROL_PHASES } from "../src/control/result-schema.js";
-import { MachineGateway } from "../src/gateway/machine-gateway.js";
+import { MachineGateway, requireCurrentTurnSurface } from "../src/gateway/machine-gateway.js";
 import { nullLogger } from "../src/logger/index.js";
 import { createMcpServer } from "../src/mcp/server.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { cleanup, isolateStateDir, makeTmpDir, write } from "./helpers.js";
+import { cleanup, isolateStateDir, makeTmpDir, projectSelection, write } from "./helpers.js";
 
 const cleanups: string[] = [];
 
@@ -60,6 +60,57 @@ afterEach(() => {
 });
 
 describe("machine MCP capability correlation", () => {
+  it("delivers BOOT through the public MCP schema before committing the exact candidate", async () => {
+    cleanups.push(isolateStateDir());
+    const root = makeTmpDir("mcp-boot-receipt");
+    cleanups.push(root);
+    const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
+    const registration = gateway.registerWorkspace(root);
+    const identity = { ...registration, localSessionId: "session-mcp-boot" };
+    const projectUrl = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
+    const chatUrl = projectUrl.replace("/project", "/c/mcp-boot");
+    const lease = gateway.surfaceClaim(identity, {
+      browserId: "iab",
+      surfaceId: "chatgpt",
+      tabId: "tab-mcp-boot",
+      projectUrl,
+      chatUrl,
+      projectSelection: projectSelection(projectUrl),
+    });
+    const turn = { taskId: "boot-mcp", iteration: 0, phase: "BOOT" as const };
+    const { request } = gateway.openControlResultRequest(identity, turn);
+    const grant = gateway.issueTurn({
+      ...identity,
+      ...turn,
+      requestId: request.requestId,
+      scopes: ["c2c.result.write"],
+      compactionEpoch: 0,
+      generation: lease.generation,
+    });
+    const connection = await connectedClient(gateway);
+    try {
+      const receipt = await connection.client.callTool({
+        name: "submit_control_result",
+        arguments: { context_id: grant.token, kind: "BOOT", payload: {} },
+      });
+      expect(receipt.isError, JSON.stringify(receipt)).not.toBe(true);
+      expect(receipt.structuredContent).toMatchObject({
+        accepted: true,
+        requestId: request.requestId,
+        kind: "BOOT",
+      });
+      expect(gateway.surfaceCommit(identity, lease, {
+        bootRequestId: request.requestId,
+        connectorName: "Codex with ChatGPT",
+      })).toMatchObject({
+        binding: { tabId: lease.tabId, lastGeneration: lease.generation, chatUrl },
+      });
+      expect(gateway.getControlResultStatus(identity, request.requestId, turn).status).toBe("acknowledged");
+    } finally {
+      await connection.close();
+    }
+  });
+
   it("derives optional progress correlation from context and rejects legacy overrides", async () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("mcp-progress-binding");
@@ -308,7 +359,7 @@ describe("machine MCP capability correlation", () => {
         name: "get_control_result_status",
         arguments: { context_id: first.token },
       });
-      expect(status.isError).not.toBe(true);
+      expect(status.isError, JSON.stringify(status)).not.toBe(true);
       expect(JSON.stringify(status)).toContain('"status":"pending"');
 
       const accepted = await connection.client.callTool({

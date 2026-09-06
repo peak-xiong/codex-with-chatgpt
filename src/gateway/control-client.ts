@@ -4,12 +4,12 @@ import type {
 } from "./turn-capability.js";
 import type {
   MachineSurfaceIdentity,
+  MachineSurfaceCommitOptions,
   TurnCancellationBinding,
 } from "./machine-gateway.js";
 import type { MachineRuntimeState } from "./runtime.js";
 import type {
   ClaimSurfaceOptions,
-  CommitVerifiedSurfaceRouteOptions,
   SurfaceBinding,
   SurfaceLease,
   SurfaceLeaseRef,
@@ -236,7 +236,7 @@ export function commitSurface(
   runtime: MachineRuntimeState,
   identity: SurfaceIdentity,
   lease: SurfaceLeaseRef,
-  options: Omit<CommitVerifiedSurfaceRouteOptions, "lease" | "workspaceId">,
+  options: MachineSurfaceCommitOptions,
   timeoutMs = DEFAULT_ADMIN_TIMEOUT_MS,
 ): Promise<VerifiedSurfaceRouteCommit> {
   return adminFetch(runtime, "POST", "/admin/surfaces/commit", {

@@ -57,8 +57,8 @@ const issueTurnSchema = registrationIdentitySchema
     localSessionId: c2cIdSchema,
     taskId: c2cIdSchema,
     iteration: z.number().int().min(0).max(10_000),
-    phase: z.enum(["BOOT", ...CONTROL_PHASES]),
-    requestId: c2cIdSchema.optional(),
+    phase: z.enum(CONTROL_PHASES),
+    requestId: c2cIdSchema,
     scopes: z.array(z.enum(TURN_SCOPES)).min(1).max(TURN_SCOPES.length),
     modelId: z.string().min(1).max(128).optional(),
     effort: z.string().min(1).max(128).optional(),
@@ -77,8 +77,8 @@ const cancellationBindingSchema = z
     localSessionId: c2cIdSchema,
     taskId: c2cIdSchema,
     iteration: z.number().int().min(0).max(10_000),
-    phase: z.enum(["BOOT", ...CONTROL_PHASES]),
-    requestId: c2cIdSchema.optional(),
+    phase: z.enum(CONTROL_PHASES),
+    requestId: c2cIdSchema,
   })
   .strict();
 const contextSchema = z
@@ -120,6 +120,7 @@ const surfaceClaimSchema = surfaceIdentitySchema
 const surfaceCommitSchema = surfaceIdentitySchema
   .extend({
     lease: surfaceLeaseRefSchema,
+    bootRequestId: c2cIdSchema,
     chatUrl: z.string().min(1).max(4_096).optional(),
     connectorName: z.string().min(1).max(256).optional(),
   })

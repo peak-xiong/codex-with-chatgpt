@@ -13,9 +13,36 @@ import {
   writeOpenAiTunnelConfig,
 } from "../src/tunnel/openai-secure.js";
 import { machineMcpCommand } from "../src/process/machine-daemon.js";
+import type { MachineGateway, MachineSurfaceIdentity } from "../src/gateway/machine-gateway.js";
+import { submitControlResult } from "../src/control/mailbox.js";
+import type { SurfaceLease } from "../src/session/surface-ownership.js";
 
 export function projectSelection(projectUrl: string) {
   return { source: "user-confirmed" as const, projectUrl, observedTitle: "Explicit fixture Project", observedAt: new Date().toISOString() };
+}
+
+/** Create the authoritative BOOT receipt required before a gateway route commit. */
+export function receiveBootResult(
+  gateway: MachineGateway,
+  identity: MachineSurfaceIdentity,
+  lease: SurfaceLease,
+): string {
+  const taskId = `boot-${lease.generation}`;
+  const { request } = gateway.openControlResultRequest(identity, {
+    taskId,
+    iteration: 0,
+    phase: "BOOT",
+  });
+  submitControlResult(identity.workspaceId, {
+    requestId: request.requestId,
+    localSessionId: identity.localSessionId,
+    taskId,
+    iteration: 0,
+    phase: "BOOT",
+    kind: "BOOT",
+    payload: {},
+  });
+  return request.requestId;
 }
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");

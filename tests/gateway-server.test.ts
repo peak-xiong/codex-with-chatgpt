@@ -10,8 +10,8 @@ import {
   readMachineRuntime,
   writeMachineRuntime,
 } from "../src/gateway/runtime.js";
-import { claimSurface, commitVerifiedSurfaceRoute } from "../src/session/surface-ownership.js";
-import { cleanup, isolateStateDir, makeTmpDir, write, projectSelection } from "./helpers.js";
+import { claimSurface, commitVerifiedSurfaceRoute, type SurfaceLease } from "../src/session/surface-ownership.js";
+import { cleanup, isolateStateDir, makeTmpDir, write, projectSelection, receiveBootResult } from "./helpers.js";
 
 async function admin<T>(
   server: MachineGatewayServer,
@@ -133,7 +133,7 @@ describe("machine gateway control server", () => {
       ...identity, browserId: "iab", surfaceId: "chatgpt", tabId: "tab-unproven", projectUrl,
     });
     expect(unproven.status).not.toBe(200);
-    const claimed = await admin<{ lease: Record<string, unknown> }>(server, "/admin/surfaces/claim", {
+    const claimed = await admin<{ lease: SurfaceLease }>(server, "/admin/surfaces/claim", {
       ...identity,
       browserId: "iab",
       surfaceId: "chatgpt",
@@ -168,6 +168,7 @@ describe("machine gateway control server", () => {
     const committed = await admin<{ binding: Record<string, unknown> }>(server, "/admin/surfaces/commit", {
       ...identity,
       lease: leaseRef,
+      bootRequestId: receiveBootResult(server.gateway, identity, claimed.body.lease),
       chatUrl,
       connectorName: "Codex with ChatGPT",
     });
@@ -383,7 +384,16 @@ describe("machine gateway control server", () => {
       taskId: "task-control",
       iteration: 2,
       phase: "PLAN",
-      requestId: "request-control",
+      requestId: server.gateway.openControlResultRequest({
+        workspaceId: registration.body.workspaceId,
+        projectId: registration.body.projectId,
+        registrationId: registration.body.registrationId,
+        localSessionId: "session-control",
+      }, {
+        taskId: "task-control",
+        iteration: 2,
+        phase: "PLAN",
+      }).request.requestId,
       scopes: ["workspace.read", "c2c.result.write"],
       compactionEpoch: 0,
       generation: 1,
@@ -461,7 +471,10 @@ describe("machine gateway control server", () => {
       browserId: "iab", surfaceId: "chatgpt", tabId: "tab-plugin",
       projectUrl, chatUrl, projectSelection: projectSelection(projectUrl),
     });
-    server.gateway.surfaceCommit(identity, surface, { chatUrl });
+    server.gateway.surfaceCommit(identity, surface, {
+      bootRequestId: receiveBootResult(server.gateway, identity, surface),
+      chatUrl,
+    });
     const turn = {
       workspaceId: registration.workspaceId,
       projectId: registration.projectId,
@@ -485,8 +498,14 @@ describe("machine gateway control server", () => {
       github: { repository: { host: "github.com", owner: "fixture-user", name: "fixture-repo" },
         expectedActor: { login: "fixture-user", id: "123" } },
     };
+    const discoveryRequest = server.gateway.openControlResultRequest(identity, {
+      taskId: "task-profile",
+      iteration: 0,
+      phase: "RESEARCH",
+    });
     const discovery = {
-      ...turn, phase: "RESEARCH", taskId: "task-profile", requestId: "request-profile",
+      ...turn, phase: "RESEARCH", taskId: "task-profile",
+      requestId: discoveryRequest.request.requestId,
       pluginIntent: "identity-discovery", scopes: ["c2c.result.write"],
       pluginPreflight: {
         ...proof, phase: "RESEARCH", taskId: "task-profile", github: undefined, requestedOperations: undefined,
@@ -504,8 +523,15 @@ describe("machine gateway control server", () => {
     expect(excessiveScopes.status).not.toBe(200);
     expect(server.gateway.turnStatus(profileTurn.body.token).status).toBe("active");
     expect((await admin(server, "/admin/turns/cancel", { contextId: profileTurn.body.token })).status).toBe(200);
+    server.gateway.cancelControlResultRequest(identity, discoveryRequest.request.requestId, {
+      taskId: "task-profile", iteration: 0, phase: "RESEARCH",
+    });
 
     // A separately correlated business turn still needs the actual matching actor.
+    const businessRequest = server.gateway.openControlResultRequest(identity, {
+      taskId: "task-plugin", iteration: 0, phase: "PLAN",
+    });
+    turn.requestId = businessRequest.request.requestId;
     const issued = await admin<{ token: string }>(server, "/admin/turns/issue", { ...turn, pluginPreflight: proof });
     expect(issued.status).toBe(200);
     const claimed = server.gateway.claimTurn(issued.body.token, ["workspace.read"]);

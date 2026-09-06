@@ -15,6 +15,7 @@ import {
 } from "../execution/records.js";
 import { listExecutionOutputs, readExecutionOutput } from "../execution/output.js";
 import {
+  bootPayloadSchema,
   blockedPayloadSchema,
   c2cIdSchema,
   ControlMailboxError,
@@ -313,7 +314,7 @@ const reportControlProgressOutputSchema = {
 };
 
 const controlResultRequestOutputSchema = z.object({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.literal(2),
   requestId: c2cIdSchema,
   workspaceId: c2cIdSchema,
   localSessionId: c2cIdSchema,
@@ -321,6 +322,8 @@ const controlResultRequestOutputSchema = z.object({
   iteration: c2cIterationSchema,
   phase: z.enum(CONTROL_PHASES),
   allowedKinds: z.array(z.enum(CONTROL_RESULT_KINDS)),
+  surfaceGeneration: z.number().int().positive().nullable(),
+  surfaceTabId: c2cIdSchema.nullable(),
   createdAt: timestampOutputSchema,
   expiresAt: timestampOutputSchema,
 });
@@ -746,7 +749,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
     {
       title: "Submit control result",
       description:
-        `Submit one bounded C2C RESEARCH, PLAN, REVIEW, DONE, or BLOCKED result to the local control mailbox. ` +
+        `Submit one bounded C2C BOOT, RESEARCH, PLAN, REVIEW, DONE, or BLOCKED result to the local control mailbox. ` +
         `This does not edit workspace files or run commands, cannot choose a write path, and has no diff/log fields. ` +
         `Each request represents exactly one Codex question and accepts exactly one answer. ` +
         `For a business refusal or inability to complete, submit BLOCKED with {reason, needs} under the original phase, ` +
@@ -760,6 +763,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
         kind: z.enum(CONTROL_RESULT_KINDS).describe("Control result kind"),
         payload: z
           .union([
+            bootPayloadSchema,
             researchPayloadSchema,
             planPayloadSchema,
             reviewPayloadSchema,

@@ -2,13 +2,17 @@ import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
+  advanceControlPageObservation,
   controlHostFailureSchema,
   controlHostObservedResultSchema,
   controlTerminalObservationSchema,
   controlWaitPolicy,
   CONTROL_PAGE_CHECK_INTERVAL_MS,
+  parseControlPageObservation,
   type ControlHostFailure,
   type ControlHostObservedResult,
+  type ControlPageObservation,
+  type ControlPageObservationState,
   type ControlTerminalObservation,
 } from "./wait-policy.js";
 import {
@@ -57,6 +61,8 @@ export type ControlRequestStatus =
 
 export interface OpenControlResultRequestInput extends ControlResultCorrelation {
   localSessionId: string;
+  surfaceGeneration?: number;
+  surfaceTabId?: string;
   ttlMs?: number;
 }
 
@@ -68,6 +74,7 @@ export interface ControlStatus {
   progress: ControlProgressEnvelope | null;
   hostFailure?: ControlHostFailure;
   hostObservedResult?: ControlHostObservedResult;
+  pageObservation?: ControlPageObservationState;
 }
 
 /**
@@ -97,6 +104,10 @@ function resultsDir(workspaceId: string): string {
 
 function progressDir(workspaceId: string): string {
   return ensureDir(path.join(workspaceDir(workspaceId), "progress"));
+}
+
+function observationsDir(workspaceId: string): string {
+  return ensureDir(path.join(workspaceDir(workspaceId), "observations"));
 }
 
 function acksDir(workspaceId: string): string {
@@ -129,6 +140,10 @@ function resultFile(workspaceId: string, requestId: string): string {
 
 function progressFile(workspaceId: string, requestId: string): string {
   return path.join(progressDir(workspaceId), `${validateControlId(requestId, "request id")}.json`);
+}
+
+function observationFile(workspaceId: string, requestId: string): string {
+  return path.join(observationsDir(workspaceId), `${validateControlId(requestId, "request id")}.json`);
 }
 
 function ackFile(workspaceId: string, requestId: string): string {
@@ -216,6 +231,26 @@ function terminalMarkerTimestampField(kind: TerminalMarkerKind): "acknowledgedAt
   return kind === "acknowledged" ? "acknowledgedAt" : "cancelledAt";
 }
 
+function parseStoredHostFailure(
+  value: unknown,
+  requestId: string,
+): ControlHostFailure | null {
+  const current = controlHostFailureSchema.safeParse(value);
+  if (current.success) return current.data;
+  if (!isRecord(value) || value.state !== "blocked") return null;
+
+  // Older terminal records predate ordered response observations. Normalize
+  // them only for retained terminal-state reads; the synthetic identity never
+  // participates in routing, renewal, or BOOT authorization.
+  const legacy = controlHostFailureSchema.safeParse({
+    ...value,
+    state: "final",
+    responseId: `legacy-${requestId}`,
+    observationSequence: 1,
+  });
+  return legacy.success ? legacy.data : null;
+}
+
 function readTerminalMarker(
   workspaceId: string,
   request: ControlResultRequest,
@@ -259,11 +294,11 @@ function readTerminalMarker(
   }
   let hostFailure: ControlHostFailure | undefined;
   if (value.hostFailure !== undefined) {
-    const parsed = controlHostFailureSchema.safeParse(value.hostFailure);
-    if (!parsed.success || parsed.data.responseToRequestId !== request.requestId) {
+    const parsed = parseStoredHostFailure(value.hostFailure, request.requestId);
+    if (!parsed || parsed.responseToRequestId !== request.requestId) {
       integrityError("cancelled request observation is invalid");
     }
-    hostFailure = parsed.data;
+    hostFailure = parsed;
   }
   let hostObservedResult: ControlHostObservedResult | undefined;
   if (value.hostObservedResult !== undefined) {
@@ -329,12 +364,8 @@ function normalizeCorrelation(correlation: ControlResultCorrelation): ControlRes
   ) {
     throw new ControlMailboxError("INVALID_RESULT", "iteration must be an integer between 0 and 10000");
   }
-  if (
-    correlation.phase !== "RESEARCH" &&
-    correlation.phase !== "PLAN" &&
-    correlation.phase !== "REVIEW"
-  ) {
-    throw new ControlMailboxError("INVALID_RESULT", "phase must be RESEARCH, PLAN, or REVIEW");
+  if (!(["BOOT", "RESEARCH", "PLAN", "REVIEW"] as const).includes(correlation.phase)) {
+    throw new ControlMailboxError("INVALID_RESULT", "phase must be BOOT, RESEARCH, PLAN, or REVIEW");
   }
   return { taskId, iteration: correlation.iteration, phase: correlation.phase };
 }
@@ -344,21 +375,26 @@ function parseStoredRequest(
   workspaceId: string,
   requestId: string
 ): ControlResultRequest {
+  const legacyKeys = [
+    "schemaVersion",
+    "requestId",
+    "workspaceId",
+    "localSessionId",
+    "taskId",
+    "iteration",
+    "phase",
+    "allowedKinds",
+    "createdAt",
+    "expiresAt",
+  ] as const;
+  const transitionalKeys = [...legacyKeys, "surfaceGeneration"] as const;
+  const currentKeys = [...transitionalKeys, "surfaceTabId"] as const;
+  const legacy = isRecord(value) && value.schemaVersion === 1 && hasExactKeys(value, legacyKeys);
+  const transitional = isRecord(value) && value.schemaVersion === 1 && hasExactKeys(value, transitionalKeys);
+  const current = isRecord(value) && value.schemaVersion === 2 && hasExactKeys(value, currentKeys);
   if (
     !isRecord(value) ||
-    value.schemaVersion !== 1 ||
-    !hasExactKeys(value, [
-      "schemaVersion",
-      "requestId",
-      "workspaceId",
-      "localSessionId",
-      "taskId",
-      "iteration",
-      "phase",
-      "allowedKinds",
-      "createdAt",
-      "expiresAt",
-    ])
+    (!legacy && !transitional && !current)
   ) {
     integrityError("stored request schema is invalid");
   }
@@ -375,8 +411,27 @@ function parseStoredRequest(
   ) {
     integrityError("stored request iteration is invalid");
   }
-  if (phase !== "RESEARCH" && phase !== "PLAN" && phase !== "REVIEW") {
+  if (
+    phase !== "BOOT" &&
+    phase !== "RESEARCH" &&
+    phase !== "PLAN" &&
+    phase !== "REVIEW"
+  ) {
     integrityError("stored request phase is invalid");
+  }
+  const surfaceGeneration = legacy ? null : value.surfaceGeneration;
+  const surfaceTabId = current ? value.surfaceTabId : null;
+  if (
+    surfaceGeneration !== null &&
+    (!Number.isSafeInteger(surfaceGeneration) || (surfaceGeneration as number) < 1)
+  ) {
+    integrityError("stored request surface generation is invalid");
+  }
+  if (surfaceTabId !== null) {
+    storedId(surfaceTabId, "stored request surface tab id");
+  }
+  if ((surfaceGeneration === null) !== (surfaceTabId === null) && current) {
+    integrityError("stored request surface identity is incomplete");
   }
   const expectedKinds = allowedKindsForPhase(phase);
   if (!Array.isArray(value.allowedKinds) || canonicalJson(value.allowedKinds) !== canonicalJson(expectedKinds)) {
@@ -393,7 +448,7 @@ function parseStoredRequest(
     integrityError("stored request does not match its mailbox path");
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     requestId: storedRequestId,
     workspaceId: storedWorkspaceId,
     localSessionId,
@@ -401,6 +456,8 @@ function parseStoredRequest(
     iteration: iteration as number,
     phase,
     allowedKinds: expectedKinds,
+    surfaceGeneration: surfaceGeneration as number | null,
+    surfaceTabId: surfaceTabId as string | null,
     createdAt: value.createdAt,
     expiresAt: value.expiresAt,
   };
@@ -630,6 +687,80 @@ function readProgress(
   };
 }
 
+function readPageObservation(
+  workspaceId: string,
+  request: ControlResultRequest,
+): ControlPageObservationState | null {
+  const value = readStoredJson(
+    observationFile(workspaceId, request.requestId),
+    "stored page observation",
+  );
+  if (value === null) return null;
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== 1 ||
+    !hasExactKeys(value, [
+      "schemaVersion",
+      "requestId",
+      "workspaceId",
+      "localSessionId",
+      "latest",
+      "lastDefinitive",
+      "observationHash",
+    ])
+  ) {
+    integrityError("stored page observation schema is invalid");
+  }
+  const requestId = storedId(value.requestId, "stored page observation request id");
+  const storedWorkspaceId = storedId(value.workspaceId, "stored page observation workspace id");
+  const localSessionId = storedId(value.localSessionId, "stored page observation local session id");
+  if (
+    requestId !== request.requestId ||
+    storedWorkspaceId !== workspaceId ||
+    localSessionId !== request.localSessionId
+  ) {
+    integrityError("stored page observation does not match the exact control request");
+  }
+  let latest: ControlPageObservation;
+  let lastDefinitive: ControlPageObservationState["lastDefinitive"];
+  try {
+    latest = parseControlPageObservation(value.latest);
+    lastDefinitive = value.lastDefinitive === null
+      ? null
+      : parseControlPageObservation(value.lastDefinitive) as ControlPageObservationState["lastDefinitive"];
+  } catch {
+    return integrityError("stored page observation payload is invalid");
+  }
+  if (
+    latest.responseToRequestId !== request.requestId ||
+    (lastDefinitive !== null && lastDefinitive.responseToRequestId !== request.requestId) ||
+    (latest.state !== "unknown" && canonicalJson(latest) !== canonicalJson(lastDefinitive))
+  ) {
+    integrityError("stored page observation lifecycle is invalid");
+  }
+  const state = { latest, lastDefinitive };
+  const observationHash = sha256Hex(canonicalJson(state));
+  if (value.observationHash !== observationHash) {
+    integrityError("stored page observation integrity hash does not match its content");
+  }
+  return state;
+}
+
+function writePageObservation(
+  workspaceId: string,
+  request: ControlResultRequest,
+  state: ControlPageObservationState,
+): void {
+  writeSecureJson(observationFile(workspaceId, request.requestId), {
+    schemaVersion: 1,
+    requestId: request.requestId,
+    workspaceId,
+    localSessionId: request.localSessionId,
+    ...state,
+    observationHash: sha256Hex(canonicalJson(state)),
+  });
+}
+
 function isExpired(request: ControlResultRequest, now = Date.now()): boolean {
   return now > Date.parse(request.expiresAt);
 }
@@ -654,7 +785,8 @@ function readTerminalState(
 }
 
 function isUnfinished(workspaceId: string, request: ControlResultRequest): boolean {
-  return !isExpired(request) && readTerminalState(workspaceId, request) === null;
+  if (readTerminalState(workspaceId, request) !== null) return false;
+  return readResult(workspaceId, request) !== null || !isExpired(request);
 }
 
 function listRequests(workspaceId: string): ControlResultRequest[] {
@@ -713,6 +845,21 @@ export function openControlResultRequestWithStatus(
   const localSessionId = validateLocalSessionId(input.localSessionId);
   const correlation = normalizeCorrelation(input);
   const ttlMs = input.ttlMs ?? REQUEST_TTL_MS;
+  if (
+    input.surfaceGeneration !== undefined &&
+    (!Number.isSafeInteger(input.surfaceGeneration) || input.surfaceGeneration < 1)
+  ) {
+    throw new ControlMailboxError("INVALID_RESULT", "surface generation must be a positive safe integer");
+  }
+  const surfaceTabId = input.surfaceTabId === undefined
+    ? null
+    : validateControlId(input.surfaceTabId, "surface tab id");
+  if ((input.surfaceGeneration === undefined) !== (surfaceTabId === null)) {
+    throw new ControlMailboxError(
+      "INVALID_RESULT",
+      "surface generation and surface tab id must be supplied together",
+    );
+  }
   if (!Number.isInteger(ttlMs) || ttlMs < MIN_REQUEST_TTL_MS || ttlMs > MAX_REQUEST_TTL_MS) {
     throw new ControlMailboxError(
       "INVALID_RESULT",
@@ -722,7 +869,11 @@ export function openControlResultRequestWithStatus(
   return withFileLock(sessionLifecycleLockFile(resolvedWorkspaceId, localSessionId), () => {
     const activeRequest = readActiveRequest(resolvedWorkspaceId, localSessionId);
     if (activeRequest) {
-      if (isUnfinished(resolvedWorkspaceId, activeRequest)) {
+      const unfinished = withFileLock(
+        requestLockFile(resolvedWorkspaceId, activeRequest.requestId),
+        () => isUnfinished(resolvedWorkspaceId, activeRequest),
+      );
+      if (unfinished) {
         if (!matchesCorrelation(activeRequest, correlation)) turnInProgress(activeRequest);
         ensureRequestFile(resolvedWorkspaceId, activeRequest);
         return { request: activeRequest, created: false };
@@ -732,7 +883,7 @@ export function openControlResultRequestWithStatus(
 
     const now = Date.now();
     const request: ControlResultRequest = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       requestId: randomBytes(24).toString("hex"),
       workspaceId: resolvedWorkspaceId,
       localSessionId,
@@ -740,6 +891,8 @@ export function openControlResultRequestWithStatus(
       iteration: correlation.iteration,
       phase: correlation.phase,
       allowedKinds: allowedKindsForPhase(correlation.phase),
+      surfaceGeneration: input.surfaceGeneration ?? null,
+      surfaceTabId,
       createdAt: new Date(now).toISOString(),
       expiresAt: new Date(now + ttlMs).toISOString(),
     };
@@ -878,6 +1031,12 @@ export function reportControlProgress(workspaceId: string, input: unknown): Cont
 
     const terminal = readTerminalState(resolvedWorkspaceId, request);
     const result = readResult(resolvedWorkspaceId, request);
+    if (request.phase === "BOOT") {
+      throw new ControlMailboxError(
+        "MAILBOX_PROGRESS_NOT_ALLOWED",
+        "BOOT verification does not accept progress updates",
+      );
+    }
     if (terminal || result) {
       throw new ControlMailboxError(
         "MAILBOX_PROGRESS_NOT_ALLOWED",
@@ -969,22 +1128,69 @@ export function getControlResultStatus(
   assertCorrelation(request, expected);
   const result = readResult(resolvedWorkspaceId, request);
   const progress = readProgress(resolvedWorkspaceId, request);
+  const pageObservation = readPageObservation(resolvedWorkspaceId, request);
+  const observed = pageObservation ? { pageObservation } : {};
   const terminal = readTerminalState(resolvedWorkspaceId, request);
   if (terminal?.kind === "acknowledged") {
     if (!result) integrityError("acknowledged control result request has no result");
-    return { requestId: resolvedRequestId, status: "acknowledged", request, result, progress };
+    return { requestId: resolvedRequestId, status: "acknowledged", request, result, progress, ...observed };
   }
   if (terminal?.kind === "cancelled") {
     if (result) integrityError("cancelled control result request unexpectedly contains a result");
-    return { requestId: resolvedRequestId, status: "cancelled", request, result: null, progress,
+    return { requestId: resolvedRequestId, status: "cancelled", request, result: null, progress, ...observed,
       ...(terminal.hostFailure ? { hostFailure: terminal.hostFailure } : {}),
       ...(terminal.hostObservedResult ? { hostObservedResult: terminal.hostObservedResult } : {}) };
   }
-  if (result) return { requestId: resolvedRequestId, status: "received", request, result, progress };
+  if (result) return { requestId: resolvedRequestId, status: "received", request, result, progress, ...observed };
   if (isExpired(request)) {
-    return { requestId: resolvedRequestId, status: "expired", request, result: null, progress };
+    return { requestId: resolvedRequestId, status: "expired", request, result: null, progress, ...observed };
   }
-  return { requestId: resolvedRequestId, status: "pending", request, result: null, progress };
+  return { requestId: resolvedRequestId, status: "pending", request, result: null, progress, ...observed };
+}
+
+/** Require an authoritative successful BOOT receipt for one exact candidate generation. */
+export function requireBootControlResult(
+  workspaceId: string,
+  requestId: string,
+  localSessionId: string,
+  surfaceGeneration: number,
+  surfaceTabId: string,
+): ControlStatus {
+  const resolvedWorkspaceId = validateControlId(workspaceId, "workspace id");
+  const resolvedRequestId = validateControlId(requestId, "request id");
+  const resolvedLocalSessionId = validateLocalSessionId(localSessionId);
+  const request = readRequest(resolvedWorkspaceId, resolvedRequestId);
+  if (!request) {
+    throw new ControlMailboxError("MAILBOX_REQUEST_NOT_FOUND", "BOOT result request was not found");
+  }
+  if (
+    request.localSessionId !== resolvedLocalSessionId ||
+    request.phase !== "BOOT" ||
+    request.surfaceGeneration !== surfaceGeneration ||
+    request.surfaceTabId !== validateControlId(surfaceTabId, "surface tab id")
+  ) {
+    throw new ControlMailboxError(
+      "MAILBOX_CORRELATION_MISMATCH",
+      "BOOT result does not match this candidate surface generation",
+    );
+  }
+  const expected = { taskId: request.taskId, iteration: request.iteration, phase: request.phase };
+  const status = getControlResultStatus(
+    resolvedWorkspaceId,
+    resolvedRequestId,
+    resolvedLocalSessionId,
+    expected,
+  );
+  if (
+    (status.status !== "received" && status.status !== "acknowledged") ||
+    status.result?.kind !== "BOOT"
+  ) {
+    throw new ControlMailboxError(
+      "MAILBOX_RESULT_NOT_READY",
+      "surface commit requires a successful BOOT result received through MCP",
+    );
+  }
+  return status;
 }
 
 export async function waitForControlResult(
@@ -1056,7 +1262,15 @@ export function acknowledgeControlResult(
       if (status.status === "not_found") {
         throw new ControlMailboxError("MAILBOX_REQUEST_NOT_FOUND", "control result request was not found");
       }
-      if (status.status === "acknowledged") return status;
+      if (status.status === "acknowledged") {
+        clearActiveRequest(resolvedWorkspaceId, status.request!.localSessionId, resolvedRequestId);
+        return getControlResultStatus(
+          resolvedWorkspaceId,
+          resolvedRequestId,
+          resolvedLocalSessionId,
+          expected,
+        );
+      }
       if (status.status !== "received") {
         throw new ControlMailboxError("MAILBOX_RESULT_NOT_READY", "control result cannot be acknowledged before receipt");
       }
@@ -1092,7 +1306,15 @@ export function cancelControlResultRequest(
       if (status.status === "not_found") {
         throw new ControlMailboxError("MAILBOX_REQUEST_NOT_FOUND", "control result request was not found");
       }
-      if (status.status === "cancelled") return status;
+      if (status.status === "cancelled") {
+        clearActiveRequest(resolvedWorkspaceId, status.request!.localSessionId, resolvedRequestId);
+        return getControlResultStatus(
+          resolvedWorkspaceId,
+          resolvedRequestId,
+          resolvedLocalSessionId,
+          expected,
+        );
+      }
       if (status.status !== "pending") {
         throw new ControlMailboxError("MAILBOX_REQUEST_NOT_PENDING", "only a pending control result request can be cancelled");
       }
@@ -1108,6 +1330,158 @@ export function cancelControlResultRequest(
   );
 }
 
+function terminalObservationRecords(observation: ControlTerminalObservation): {
+  failure: ControlHostFailure;
+  hostObservedResult?: ControlHostObservedResult;
+} {
+  const terminalResultInput = observation.state === "final"
+    ? observation.terminalResult
+    : undefined;
+  const failureInput = observation.state === "final"
+    ? (({ terminalResult: _terminalResult, ...failure }) => failure)(observation)
+    : observation;
+  const failure = controlHostFailureSchema.parse(failureInput);
+  const hostObservedResult = terminalResultInput
+    ? controlHostObservedResultSchema.parse({
+        provenance: "host_observed",
+        observedAt: failure.observedAt,
+        result: parseControlResultSubmission(terminalResultInput),
+      })
+    : undefined;
+  return { failure, ...(hostObservedResult ? { hostObservedResult } : {}) };
+}
+
+/**
+ * Persist one exact page lifecycle event and apply its mailbox effect under the
+ * same request/session locks used by receipt, acknowledgement, and cancellation.
+ */
+export function observeControlResultRequest(
+  workspaceId: string,
+  requestId: string,
+  localSessionId: string,
+  expected: ControlResultCorrelation,
+  observation: ControlPageObservation,
+  renewAuthorization?: () => string,
+): ControlStatus {
+  const resolvedWorkspaceId = validateControlId(workspaceId, "workspace id");
+  const resolvedRequestId = validateControlId(requestId, "request id");
+  const resolvedLocalSessionId = validateLocalSessionId(localSessionId);
+  const parsed = parseControlPageObservation(observation);
+  if (parsed.responseToRequestId !== resolvedRequestId) {
+    throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "page observation belongs to another response");
+  }
+  return withFileLock(sessionLifecycleLockFile(resolvedWorkspaceId, resolvedLocalSessionId), () =>
+    withFileLock(requestLockFile(resolvedWorkspaceId, resolvedRequestId), () => {
+      const status = getControlResultStatus(
+        resolvedWorkspaceId,
+        resolvedRequestId,
+        resolvedLocalSessionId,
+        expected,
+      );
+      if (status.status === "cancelled") {
+        if (!status.hostFailure) {
+          clearActiveRequest(resolvedWorkspaceId, resolvedLocalSessionId, resolvedRequestId);
+          return getControlResultStatus(
+            resolvedWorkspaceId,
+            resolvedRequestId,
+            resolvedLocalSessionId,
+            expected,
+          );
+        }
+        const replay = advanceControlPageObservation(status.pageObservation ?? null, parsed);
+        if (!replay.terminal) {
+          throw new ControlMailboxError(
+            "MAILBOX_CORRELATION_MISMATCH",
+            "cancelled request can only replay its exact terminal observation",
+          );
+        }
+        const records = terminalObservationRecords(replay.terminal);
+        if (
+          canonicalJson(records.failure) !== canonicalJson(status.hostFailure) ||
+          canonicalJson(records.hostObservedResult ?? null) !== canonicalJson(status.hostObservedResult ?? null)
+        ) {
+          throw new ControlMailboxError(
+            "MAILBOX_CORRELATION_MISMATCH",
+            "terminal observation does not match the cancelled request",
+          );
+        }
+        if (!replay.idempotentReplay) {
+          writePageObservation(resolvedWorkspaceId, status.request!, replay.state);
+        }
+        clearActiveRequest(resolvedWorkspaceId, resolvedLocalSessionId, resolvedRequestId);
+        return getControlResultStatus(
+          resolvedWorkspaceId,
+          resolvedRequestId,
+          resolvedLocalSessionId,
+          expected,
+        );
+      }
+      if (status.status !== "pending") return status;
+      const advanced = advanceControlPageObservation(status.pageObservation ?? null, parsed);
+      if (advanced.idempotentReplay) return status;
+
+      if (parsed.state === "generating") {
+        if (!renewAuthorization) {
+          throw new ControlMailboxError("INVALID_RESULT", "generating observation requires live authorization renewal");
+        }
+        const expiresAt = renewAuthorization();
+        const expiry = Date.parse(expiresAt);
+        if (!isCanonicalTimestamp(expiresAt) || expiry <= Date.now() || expiry > Date.now() + MAX_REQUEST_TTL_MS) {
+          throw new ControlMailboxError("INVALID_RESULT", "invalid request renewal lifetime");
+        }
+        if (expiry > Date.parse(status.request!.expiresAt)) {
+          const original = parseStoredRequest(
+            readStoredJson(requestFile(resolvedWorkspaceId, resolvedRequestId), "stored request"),
+            resolvedWorkspaceId,
+            resolvedRequestId,
+          );
+          writeSecureJson(renewalFile(resolvedWorkspaceId, resolvedRequestId), { request: original, expiresAt });
+        }
+        writePageObservation(resolvedWorkspaceId, status.request!, advanced.state);
+        return getControlResultStatus(
+          resolvedWorkspaceId,
+          resolvedRequestId,
+          resolvedLocalSessionId,
+          expected,
+        );
+      }
+
+      if (!advanced.terminal) {
+        writePageObservation(resolvedWorkspaceId, status.request!, advanced.state);
+        return getControlResultStatus(
+          resolvedWorkspaceId,
+          resolvedRequestId,
+          resolvedLocalSessionId,
+          expected,
+        );
+      }
+
+      const { failure, hostObservedResult } = terminalObservationRecords(advanced.terminal);
+      if (hostObservedResult && !status.request!.allowedKinds.includes(hostObservedResult.result.kind)) {
+        throw new ControlMailboxError(
+          "MAILBOX_KIND_NOT_ALLOWED",
+          `${hostObservedResult.result.kind} is not allowed for ${status.request!.phase}`,
+        );
+      }
+      writeTerminalMarker(
+        resolvedWorkspaceId,
+        status.request!,
+        "cancelled",
+        failure,
+        hostObservedResult,
+      );
+      writePageObservation(resolvedWorkspaceId, status.request!, advanced.state);
+      clearActiveRequest(resolvedWorkspaceId, resolvedLocalSessionId, resolvedRequestId);
+      return getControlResultStatus(
+        resolvedWorkspaceId,
+        resolvedRequestId,
+        resolvedLocalSessionId,
+        expected,
+      );
+    }),
+  );
+}
+
 /** Host observations cancel pending work, never manufacture an MCP result. Receipt wins under the request lock. */
 export function recordControlHostFailure(
   workspaceId: string,
@@ -1118,7 +1492,12 @@ export function recordControlHostFailure(
 ): ControlStatus {
   const parsed = controlTerminalObservationSchema.safeParse(observation);
   if (!parsed.success) throw new ControlMailboxError("INVALID_RESULT", "invalid host failure observation");
-  const { terminalResult: terminalResultInput, ...failureInput } = parsed.data;
+  const terminalResultInput = parsed.data.state === "final"
+    ? parsed.data.terminalResult
+    : undefined;
+  const failureInput = parsed.data.state === "final"
+    ? (({ terminalResult: _terminalResult, ...failure }) => failure)(parsed.data)
+    : parsed.data;
   const terminalResult = terminalResultInput
     ? parseControlResultSubmission(terminalResultInput)
     : undefined;
@@ -1264,6 +1643,7 @@ function pruneControlMailboxUnlocked(resolvedWorkspaceId: string, now: number): 
             requestFile(resolvedWorkspaceId, request.requestId),
             resultFile(resolvedWorkspaceId, request.requestId),
             progressFile(resolvedWorkspaceId, request.requestId),
+            observationFile(resolvedWorkspaceId, request.requestId),
             ackFile(resolvedWorkspaceId, request.requestId),
             cancelledFile(resolvedWorkspaceId, request.requestId),
             renewalFile(resolvedWorkspaceId, request.requestId),
