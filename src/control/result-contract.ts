@@ -3,7 +3,7 @@ import {
   type ControlPhase,
   type ControlResultKind,
   type ControlResultRequest,
-  type SubmitControlResultInput,
+  type ControlResultSubmission,
 } from "./result-schema.js";
 
 /** Prompt scaffolds, not results or proof that a page can call these tools. */
@@ -39,21 +39,21 @@ export function controlResultContract(phase: ControlPhase) {
       reason: "<observed blocker, without guessing its cause>",
       needs: ["<specific missing input or required user action>"],
     },
-  } satisfies Record<ControlResultKind, SubmitControlResultInput["payload"]>;
+  } satisfies Record<ControlResultKind, ControlResultSubmission["payload"]>;
 
   return {
     phase,
     requiredTools: ["submit_control_result"],
     instructions: [
       "Use the Codex with ChatGPT connector in this exact message. Check that submit_control_result is callable now, not merely mentioned in history, before doing research or analysis.",
-      "When get_control_result_status is callable, check this context_id, requestId, localSessionId, taskId, iteration and phase first and proceed only for the exact pending request. Its absence alone does not block submission; Codex owns mailbox status and acknowledgment.",
-      "Submit with those same correlation fields, kind and its matching payload. Replace every example placeholder with observed facts; examples are not evidence.",
-      "FINAL DELIVERY IS REQUIRED FOR FAILURE TOO: if you refuse the business request, cannot complete it, lack information, or a business read fails, stop business work and proactively call submit_control_result with kind BLOCKED, payload {reason, needs}, and the original phase/correlation, while this callback remains authorized and permitted. Do this before your final page reply; do not wait for the user to interrupt, send another message, or ask you to report failure. Keep the reason short and safe, without prohibited content or guessed causes. A page-only refusal does not notify Codex.",
+      "When get_control_result_status is callable, call it with context_id only and proceed only for the bound pending request. Its absence alone does not block submission; Codex owns mailbox status and acknowledgment.",
+      "Call submit_control_result with context_id, kind and its matching payload only. The context already binds request, workspace, local session, task, iteration and phase. Never supply or override those correlation fields. Replace every example placeholder with observed facts; examples are not evidence.",
+      "FINAL DELIVERY IS REQUIRED FOR FAILURE TOO: if you refuse the business request, cannot complete it, lack information, or a business read fails, stop business work and proactively call submit_control_result with kind BLOCKED and payload {reason, needs}, while this callback remains authorized and permitted. Do this before your final page reply; do not wait for the user to interrupt, send another message, or ask you to report failure. Keep the reason short and safe, without prohibited content or guessed causes. A page-only refusal does not notify Codex.",
       "report_control_progress is optional and never a prerequisite for final submission or synthesis. No initial or SYNTHESIZING progress call is required. Skip routine progress unless it materially helps a long task.",
       "Elapsed time alone is not failure. Codex can renew this request's live authorization while observing your ongoing work; do not ask the user to interrupt or send a continuation just because the task takes a long time. Respect any actual expired or revoked authorization. For BLOCKED, needs describes the next steps, which may simply be to end the failed attempt and preserve completed work; user confirmation is not required just to record failure.",
       "For RESEARCH, sources contains only external HTTP(S) URLs actually consulted, each with title, url, publishedDate (YYYY-MM-DD or null) and keyEvidence. Use sources: [] for local-only work and cite relative files/lines in conclusions. Never fabricate URLs or use workspace:/ or file:// as sources.",
       "If tools are unavailable or a platform approval/safety check blocks a call, stop this turn and report the observed failure; do not bypass it, switch apps or claim successful delivery. Submit BLOCKED only when that same tool is available and permitted.",
-      "After an explicit safety/approval block or TOKEN_REVOKED, TOKEN_EXPIRED or STALE_BINDING_EPOCH, do not retry through another call or delivery channel. If no permitted final callback can be sent, finish with an explicit terminal status paired to RESULT_REQUEST_ID so the host can reconcile; do not claim a mailbox receipt.",
+      "After an explicit safety/approval block or TOKEN_REVOKED, TOKEN_EXPIRED or STALE_BINDING_EPOCH, do not retry through another call or delivery channel. If no permitted final callback can be sent, finish with a short schema-valid {kind,payload} result under the host-observed marker supplied below so the host can reconcile; do not claim a mailbox receipt.",
       "Only the local mailbox received/acknowledged state proves delivery. A visible answer or successful read is not a receipt.",
     ],
     examples: allowedKindsForPhase(phase).map((kind) => ({ kind, payload: examples[kind] })),
@@ -74,6 +74,7 @@ export function controlDeliveryPrompt(request: ControlResultRequest, contextId: 
     "",
     "Use this context_id for every C2C MCP call. Codex owns edits, execution and acknowledgment.",
     ...contract.instructions,
+    `If no permitted MCP callback can be sent, end this exact response with the marker C2C_HOST_OBSERVED_RESULT, pair it to RESULT_REQUEST_ID ${request.requestId}, and place exactly one schema-valid allowed {kind,payload} JSON object after the marker. This is host-observed evidence, not an MCP receipt. Do not include raw logs, source, diffs, credentials or error excerpts.`,
     "Phase-specific payload scaffolds (replace placeholders with actual findings; never submit examples verbatim):",
     JSON.stringify(contract.examples),
   ].join("\n");

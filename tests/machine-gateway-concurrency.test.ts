@@ -188,11 +188,6 @@ describe("machine gateway session concurrency", () => {
             name: "submit_control_result",
             arguments: {
               context_id: grants[index].token,
-              requestId: requests[index].request.requestId,
-              localSessionId: sessions[index].localSessionId,
-              taskId: `task-${sessions[index].localSessionId}`,
-              iteration: 0,
-              phase: "PLAN",
               kind: "PLAN",
               payload: planPayload(sessions[index].localSessionId),
             },

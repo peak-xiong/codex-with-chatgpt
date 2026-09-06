@@ -2,7 +2,11 @@ import { describe, expect, it } from "vitest";
 import { controlDeliveryPrompt, controlResultContract } from "../src/control/result-contract.js";
 import {
   CONTROL_PHASES,
+  MAX_CONTROL_RESULT_BYTES,
+  MAX_STORED_CONTROL_RESULT_BYTES,
   allowedKindsForPhase,
+  parseControlResultSubmission,
+  parseStoredSubmitControlResultInput,
   parseSubmitControlResultInput,
   researchPayloadSchema,
 } from "../src/control/result-schema.js";
@@ -13,6 +17,7 @@ describe("control result prompt contract", () => {
     expect(contract.requiredTools).toEqual(["submit_control_result"]);
     expect(contract.examples.map((example) => example.kind)).toEqual(allowedKindsForPhase(phase));
     for (const example of contract.examples) {
+      expect(parseControlResultSubmission(example)).toMatchObject(example);
       expect(parseSubmitControlResultInput({
         requestId: "request-test", localSessionId: "session-test", taskId: "task-test",
         iteration: 0, phase, ...example,
@@ -45,5 +50,52 @@ describe("control result prompt contract", () => {
     for (const instruction of contract.instructions) expect(prompt).toContain(instruction);
     expect(JSON.parse(prompt.split("\n").at(-1)!)).toEqual(contract.examples);
     expect(contract.examples.some((example) => example.kind === "BLOCKED")).toBe(true);
+    expect(prompt).toContain("C2C_HOST_OBSERVED_RESULT");
+    expect(prompt).toContain(request.requestId);
+  });
+
+  it("bounds new submissions while retaining validation for larger stored results", () => {
+    expect(MAX_CONTROL_RESULT_BYTES).toBe(16 * 1024);
+    expect(MAX_STORED_CONTROL_RESULT_BYTES).toBe(32 * 1024);
+    expect(() => parseControlResultSubmission({
+      kind: "BLOCKED",
+      payload: { reason: "x".repeat(601), needs: ["Stop this attempt"] },
+    })).toThrow(/INVALID_RESULT|600|invalid/i);
+    expect(() => parseControlResultSubmission({
+      kind: "BLOCKED",
+      payload: { reason: "Cannot finish", needs: Array.from({ length: 6 }, () => "Stop this attempt") },
+    })).toThrow(/INVALID_RESULT|5|invalid/i);
+
+    const stored = {
+      requestId: "request-stored", localSessionId: "session-stored", taskId: "task-stored",
+      iteration: 0, phase: "PLAN" as const, kind: "PLAN" as const,
+      payload: {
+        goal: "Read a retained result",
+        rationale: "r".repeat(3_500),
+        actions: Array.from({ length: 12 }, (_, index) => ({
+          change: `change-${index} ${"c".repeat(700)}`,
+          why: `why-${index} ${"w".repeat(700)}`,
+        })),
+        tests: [],
+        successCriteria: ["The retained result remains readable"],
+      },
+    };
+    expect(() => parseSubmitControlResultInput(stored)).toThrow(/at most|exceeds|invalid/i);
+    expect(parseStoredSubmitControlResultInput(stored)).toMatchObject({ kind: "PLAN" });
+
+    expect(() => parseControlResultSubmission({
+      kind: "PLAN",
+      payload: {
+        goal: "Bound aggregate output",
+        rationale: "r".repeat(1_900),
+        actions: Array.from({ length: 12 }, (_, index) => ({
+          change: `change-${index} ${"c".repeat(500)}`,
+          why: `why-${index} ${"w".repeat(500)}`,
+          risks: Array.from({ length: 4 }, () => "risk ".padEnd(280, "x")),
+        })),
+        tests: [],
+        successCriteria: ["Reject oversized aggregate output"],
+      },
+    })).toThrow(/exceeds 16384 bytes/);
   });
 });

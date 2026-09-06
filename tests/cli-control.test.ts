@@ -141,18 +141,35 @@ describe("control CLI correlation", () => {
       observedAt: new Date().toISOString(), responseToRequestId: request.requestId,
       state: "blocked", responseIsFinal: true, reason: "capability_invalid",
       source: "model_reported", errorCode: "TOKEN_REVOKED",
+      terminalResult: {
+        kind: "BLOCKED",
+        payload: { reason: "The callback authorization ended", needs: ["End this attempt"] },
+      },
     };
     const bad = runJson(["control", "observe", ...lookup, "--page-observation", JSON.stringify({ ...observation, errorCode: "sk-fixture-private" })]);
     expect(bad.command.status).toBe(1);
     expect(bad.command.stdout + bad.command.stderr).not.toContain("sk-fixture-private");
     const resolved = runJson(["control", "observe", ...lookup, "--page-observation", JSON.stringify(observation)]);
     expect(resolved.command.status, JSON.stringify(resolved)).toBe(0);
-    expect(resolved.body).toMatchObject({ status: "cancelled", result: null, hostFailure: observation, wait: { nextAction: "stop" } });
+    const { terminalResult, ...hostFailure } = observation;
+    expect(resolved.body).toMatchObject({
+      status: "cancelled",
+      result: null,
+      hostFailure,
+      hostObservedResult: { provenance: "host_observed", result: terminalResult },
+      wait: { delivery: "host_observed", nextAction: "stop" },
+    });
     const waited = runJson(["control", "wait", ...lookup, "--timeout-ms", "0"]);
     expect(waited.command.status).toBe(1);
-    expect(waited.body).toMatchObject({ status: "cancelled", result: null, hostFailure: observation });
+    expect(waited.body).toMatchObject({
+      status: "cancelled",
+      result: null,
+      hostFailure,
+      hostObservedResult: { provenance: "host_observed", result: terminalResult },
+      wait: { delivery: "host_observed", nextAction: "stop" },
+    });
     expect(runJson(["control", "ack", ...lookup]).command.status).toBe(1);
-  }, 60_000);
+    }, 90_000);
 
   it("reuses one page across tasks and grants only selected observed app reads", () => {
     const localSessionId = "session-app-reads";

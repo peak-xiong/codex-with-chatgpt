@@ -591,6 +591,9 @@ that `submit_control_result` is callable in this message before doing the task.
 `get_control_result_status` is useful when exposed but is not required: Codex
 checks the authoritative mailbox. BOOT reads and machine health do not prove
 result delivery, and a tool name in an old answer is not current availability.
+When exposed, call the status tool with `context_id` only. Submit final results
+with `context_id`, `kind` and `payload` only; the capability supplies all request
+correlation and legacy correlation arguments are rejected.
 
 For a business refusal, missing input, or inability to complete, request an
 immediate `BLOCKED` result through `submit_control_result` when it is still
@@ -634,11 +637,13 @@ with submit_control_result. Follow resultContract.instructions and the
 phase-matching payload example supplied by control open. Codex owns all edits
 and execution.
 On business refusal or failure, proactively submit kind BLOCKED with a short
-safe payload {reason, needs}, using this same phase and correlation, before
+safe payload {reason, needs}, using only this context_id for correlation, before
 your final page reply. Do not wait for the user to interrupt or prompt again.
 No progress callback is required. Respect platform blocks and invalid tokens;
 if the callback itself is unavailable or forbidden, report that terminal state
-without pretending an MCP receipt exists.
+with the `C2C_HOST_OBSERVED_RESULT` marker and one schema-valid allowed
+`{kind,payload}` JSON object paired to this RESULT_REQUEST_ID. This lets the host
+finish automatically without pretending an MCP receipt exists.
 ```
 
 For `EXECUTED`, record command, changed files, tests and output locally, then
@@ -680,7 +685,8 @@ lease; never label uncertainty as generation or refusal.
 If that exact response is final and explicitly refused/blocked/unavailable,
 call `control observe --page-observation '<json>'` with the fresh observation
 specified in the protocol. It checks the mailbox again and records a separate
-`hostFailure` only if cancellation wins the race. It cannot submit a result.
+`hostFailure` and optional validated `hostObservedResult` only if cancellation
+wins the race. `result` remains null and it cannot submit an MCP result.
 For a confirmed completed response with no final callback, reread the mailbox
 and use `reason: callback_missing`, `source: host_observed` if still pending.
 Do not ask the user to interrupt or send a follow-up to finish this failure.
@@ -706,10 +712,10 @@ c2c control ack \
   --phase <phase> --json
 ```
 
-After a `BLOCKED` result or host-observed cancellation, set the checkpoint to
+After a `BLOCKED` result or host-observed terminal cancellation, set the checkpoint to
 `BLOCKED` and `waitingFor: none`, preserving the goal, completed work and exact
-request correlation. Do not ack a host failure or treat it as a model-submitted
-result. Finish the failed attempt automatically; do not ask for confirmation
+request correlation. Do not ack a host failure or `hostObservedResult`, and do
+not treat either as a model-submitted MCP result. Finish the failed attempt automatically; do not ask for confirmation
 just to record failure, and do not automatically retry a refused task.
 
 Do not send the next control message until the current request is received,

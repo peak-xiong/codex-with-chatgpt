@@ -37,8 +37,11 @@ import {
   type RetireControlResultSessionSummary,
 } from "../control/mailbox.js";
 import {
+  parseControlProgressUpdate,
+  parseControlResultSubmission,
   parseReportControlProgressInput,
   parseSubmitControlResultInput,
+  type ControlPhase,
   type ControlProgressReceipt,
   type ControlResultCorrelation,
   type ControlResultReceipt,
@@ -197,6 +200,7 @@ export class MachineGateway {
   private readonly surfaceValidator?: SurfaceGenerationValidator;
   /** Synchronous per-session critical sections for final surface validation and mailbox publication. */
   private readonly controlSubmissionSessions = new Set<string>();
+  private readonly controlCompletionFences = new Map<string, string>();
 
   constructor(options: MachineGatewayOptions = {}) {
     const { broker, surfaceValidator, workspaceMembershipFile } = options;
@@ -399,7 +403,15 @@ export class MachineGateway {
   }
 
   beginCompletion(contextId: string): TurnCompletionFence {
-    return this.broker.beginCompletion(contextId, bindingForStatus(this.broker, contextId));
+    const binding = bindingForStatus(this.broker, contextId);
+    const sessionKey = this.controlSessionKey(binding.projectId, binding.localSessionId);
+    if (this.controlSubmissionSessions.has(sessionKey)) {
+      throw new TurnCapabilityError("COMPLETION_ALREADY_STARTED", "another control result is being committed");
+    }
+    const fence = this.broker.beginCompletion(contextId, binding);
+    this.controlSubmissionSessions.add(sessionKey);
+    this.controlCompletionFences.set(fence.fence, sessionKey);
+    return fence;
   }
 
   /** Open a machine-owned mailbox request for a registered workspace/session. */
@@ -483,6 +495,9 @@ export class MachineGateway {
       throw new TurnCapabilityError("BINDING_MISMATCH", "page observation does not match this request's current response and owned page");
     }
     if (observation.state === "unknown" || status.status !== "pending") return status;
+    if (this.controlSubmissionSessions.has(this.controlSessionKey(identity.projectId, identity.localSessionId))) {
+      return status;
+    }
     this.assertSurfaceMutationAllowed(identity.projectId, identity.localSessionId);
     if (observation.state === "generating") {
       const lease = requireSurfaceGeneration(identity.projectId, identity.localSessionId, observation.generation);
@@ -510,20 +525,28 @@ export class MachineGateway {
    */
   controlResultStatusForTurn(
     contextId: string,
-    requestId: string,
-    localSessionId: string,
-    expected: ControlResultCorrelation,
   ): ControlStatus {
-    const binding = this.assertControlTurn(contextId, requestId, localSessionId, expected);
-    return getControlResultStatus(binding.workspaceId, requestId, localSessionId, expected);
+    const binding = this.controlBindingForTurn(contextId);
+    return getControlResultStatus(
+      binding.workspaceId,
+      binding.requestId,
+      binding.localSessionId,
+      { taskId: binding.taskId, iteration: binding.iteration, phase: binding.phase },
+    );
   }
 
   controlProgressForTurn(contextId: string, input: unknown): ControlProgressReceipt {
-    const binding = bindingForStatus(this.broker, contextId);
-    const parsed = parseReportControlProgressInput(input);
-    this.assertControlCorrelation(binding, parsed);
-    this.validateSurface(contextId, binding);
-    return reportControlProgress(binding.workspaceId, parsed);
+    const binding = this.controlBindingForTurn(contextId);
+    const update = parseControlProgressUpdate(input);
+    const reported = parseReportControlProgressInput({
+      requestId: binding.requestId,
+      localSessionId: binding.localSessionId,
+      taskId: binding.taskId,
+      iteration: binding.iteration,
+      phase: binding.phase,
+      ...update,
+    });
+    return reportControlProgress(binding.workspaceId, reported);
   }
 
   /**
@@ -538,18 +561,25 @@ export class MachineGateway {
   ): ControlResultReceipt {
     const binding = bindingForStatus(this.broker, contextId);
     const sessionKey = this.controlSessionKey(binding.projectId, binding.localSessionId);
-    if (this.controlSubmissionSessions.has(sessionKey)) {
-      throw new TurnCapabilityError("COMPLETION_ALREADY_STARTED", "another control result is being committed");
+    const fence = fenceOf(fenceInput);
+    if (this.controlCompletionFences.get(fence) !== sessionKey) {
+      throw new TurnCapabilityError("COMPLETION_FENCE_INVALID", "completion fence does not belong to this control session");
     }
-    this.controlSubmissionSessions.add(sessionKey);
     try {
-      const fence = fenceOf(fenceInput);
       // The fence is a second bearer secret, so bind it to the context before
       // parsing or publishing the result. Otherwise context B could consume
       // context A's fence after submitting B's mailbox result.
       this.broker.assertCompletionFence(contextId, binding, fence);
-      const parsed = parseSubmitControlResultInput(input);
-      this.assertControlCorrelation(binding, parsed);
+      const submission = parseControlResultSubmission(input);
+      const controlBinding = this.controlBindingForTurn(contextId);
+      const parsed = parseSubmitControlResultInput({
+        requestId: controlBinding.requestId,
+        localSessionId: controlBinding.localSessionId,
+        taskId: controlBinding.taskId,
+        iteration: controlBinding.iteration,
+        phase: controlBinding.phase,
+        ...submission,
+      });
       const status = this.broker.status(contextId);
       if (status.status !== "completing") {
         throw new TurnCapabilityError("COMPLETION_FENCE_INVALID", "turn is no longer completing");
@@ -560,19 +590,28 @@ export class MachineGateway {
       return receipt;
     } finally {
       this.controlSubmissionSessions.delete(sessionKey);
+      this.controlCompletionFences.delete(fence);
     }
   }
 
   completeTurn(
     fenceInput: string | Pick<TurnCompletionFence, "fence">
   ): TurnCompletionReceipt {
-    return this.broker.complete(fenceOf(fenceInput));
+    const fence = fenceOf(fenceInput);
+    const receipt = this.broker.complete(fence);
+    this.releaseCompletionFence(fence);
+    return receipt;
   }
 
   abortTurnCompletion(
     fenceInput: string | Pick<TurnCompletionFence, "fence">
   ): TurnCompletionAbortReceipt {
-    return this.broker.abortCompletion(fenceOf(fenceInput));
+    const fence = fenceOf(fenceInput);
+    try {
+      return this.broker.abortCompletion(fence);
+    } finally {
+      this.releaseCompletionFence(fence);
+    }
   }
 
   turnStatus(contextId: string): TurnCapabilityStatus {
@@ -647,38 +686,25 @@ export class MachineGateway {
     }
   }
 
-  private assertControlTurn(
+  private controlBindingForTurn(
     contextId: string,
-    requestId: string,
-    localSessionId: string,
-    expected: ControlResultCorrelation,
-  ): TurnCapabilityBinding {
+  ): TurnCapabilityBinding & { requestId: string; phase: ControlPhase } {
     const binding = bindingForStatus(this.broker, contextId);
-    this.assertControlCorrelation(binding, {
-      requestId,
-      localSessionId,
-      ...expected,
-    });
+    if (
+      binding.requestId === undefined ||
+      (binding.phase !== "RESEARCH" && binding.phase !== "PLAN" && binding.phase !== "REVIEW")
+    ) {
+      throw new TurnCapabilityError("BINDING_MISMATCH", "turn capability is not bound to a control result request");
+    }
     this.validateSurface(contextId, binding);
-    return binding;
+    return binding as TurnCapabilityBinding & { requestId: string; phase: ControlPhase };
   }
 
-  private assertControlCorrelation(
-    binding: TurnCapabilityBinding,
-    input: { requestId?: string; localSessionId: string; taskId: string; iteration: number; phase: string },
-  ): void {
-    if (
-      binding.requestId !== input.requestId ||
-      binding.localSessionId !== input.localSessionId ||
-      binding.taskId !== input.taskId ||
-      binding.iteration !== input.iteration ||
-      binding.phase !== input.phase
-    ) {
-      throw new TurnCapabilityError(
-        "BINDING_MISMATCH",
-        "control result does not match the live turn capability",
-      );
-    }
+  private releaseCompletionFence(fence: string): void {
+    const sessionKey = this.controlCompletionFences.get(fence);
+    if (!sessionKey) return;
+    this.controlCompletionFences.delete(fence);
+    this.controlSubmissionSessions.delete(sessionKey);
   }
 
   private revokeStaleContext(contextId: string, error: unknown): never {

@@ -6,7 +6,8 @@ import { redact } from "../logger/index.js";
 export const CONTROL_PHASES = ["RESEARCH", "PLAN", "REVIEW"] as const;
 export const CONTROL_RESULT_KINDS = ["RESEARCH", "PLAN", "REVIEW", "DONE", "BLOCKED"] as const;
 export const CONTROL_PROGRESS_STATES = ["SEARCHING", "READING_CODE", "SYNTHESIZING"] as const;
-export const MAX_CONTROL_RESULT_BYTES = 32 * 1024;
+export const MAX_CONTROL_RESULT_BYTES = 16 * 1024;
+export const MAX_STORED_CONTROL_RESULT_BYTES = 32 * 1024;
 export const MAX_C2C_ITERATION = 10_000;
 export const C2C_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
@@ -98,18 +99,6 @@ const relativeFileHintSchema = z
 
 export const c2cIdSchema = z.string().regex(C2C_ID_PATTERN);
 
-const actionSchema = z
-  .object({
-    file: relativeFileHintSchema.optional(),
-    change: boundedText(1000),
-    why: boundedText(1000),
-    risks: z.array(boundedText(400)).max(6).optional(),
-  })
-  .strict();
-
-const testAdviceSchema = boundedText(500);
-const successCriterionSchema = boundedText(500);
-
 const researchSourceUrlSchema = z
   .string()
   .min(1)
@@ -144,136 +133,161 @@ const publishedDateSchema = z
   }, "publishedDate must be a real calendar date")
   .nullable();
 
-const researchSourceSchema = z
-  .object({
-    title: boundedText(300),
+interface ControlPayloadLimits {
+  actionText: number;
+  actionRisks: number;
+  riskText: number;
+  testText: number;
+  criterionText: number;
+  sourceTitle: number;
+  sourceEvidence: number;
+  question: number;
+  summary: number;
+  terminalSummary: number;
+  conclusionText: number;
+  conclusions: number;
+  sources: number;
+  openQuestionText: number;
+  openQuestions: number;
+  findingLocation: number;
+  findingText: number;
+  findings: number;
+  goal: number;
+  rationale: number;
+  actions: number;
+  tests: number;
+  criteria: number;
+  verification: number;
+  remainingRisks: number;
+  blockedReason: number;
+  needText: number;
+  needs: number;
+}
+
+const CURRENT_PAYLOAD_LIMITS: ControlPayloadLimits = {
+  actionText: 600, actionRisks: 4, riskText: 300, testText: 300, criterionText: 300,
+  sourceTitle: 200, sourceEvidence: 600, question: 600, summary: 2_000, terminalSummary: 1_200,
+  conclusionText: 600, conclusions: 12, sources: 12, openQuestionText: 300,
+  openQuestions: 6, findingLocation: 120, findingText: 600, findings: 12,
+  goal: 600, rationale: 2_000, actions: 12, tests: 12, criteria: 8,
+  verification: 12, remainingRisks: 6, blockedReason: 600, needText: 240, needs: 5,
+};
+
+const STORED_PAYLOAD_LIMITS: ControlPayloadLimits = {
+  actionText: 1_000, actionRisks: 6, riskText: 400, testText: 500, criterionText: 500,
+  sourceTitle: 300, sourceEvidence: 1_200, question: 1_200, summary: 4_000, terminalSummary: 2_000,
+  conclusionText: 1_200, conclusions: 20, sources: 20, openQuestionText: 600,
+  openQuestions: 12, findingLocation: 160, findingText: 1_000, findings: 20,
+  goal: 1_200, rationale: 4_000, actions: 20, tests: 20, criteria: 12,
+  verification: 20, remainingRisks: 12, blockedReason: 2_000, needText: 500, needs: 12,
+};
+
+function createControlPayloadSchemas(limits: ControlPayloadLimits) {
+  const action = z.object({
+    file: relativeFileHintSchema.optional(),
+    change: boundedText(limits.actionText),
+    why: boundedText(limits.actionText),
+    risks: z.array(boundedText(limits.riskText)).max(limits.actionRisks).optional(),
+  }).strict();
+  const researchSource = z.object({
+    title: boundedText(limits.sourceTitle),
     url: researchSourceUrlSchema.describe("Real external HTTP(S) source URL without credentials; never workspace:/ or file://"),
     publishedDate: publishedDateSchema.describe("YYYY-MM-DD when known, otherwise null"),
-    keyEvidence: boundedText(1200),
-  })
-  .strict();
-
-export const researchPayloadSchema = z
-  .object({
-    question: boundedText(1200),
-    summary: boundedText(4000),
-    conclusions: z.array(boundedText(1200)).min(1).max(20)
-      .describe("Evidence-backed conclusions. Cite workspace-relative files and line numbers here for local reads."),
-    sources: z.array(researchSourceSchema).max(20)
-      .describe("External sources actually consulted. Use [] for local-only research; never invent a URL to cite a local file."),
-    openQuestions: z.array(boundedText(600)).max(12).default([]),
-  })
-  .strict()
-  .describe("RESEARCH payload");
-
-const findingSchema = z
-  .object({
+    keyEvidence: boundedText(limits.sourceEvidence),
+  }).strict();
+  const finding = z.object({
     severity: z.enum(["low", "medium", "high"]),
     file: relativeFileHintSchema.optional(),
-    location: boundedText(160).optional(),
-    issue: boundedText(1000),
-    recommendation: boundedText(1000),
+    location: boundedText(limits.findingLocation).optional(),
+    issue: boundedText(limits.findingText),
+    recommendation: boundedText(limits.findingText),
+  }).strict();
+  return {
+    research: z.object({
+      question: boundedText(limits.question),
+      summary: boundedText(limits.summary),
+      conclusions: z.array(boundedText(limits.conclusionText)).min(1).max(limits.conclusions)
+        .describe("Evidence-backed conclusions. Cite workspace-relative files and line numbers here for local reads."),
+      sources: z.array(researchSource).max(limits.sources)
+        .describe("External sources actually consulted. Use [] for local-only research; never invent a URL to cite a local file."),
+      openQuestions: z.array(boundedText(limits.openQuestionText)).max(limits.openQuestions).default([]),
+    }).strict().describe("RESEARCH payload"),
+    plan: z.object({
+      goal: boundedText(limits.goal),
+      rationale: boundedText(limits.rationale),
+      actions: z.array(action).min(1).max(limits.actions),
+      tests: z.array(boundedText(limits.testText)).max(limits.tests).default([]),
+      successCriteria: z.array(boundedText(limits.criterionText)).min(1).max(limits.criteria),
+    }).strict().describe("PLAN payload"),
+    review: z.object({
+      summary: boundedText(limits.terminalSummary),
+      findings: z.array(finding).min(1).max(limits.findings),
+      actions: z.array(action).min(1).max(limits.actions),
+      tests: z.array(boundedText(limits.testText)).max(limits.tests).default([]),
+      successCriteria: z.array(boundedText(limits.criterionText)).min(1).max(limits.criteria),
+    }).strict().describe("REVIEW payload"),
+    done: z.object({
+      summary: boundedText(limits.terminalSummary),
+      verification: z.array(boundedText(limits.testText)).min(1).max(limits.verification),
+      remainingRisks: z.array(boundedText(limits.testText)).max(limits.remainingRisks).optional(),
+    }).strict().describe("DONE payload"),
+    blocked: z.object({
+      reason: boundedText(limits.blockedReason),
+      needs: z.array(boundedText(limits.needText)).min(1).max(limits.needs),
+    }).strict().describe("BLOCKED payload"),
+  };
+}
+
+const currentPayloadSchemas = createControlPayloadSchemas(CURRENT_PAYLOAD_LIMITS);
+const storedPayloadSchemas = createControlPayloadSchemas(STORED_PAYLOAD_LIMITS);
+export const researchPayloadSchema = currentPayloadSchemas.research;
+export const planPayloadSchema = currentPayloadSchemas.plan;
+export const reviewPayloadSchema = currentPayloadSchemas.review;
+export const donePayloadSchema = currentPayloadSchemas.done;
+export const blockedPayloadSchema = currentPayloadSchemas.blocked;
+
+function createControlResultSubmissionSchema(payloads: ReturnType<typeof createControlPayloadSchemas>) {
+  return z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("RESEARCH"), payload: payloads.research }).strict(),
+    z.object({ kind: z.literal("PLAN"), payload: payloads.plan }).strict(),
+    z.object({ kind: z.literal("REVIEW"), payload: payloads.review }).strict(),
+    z.object({ kind: z.literal("DONE"), payload: payloads.done }).strict(),
+    z.object({ kind: z.literal("BLOCKED"), payload: payloads.blocked }).strict(),
+  ]);
+}
+
+function createSubmitControlResultInputSchema(payloads: ReturnType<typeof createControlPayloadSchemas>) {
+  const correlation = {
+    requestId: c2cIdSchema,
+    localSessionId: c2cIdSchema,
+    taskId: c2cIdSchema,
+    iteration: z.number().int().min(0).max(MAX_C2C_ITERATION),
+  };
+  return z.discriminatedUnion("kind", [
+    z.object({ ...correlation, phase: z.literal("RESEARCH"), kind: z.literal("RESEARCH"), payload: payloads.research }).strict(),
+    z.object({ ...correlation, phase: z.literal("PLAN"), kind: z.literal("PLAN"), payload: payloads.plan }).strict(),
+    z.object({ ...correlation, phase: z.literal("REVIEW"), kind: z.literal("REVIEW"), payload: payloads.review }).strict(),
+    z.object({ ...correlation, phase: z.literal("REVIEW"), kind: z.literal("DONE"), payload: payloads.done }).strict(),
+    z.object({ ...correlation, phase: z.enum(CONTROL_PHASES), kind: z.literal("BLOCKED"), payload: payloads.blocked }).strict(),
+  ]);
+}
+
+export const controlResultSubmissionSchema = createControlResultSubmissionSchema(currentPayloadSchemas);
+const storedSubmitControlResultInputSchema = createSubmitControlResultInputSchema(storedPayloadSchemas);
+export const submitControlResultInputSchema = createSubmitControlResultInputSchema(currentPayloadSchemas);
+
+export type ControlResultSubmission = z.infer<typeof controlResultSubmissionSchema>;
+
+export type SubmitControlResultInput = z.infer<typeof submitControlResultInputSchema>;
+
+export const controlProgressUpdateSchema = z
+  .object({
+    status: z.enum(CONTROL_PROGRESS_STATES),
+    message: boundedText(500).optional(),
   })
   .strict();
 
-export const planPayloadSchema = z
-  .object({
-    goal: boundedText(1200),
-    rationale: boundedText(4000),
-    actions: z.array(actionSchema).min(1).max(20),
-    tests: z.array(testAdviceSchema).max(20).default([]),
-    successCriteria: z.array(successCriterionSchema).min(1).max(12),
-  })
-  .strict()
-  .describe("PLAN payload");
-
-export const reviewPayloadSchema = z
-  .object({
-    summary: boundedText(2000),
-    findings: z.array(findingSchema).min(1).max(20),
-    actions: z.array(actionSchema).min(1).max(20),
-    tests: z.array(testAdviceSchema).max(20).default([]),
-    successCriteria: z.array(successCriterionSchema).min(1).max(12),
-  })
-  .strict()
-  .describe("REVIEW payload");
-
-export const donePayloadSchema = z
-  .object({
-    summary: boundedText(2000),
-    verification: z.array(boundedText(500)).min(1).max(20),
-    remainingRisks: z.array(boundedText(500)).max(12).optional(),
-  })
-  .strict()
-  .describe("DONE payload");
-
-export const blockedPayloadSchema = z
-  .object({
-    reason: boundedText(2000),
-    needs: z.array(boundedText(500)).min(1).max(12),
-  })
-  .strict()
-  .describe("BLOCKED payload");
-
-export const submitControlResultInputSchema = z.discriminatedUnion("kind", [
-  z
-    .object({
-      requestId: c2cIdSchema,
-      localSessionId: c2cIdSchema,
-      taskId: c2cIdSchema,
-      iteration: z.number().int().min(0).max(MAX_C2C_ITERATION),
-      phase: z.literal("RESEARCH"),
-      kind: z.literal("RESEARCH"),
-      payload: researchPayloadSchema,
-    })
-    .strict(),
-  z
-    .object({
-      requestId: c2cIdSchema,
-      localSessionId: c2cIdSchema,
-      taskId: c2cIdSchema,
-      iteration: z.number().int().min(0).max(MAX_C2C_ITERATION),
-      phase: z.literal("PLAN"),
-      kind: z.literal("PLAN"),
-      payload: planPayloadSchema,
-    })
-    .strict(),
-  z
-    .object({
-      requestId: c2cIdSchema,
-      localSessionId: c2cIdSchema,
-      taskId: c2cIdSchema,
-      iteration: z.number().int().min(0).max(MAX_C2C_ITERATION),
-      phase: z.literal("REVIEW"),
-      kind: z.literal("REVIEW"),
-      payload: reviewPayloadSchema,
-    })
-    .strict(),
-  z
-    .object({
-      requestId: c2cIdSchema,
-      localSessionId: c2cIdSchema,
-      taskId: c2cIdSchema,
-      iteration: z.number().int().min(0).max(MAX_C2C_ITERATION),
-      phase: z.literal("REVIEW"),
-      kind: z.literal("DONE"),
-      payload: donePayloadSchema,
-    })
-    .strict(),
-  z
-    .object({
-      requestId: c2cIdSchema,
-      localSessionId: c2cIdSchema,
-      taskId: c2cIdSchema,
-      iteration: z.number().int().min(0).max(MAX_C2C_ITERATION),
-      phase: z.enum(CONTROL_PHASES),
-      kind: z.literal("BLOCKED"),
-      payload: blockedPayloadSchema,
-    })
-    .strict(),
-]);
-
-export type SubmitControlResultInput = z.infer<typeof submitControlResultInputSchema>;
+export type ControlProgressUpdate = z.infer<typeof controlProgressUpdateSchema>;
 
 export const reportControlProgressInputSchema = z
   .object({
@@ -370,12 +384,40 @@ export function parseSubmitControlResultInput(input: unknown): SubmitControlResu
   if (!parsed.success) {
     throw new ControlMailboxError("INVALID_RESULT", parsed.error.issues.map((issue) => issue.message).join("; "));
   }
+  assertCanonicalSize({ kind: parsed.data.kind, payload: parsed.data.payload });
+  return parsed.data;
+}
+
+export function parseControlResultSubmission(input: unknown): ControlResultSubmission {
+  const parsed = controlResultSubmissionSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new ControlMailboxError("INVALID_RESULT", parsed.error.issues.map((issue) => issue.message).join("; "));
+  }
   assertCanonicalSize(parsed.data);
   return parsed.data;
 }
 
+/** Validate immutable mailbox data accepted before the tighter admission contract. */
+export function parseStoredSubmitControlResultInput(input: unknown): SubmitControlResultInput {
+  const parsed = storedSubmitControlResultInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new ControlMailboxError("INVALID_RESULT", parsed.error.issues.map((issue) => issue.message).join("; "));
+  }
+  assertCanonicalSize({ kind: parsed.data.kind, payload: parsed.data.payload }, MAX_STORED_CONTROL_RESULT_BYTES);
+  return parsed.data as SubmitControlResultInput;
+}
+
 export function parseReportControlProgressInput(input: unknown): ReportControlProgressInput {
   const parsed = reportControlProgressInputSchema.safeParse(input);
+  if (!parsed.success) {
+    throw new ControlMailboxError("INVALID_RESULT", parsed.error.issues.map((issue) => issue.message).join("; "));
+  }
+  assertCanonicalSize(parsed.data);
+  return parsed.data;
+}
+
+export function parseControlProgressUpdate(input: unknown): ControlProgressUpdate {
+  const parsed = controlProgressUpdateSchema.safeParse(input);
   if (!parsed.success) {
     throw new ControlMailboxError("INVALID_RESULT", parsed.error.issues.map((issue) => issue.message).join("; "));
   }
@@ -391,10 +433,10 @@ export function sha256Hex(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-export function assertCanonicalSize(value: unknown): void {
+export function assertCanonicalSize(value: unknown, maximumBytes = MAX_CONTROL_RESULT_BYTES): void {
   const size = Buffer.byteLength(canonicalJson(value), "utf8");
-  if (size > MAX_CONTROL_RESULT_BYTES) {
-    throw new ControlMailboxError("INVALID_RESULT", `control result exceeds ${MAX_CONTROL_RESULT_BYTES} bytes`);
+  if (size > maximumBytes) {
+    throw new ControlMailboxError("INVALID_RESULT", `control result exceeds ${maximumBytes} bytes`);
   }
 }
 

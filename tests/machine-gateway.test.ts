@@ -547,11 +547,6 @@ describe("machine gateway", () => {
       gateway.releaseTurn(grantB.token, leaseB.lease);
 
       const resultB = {
-        requestId: requestB.request.requestId,
-        localSessionId: identityB.localSessionId,
-        taskId: "task-fence-b",
-        iteration: 0,
-        phase: "PLAN",
         kind: "PLAN",
         payload: {
           goal: "fence ownership",
@@ -573,11 +568,6 @@ describe("machine gateway", () => {
       }).status).toBe("pending");
 
       const resultA = {
-        requestId: requestA.request.requestId,
-        localSessionId: identityA.localSessionId,
-        taskId: "task-fence-a",
-        iteration: 0,
-        phase: "PLAN",
         kind: "PLAN",
         payload: {
           goal: "fence ownership",
@@ -683,11 +673,6 @@ describe("machine gateway", () => {
       gateway.releaseTurn(grant.token, lease.lease);
       checked = true;
       const receipt = gateway.completeControlResult(grant.token, fence, {
-        requestId: request.requestId,
-        localSessionId: identity.localSessionId,
-        taskId: "c2c_mailbox_atomic",
-        iteration: 0,
-        phase: "PLAN",
         kind: "PLAN",
         payload: {
           goal: "atomic mailbox publication",

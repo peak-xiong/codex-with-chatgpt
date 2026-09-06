@@ -130,8 +130,8 @@ describe("state-driven mailbox waiting", () => {
     await client.connect(clientTransport);
     try {
       const receipt = await client.callTool({ name: "submit_control_result", arguments: {
-        context_id: f.grant.token, requestId: f.request.requestId, localSessionId: f.identity.localSessionId,
-        ...correlation, kind: "BLOCKED", payload: { reason: "Unable to complete the research", needs: ["End this attempt and preserve completed work"] },
+        context_id: f.grant.token, kind: "BLOCKED",
+        payload: { reason: "Unable to complete the research", needs: ["End this attempt and preserve completed work"] },
       } });
       expect(receipt.isError, JSON.stringify(receipt)).not.toBe(true);
       expect(receipt.structuredContent).toMatchObject({ accepted: true, requestId: f.request.requestId, kind: "BLOCKED" });
@@ -236,10 +236,61 @@ describe("exact response terminal observations", () => {
     const f = fixture();
     const status = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, {
       ...f.observation, reason: "callback_missing", source: "host_observed", tool: "submit_control_result", errorCode: "UNKNOWN",
+      terminalResult: {
+        kind: "BLOCKED",
+        payload: { reason: "The final callback was unavailable", needs: ["End this attempt"] },
+      },
     });
-    expect(status).toMatchObject({ status: "cancelled", result: null, hostFailure: { reason: "callback_missing", source: "host_observed" } });
-    expect(controlWaitPolicy(status).nextAction).toBe("stop");
+    expect(status).toMatchObject({
+      status: "cancelled",
+      result: null,
+      hostFailure: { reason: "callback_missing", source: "host_observed" },
+      hostObservedResult: {
+        provenance: "host_observed",
+        result: { kind: "BLOCKED", payload: { reason: "The final callback was unavailable" } },
+      },
+    });
+    expect(controlWaitPolicy(status)).toMatchObject({ nextAction: "stop", delivery: "host_observed" });
     expect(f.gateway.turnStatus(f.grant.token).status).toBe("revoked");
+  });
+
+  it("rejects a host-observed kind that the request phase does not allow", () => {
+    const f = fixture();
+    expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, {
+      ...f.observation,
+      terminalResult: {
+        kind: "PLAN",
+        payload: {
+          goal: "Wrong phase", rationale: "RESEARCH cannot accept PLAN",
+          actions: [{ change: "Do nothing", why: "The phase is wrong" }], tests: [],
+          successCriteria: ["The observation is rejected"],
+        },
+      },
+    })).toThrow(/not allowed/i);
+    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation))
+      .toMatchObject({ status: "pending", result: null });
+  });
+
+  it("lets an already-started MCP completion settle before a host terminal fallback", () => {
+    const f = fixture();
+    const lease = f.gateway.claimTurn(f.grant.token, ["c2c.result.write"]);
+    const fence = f.gateway.beginCompletion(f.grant.token);
+    f.gateway.releaseTurn(f.grant.token, lease.lease);
+    const observed = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, {
+      ...f.observation,
+      terminalResult: {
+        kind: "BLOCKED",
+        payload: { reason: "The page did not see the receipt", needs: ["Reconcile the mailbox"] },
+      },
+    });
+    expect(observed).toMatchObject({ status: "pending", result: null });
+    expect(observed.hostObservedResult).toBeUndefined();
+    f.gateway.completeControlResult(f.grant.token, fence, {
+      kind: "BLOCKED",
+      payload: { reason: "The business task was refused", needs: ["End this attempt"] },
+    });
+    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation))
+      .toMatchObject({ status: "received", result: { kind: "BLOCKED" } });
   });
 
   it.each(["generating", "unknown"] as const)("does not infer refusal from %s or a quotation of historical BLOCKED text", (state) => {

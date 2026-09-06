@@ -60,6 +60,37 @@ afterEach(() => {
 });
 
 describe("machine MCP capability correlation", () => {
+  it("derives optional progress correlation from context and rejects legacy overrides", async () => {
+    cleanups.push(isolateStateDir());
+    const root = makeTmpDir("mcp-progress-binding");
+    cleanups.push(root);
+    const gateway = new MachineGateway();
+    const registration = gateway.registerWorkspace(root);
+    const turn = correlation();
+    const request = openControlResultRequest(registration.workspaceId, turn);
+    const grant = gateway.issueTurn({
+      ...registration, ...turn, requestId: request.requestId, scopes: ["c2c.result.write"],
+      compactionEpoch: 0, generation: 1,
+    });
+    const connection = await connectedClient(gateway);
+    try {
+      const reported = await connection.client.callTool({
+        name: "report_control_progress",
+        arguments: { context_id: grant.token, status: "SEARCHING", message: "Inspecting the bounded inputs" },
+      });
+      expect(reported.isError).not.toBe(true);
+      expect(getControlResultStatus(registration.workspaceId, request.requestId, turn.localSessionId, turn))
+        .toMatchObject({ status: "pending", progress: { status: "SEARCHING", taskId: turn.taskId } });
+      const rejected = await connection.client.callTool({
+        name: "report_control_progress",
+        arguments: { context_id: grant.token, taskId: "another-task", status: "READING_CODE" },
+      });
+      expect(rejected.isError).toBe(true);
+      expect(getControlResultStatus(registration.workspaceId, request.requestId, turn.localSessionId, turn))
+        .toMatchObject({ progress: { status: "SEARCHING" } });
+    } finally { await connection.close(); }
+  });
+
   it.each(CONTROL_PHASES)("delivers a %s refusal directly without progress or business reads", async (phase) => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("mcp-refusal");
@@ -77,7 +108,7 @@ describe("machine MCP capability correlation", () => {
       const receipt = await connection.client.callTool({
         name: "submit_control_result",
         arguments: {
-          context_id: grant.token, requestId: request.requestId, ...turn, kind: "BLOCKED",
+          context_id: grant.token, kind: "BLOCKED",
           payload: { reason: "Cannot complete the requested business action", needs: ["Provide a permitted alternative"] },
         },
       });
@@ -106,7 +137,7 @@ describe("machine MCP capability correlation", () => {
       const reply = await connection.client.callTool({
         name: "submit_control_result",
         arguments: {
-          context_id: grant.token, requestId: request.requestId, ...correlation(), kind: "BLOCKED",
+          context_id: grant.token, kind: "BLOCKED",
           payload: { reason: "Authorization ended", needs: ["Stop the current attempt"] },
         },
       });
@@ -130,8 +161,19 @@ describe("machine MCP capability correlation", () => {
     try {
       for (const iteration of [0, 1]) {
         const { tools } = await connection.client.listTools();
-        expect(tools.find((tool) => tool.name === "submit_control_result")?.annotations)
-          .toMatchObject({ readOnlyHint: false, destructiveHint: false, idempotentHint: true });
+        const submitTool = tools.find((tool) => tool.name === "submit_control_result");
+        expect(submitTool?.annotations).toMatchObject({
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        });
+        const inputProperties = (name: string) => Object.keys(
+          (tools.find((tool) => tool.name === name)?.inputSchema as { properties?: Record<string, unknown> }).properties ?? {},
+        );
+        expect(inputProperties("submit_control_result")).toEqual(["context_id", "kind", "payload"]);
+        expect(inputProperties("get_control_result_status")).toEqual(["context_id"]);
+        expect(inputProperties("report_control_progress")).toEqual(["context_id", "status", "message"]);
         await Promise.all(registrations.map(async (registration, index) => {
           const turn = { localSessionId: `session-local-${index}`, taskId: "local-research", iteration, phase: "RESEARCH" as const };
           const request = openControlResultRequest(registration.workspaceId, { ...turn, ttlMs: 60_000 });
@@ -150,7 +192,7 @@ describe("machine MCP capability correlation", () => {
           };
           const receipt = await connection.client.callTool({
             name: "submit_control_result",
-            arguments: { context_id: grant.token, requestId: request.requestId, ...turn, kind: "RESEARCH", payload },
+            arguments: { context_id: grant.token, kind: "RESEARCH", payload },
           });
           expect(receipt.isError).not.toBe(true);
           expect(receipt.structuredContent).toMatchObject({ accepted: true, requestId: request.requestId });
@@ -264,11 +306,7 @@ describe("machine MCP capability correlation", () => {
     try {
       const status = await connection.client.callTool({
         name: "get_control_result_status",
-        arguments: {
-          context_id: first.token,
-          requestId: firstRequest.requestId,
-          ...correlation(),
-        },
+        arguments: { context_id: first.token },
       });
       expect(status.isError).not.toBe(true);
       expect(JSON.stringify(status)).toContain('"status":"pending"');
@@ -277,8 +315,6 @@ describe("machine MCP capability correlation", () => {
         name: "submit_control_result",
         arguments: {
           context_id: first.token,
-          requestId: firstRequest.requestId,
-          ...correlation(),
           kind: "PLAN",
           payload: planPayload(),
         },
@@ -310,14 +346,13 @@ describe("machine MCP capability correlation", () => {
         arguments: {
           context_id: second.token,
           requestId: firstRequest.requestId,
-          ...correlation(),
           kind: "PLAN",
           payload: planPayload(),
         },
       });
       expect(replay.isError).toBe(true);
-      expect(JSON.stringify(replay)).toContain("TURN_CORRELATION_MISMATCH");
-      expect(gateway.turnStatus(second.token).status).toBe("active");
+      expect(JSON.stringify(replay)).toMatch(/invalid|unrecognized|requestId/i);
+      expect(gateway.turnStatus(second.token).status).toBe("issued");
       expect(
         getControlResultStatus(
           registration.workspaceId,
@@ -326,6 +361,16 @@ describe("machine MCP capability correlation", () => {
           correlation(),
         ).status,
       ).toBe("pending");
+
+      const acceptedSecond = await connection.client.callTool({
+        name: "submit_control_result",
+        arguments: { context_id: second.token, kind: "PLAN", payload: planPayload() },
+      });
+      expect(acceptedSecond.isError).not.toBe(true);
+      expect(acceptedSecond.structuredContent).toMatchObject({
+        accepted: true,
+        requestId: secondRequest.requestId,
+      });
     } finally {
       await connection.close();
     }

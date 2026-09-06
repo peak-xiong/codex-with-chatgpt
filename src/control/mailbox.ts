@@ -3,9 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import {
   controlHostFailureSchema,
+  controlHostObservedResultSchema,
+  controlTerminalObservationSchema,
   controlWaitPolicy,
   CONTROL_PAGE_CHECK_INTERVAL_MS,
   type ControlHostFailure,
+  type ControlHostObservedResult,
+  type ControlTerminalObservation,
 } from "./wait-policy.js";
 import {
   ensureDir,
@@ -28,6 +32,7 @@ import {
   type ControlResultReceipt,
   type ControlResultRequest,
   parseSubmitControlResultInput,
+  parseStoredSubmitControlResultInput,
   parseReportControlProgressInput,
   type ReportControlProgressInput,
   sha256Hex,
@@ -61,6 +66,7 @@ export interface ControlStatus {
   result: ControlResultEnvelope | null;
   progress: ControlProgressEnvelope | null;
   hostFailure?: ControlHostFailure;
+  hostObservedResult?: ControlHostObservedResult;
 }
 
 /**
@@ -213,7 +219,7 @@ function readTerminalMarker(
   workspaceId: string,
   request: ControlResultRequest,
   kind: TerminalMarkerKind
-): { timestamp: string; hostFailure?: ControlHostFailure } | null {
+): { timestamp: string; hostFailure?: ControlHostFailure; hostObservedResult?: ControlHostObservedResult } | null {
   const value = readStoredJson(
     terminalMarkerFile(workspaceId, request.requestId, kind),
     `${kind} request marker`
@@ -233,6 +239,7 @@ function readTerminalMarker(
       "phase",
       timestampField,
       ...(kind === "cancelled" && value.hostFailure !== undefined ? ["hostFailure"] : []),
+      ...(kind === "cancelled" && value.hostObservedResult !== undefined ? ["hostObservedResult"] : []),
     ])
   ) {
     integrityError(`${kind} request marker schema is invalid`);
@@ -257,7 +264,23 @@ function readTerminalMarker(
     }
     hostFailure = parsed.data;
   }
-  return { timestamp, ...(hostFailure ? { hostFailure } : {}) };
+  let hostObservedResult: ControlHostObservedResult | undefined;
+  if (value.hostObservedResult !== undefined) {
+    const parsed = controlHostObservedResultSchema.safeParse(value.hostObservedResult);
+    if (
+      !parsed.success || !hostFailure ||
+      parsed.data.observedAt !== hostFailure.observedAt ||
+      !request.allowedKinds.includes(parsed.data.result.kind)
+    ) {
+      integrityError("cancelled request host-observed result is invalid");
+    }
+    hostObservedResult = parsed.data;
+  }
+  return {
+    timestamp,
+    ...(hostFailure ? { hostFailure } : {}),
+    ...(hostObservedResult ? { hostObservedResult } : {}),
+  };
 }
 
 function writeTerminalMarker(
@@ -265,6 +288,7 @@ function writeTerminalMarker(
   request: ControlResultRequest,
   kind: TerminalMarkerKind,
   hostFailure?: ControlHostFailure,
+  hostObservedResult?: ControlHostObservedResult,
 ): void {
   const timestampField = terminalMarkerTimestampField(kind);
   const marker = {
@@ -277,6 +301,7 @@ function writeTerminalMarker(
     phase: request.phase,
     [timestampField]: new Date().toISOString(),
     ...(hostFailure ? { hostFailure } : {}),
+    ...(hostObservedResult ? { hostObservedResult } : {}),
   };
   const file = terminalMarkerFile(workspaceId, request.requestId, kind);
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -468,7 +493,7 @@ function readResult(workspaceId: string, request: ControlResultRequest): Control
 
   let submitted: SubmitControlResultInput;
   try {
-    submitted = parseSubmitControlResultInput({
+    submitted = parseStoredSubmitControlResultInput({
       requestId: value.requestId,
       localSessionId: value.localSessionId,
       taskId: value.taskId,
@@ -611,7 +636,12 @@ function isExpired(request: ControlResultRequest, now = Date.now()): boolean {
 function readTerminalState(
   workspaceId: string,
   request: ControlResultRequest
-): { kind: TerminalMarkerKind; timestamp: string; hostFailure?: ControlHostFailure } | null {
+): {
+  kind: TerminalMarkerKind;
+  timestamp: string;
+  hostFailure?: ControlHostFailure;
+  hostObservedResult?: ControlHostObservedResult;
+} | null {
   const acknowledgedAt = readTerminalMarker(workspaceId, request, "acknowledged");
   const cancelledAt = readTerminalMarker(workspaceId, request, "cancelled");
   if (acknowledgedAt && cancelledAt) {
@@ -946,7 +976,8 @@ export function getControlResultStatus(
   if (terminal?.kind === "cancelled") {
     if (result) integrityError("cancelled control result request unexpectedly contains a result");
     return { requestId: resolvedRequestId, status: "cancelled", request, result: null, progress,
-      ...(terminal.hostFailure ? { hostFailure: terminal.hostFailure } : {}) };
+      ...(terminal.hostFailure ? { hostFailure: terminal.hostFailure } : {}),
+      ...(terminal.hostObservedResult ? { hostObservedResult: terminal.hostObservedResult } : {}) };
   }
   if (result) return { requestId: resolvedRequestId, status: "received", request, result, progress };
   if (isExpired(request)) {
@@ -1082,11 +1113,12 @@ export function recordControlHostFailure(
   requestId: string,
   localSessionId: string,
   expected: ControlResultCorrelation,
-  observation: ControlHostFailure,
+  observation: ControlTerminalObservation,
 ): ControlStatus {
-  const parsed = controlHostFailureSchema.safeParse(observation);
+  const parsed = controlTerminalObservationSchema.safeParse(observation);
   if (!parsed.success) throw new ControlMailboxError("INVALID_RESULT", "invalid host failure observation");
-  const failure = parsed.data;
+  const { terminalResult, ...failureInput } = parsed.data;
+  const failure = controlHostFailureSchema.parse(failureInput);
   if (failure.responseToRequestId !== requestId) {
     throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "observation belongs to another response");
   }
@@ -1094,7 +1126,18 @@ export function recordControlHostFailure(
     withFileLock(requestLockFile(workspaceId, requestId), () => {
       const status = getControlResultStatus(workspaceId, requestId, localSessionId, expected);
       if (status.status !== "pending") return status;
-      writeTerminalMarker(workspaceId, status.request!, "cancelled", failure);
+      if (terminalResult && !status.request!.allowedKinds.includes(terminalResult.kind)) {
+        throw new ControlMailboxError(
+          "MAILBOX_KIND_NOT_ALLOWED",
+          `${terminalResult.kind} is not allowed for ${status.request!.phase}`,
+        );
+      }
+      const hostObservedResult = terminalResult ? controlHostObservedResultSchema.parse({
+        provenance: "host_observed",
+        observedAt: failure.observedAt,
+        result: terminalResult,
+      }) : undefined;
+      writeTerminalMarker(workspaceId, status.request!, "cancelled", failure, hostObservedResult);
       clearActiveRequest(workspaceId, localSessionId, requestId);
       return getControlResultStatus(workspaceId, requestId, localSessionId, expected);
     }),

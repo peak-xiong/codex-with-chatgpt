@@ -26,10 +26,13 @@ import {
   planPayloadSchema,
   researchPayloadSchema,
   reviewPayloadSchema,
-  parseSubmitControlResultInput,
+  parseControlResultSubmission,
 } from "../control/result-schema.js";
 import type { Logger } from "../logger/index.js";
-import { controlHostFailureSchema } from "../control/wait-policy.js";
+import {
+  controlHostFailureSchema,
+  controlHostObservedResultSchema,
+} from "../control/wait-policy.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 import {
   MachineGateway,
@@ -346,6 +349,7 @@ const controlResultStatusOutputSchema = {
   result: z.unknown().nullable(),
   progress: controlProgressOutputSchema.nullable(),
   hostFailure: controlHostFailureSchema.optional(),
+  hostObservedResult: controlHostObservedResultSchema.optional(),
 };
 
 export interface McpContext {
@@ -699,31 +703,18 @@ export function createMcpServer(ctx: McpContext): McpServer {
     {
       title: "Get control result status",
       description:
-        `Read the exact status of one active C2C result request. Supply the request id and all ` +
-        `correlation fields from the current control prompt. This does not consume or acknowledge ` +
-        `the result. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+        `Read the exact status bound to this turn's context. The context selects the request, local session, ` +
+        `task, iteration and phase; do not supply those fields. This does not consume or acknowledge the result. ${UNTRUSTED_NOTE}`,
+      inputSchema: z.object({
         context_id: contextIdSchema,
-        requestId: c2cIdSchema.describe("Active RESULT_REQUEST_ID created by Codex"),
-        localSessionId: c2cIdSchema.describe("Exact LOCAL_SESSION_ID supplied by Codex"),
-        taskId: c2cIdSchema.describe("C2C task id bound to the active request"),
-        iteration: c2cIterationSchema.describe("C2C iteration bound to the active request"),
-        phase: z.enum(CONTROL_PHASES).describe("Exact RESULT_PHASE bound to the active request"),
-      },
+      }).strict(),
       outputSchema: controlResultStatusOutputSchema,
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (args) =>
-      withClaimedWorkspace(gateway, args.context_id, ["c2c.result.write"], ({ workspace, lease }) => {
-        if (!correlationMatches(lease.binding, args)) return correlationMismatch();
-        return okStructured(
-          gateway.controlResultStatusForTurn(args.context_id, args.requestId, args.localSessionId, {
-            taskId: args.taskId,
-            iteration: args.iteration,
-            phase: args.phase,
-          })
-        );
-      })
+      withClaimedWorkspace(gateway, args.context_id, ["c2c.result.write"], () =>
+        okStructured(gateway.controlResultStatusForTurn(args.context_id))
+      )
   );
 
   server.registerTool(
@@ -734,24 +725,18 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `Optionally report bounded progress for the active C2C question; it is never required before final submission. Progress can move only forward through ` +
         `SEARCHING, READING_CODE, and SYNTHESIZING, with at most one accepted update per state. ` +
         `This does not edit workspace files or run commands. Only use it when Codex supplied the ` +
-        `active RESULT_REQUEST_ID and RESULT_PHASE. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+        `active turn context; that context selects all request correlation. ${UNTRUSTED_NOTE}`,
+      inputSchema: z.object({
         context_id: contextIdSchema,
-        requestId: c2cIdSchema.describe("Active RESULT_REQUEST_ID created by Codex"),
-        localSessionId: c2cIdSchema.describe("Exact LOCAL_SESSION_ID supplied by Codex for this question"),
-        taskId: c2cIdSchema.describe("C2C task id bound to the active request"),
-        iteration: c2cIterationSchema.describe("C2C iteration bound to the active request"),
-        phase: z.enum(CONTROL_PHASES).describe("Exact RESULT_PHASE bound to the active request"),
         status: z.enum(CONTROL_PROGRESS_STATES).describe("Current monotonic progress state"),
         message: z.string().min(1).max(500).optional().describe("Short user-safe progress detail"),
-      },
+      }).strict(),
       outputSchema: reportControlProgressOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (args) =>
-      withClaimedWorkspace(gateway, args.context_id, ["c2c.result.write"], ({ workspace, lease }) => {
+      withClaimedWorkspace(gateway, args.context_id, ["c2c.result.write"], () => {
         const { context_id: _contextId, ...input } = args;
-        if (!correlationMatches(lease.binding, input)) return correlationMismatch();
         return okStructured(gateway.controlProgressForTurn(args.context_id, input));
       })
   );
@@ -769,14 +754,9 @@ export function createMcpServer(ctx: McpContext): McpServer {
         `For local-only RESEARCH use sources: [] and cite relative file paths/lines in conclusions. ` +
         `External sources require title, a real HTTP(S) url, publishedDate (YYYY-MM-DD or null), and keyEvidence; ` +
         `workspace:/ and file:// are not external sources. Never invent sources. ` +
-        `Only use it when Codex supplied the active RESULT_REQUEST_ID and RESULT_PHASE. ${UNTRUSTED_NOTE}`,
-      inputSchema: {
+        `The context selects the exact request correlation; submit only kind and its matching payload. ${UNTRUSTED_NOTE}`,
+      inputSchema: z.object({
         context_id: contextIdSchema,
-        requestId: c2cIdSchema.describe("Active RESULT_REQUEST_ID created by Codex"),
-        localSessionId: c2cIdSchema.describe("Exact LOCAL_SESSION_ID supplied by Codex for this question"),
-        taskId: c2cIdSchema.describe("C2C task id bound to the active request"),
-        iteration: c2cIterationSchema.describe("C2C iteration bound to the active request"),
-        phase: z.enum(CONTROL_PHASES).describe("Exact RESULT_PHASE bound to the active request"),
         kind: z.enum(CONTROL_RESULT_KINDS).describe("Control result kind"),
         payload: z
           .union([
@@ -787,9 +767,9 @@ export function createMcpServer(ctx: McpContext): McpServer {
             blockedPayloadSchema,
           ])
           .describe("Kind-specific structured payload; its shape must match kind"),
-      },
+      }).strict(),
       outputSchema: submitControlResultOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (args) => {
       let context: MachineTurnContext | null = null;
@@ -798,15 +778,9 @@ export function createMcpServer(ctx: McpContext): McpServer {
       try {
         context = gateway.claimTurn(args.context_id, ["c2c.result.write"]);
         const { context_id: _contextId, ...input } = args;
-        const parsed = parseSubmitControlResultInput(input);
-        if (!correlationMatches(context.lease.binding, parsed)) return correlationMismatch();
+        const parsed = parseControlResultSubmission(input);
 
-        const status = gateway.controlResultStatusForTurn(
-          args.context_id,
-          parsed.requestId,
-          parsed.localSessionId,
-          { taskId: parsed.taskId, iteration: parsed.iteration, phase: parsed.phase }
-        );
+        const status = gateway.controlResultStatusForTurn(args.context_id);
         if (status.status === "not_found") {
           return fail("MAILBOX_REQUEST_NOT_FOUND", "Control result request was not found.");
         }
@@ -817,7 +791,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
           return fail("MAILBOX_REQUEST_EXPIRED", "Control result request has expired.");
         }
         if (!status.request?.allowedKinds.includes(parsed.kind)) {
-          return fail("MAILBOX_KIND_NOT_ALLOWED", `${parsed.kind} is not allowed for ${parsed.phase}.`);
+          return fail("MAILBOX_KIND_NOT_ALLOWED", `${parsed.kind} is not allowed for this request phase.`);
         }
 
         fence = gateway.beginCompletion(args.context_id);

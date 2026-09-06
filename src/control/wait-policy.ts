@@ -1,6 +1,10 @@
 import { z } from "zod";
 import type { ControlStatus } from "./mailbox.js";
-import { ControlMailboxError, c2cIdSchema } from "./result-schema.js";
+import {
+  ControlMailboxError,
+  c2cIdSchema,
+  controlResultSubmissionSchema,
+} from "./result-schema.js";
 
 export const CONTROL_PAGE_CHECK_INTERVAL_MS = 30_000;
 
@@ -22,12 +26,24 @@ export const controlHostFailureSchema = observationIdentity.extend({
   errorCode: z.enum(["TOKEN_REVOKED", "TOKEN_EXPIRED", "STALE_BINDING_EPOCH", "TOOL_UNAVAILABLE", "SAFETY_CHECK_BLOCKED", "APPROVAL_REQUIRED", "UNKNOWN"]).optional(),
 }).strict();
 
+export const controlHostObservedResultSchema = z.object({
+  provenance: z.literal("host_observed"),
+  observedAt: z.string().datetime(),
+  result: controlResultSubmissionSchema,
+}).strict();
+
+export const controlTerminalObservationSchema = controlHostFailureSchema.extend({
+  terminalResult: controlResultSubmissionSchema.optional(),
+}).strict();
+
 export const controlPageObservationSchema = z.discriminatedUnion("state", [
-  controlHostFailureSchema,
+  controlTerminalObservationSchema,
   observationIdentity.extend({ state: z.enum(["generating", "unknown"]) }).strict(),
 ]);
 
 export type ControlHostFailure = z.infer<typeof controlHostFailureSchema>;
+export type ControlHostObservedResult = z.infer<typeof controlHostObservedResultSchema>;
+export type ControlTerminalObservation = z.infer<typeof controlTerminalObservationSchema>;
 export type ControlPageObservation = z.infer<typeof controlPageObservationSchema>;
 
 export function parseControlPageObservation(value: unknown): ControlPageObservation {
@@ -39,11 +55,14 @@ export function parseControlPageObservation(value: unknown): ControlPageObservat
 export function controlWaitPolicy(status: ControlStatus, now = Date.now()) {
   const remainingMs = status.request ? Math.max(0, Date.parse(status.request.expiresAt) - now) : 0;
   const received = status.status === "received" || status.status === "acknowledged";
+  const hostObserved = status.status === "cancelled" && status.hostObservedResult !== undefined;
   const outcome = received
     ? status.result?.kind === "BLOCKED" ? "blocked" : "delivered"
+    : hostObserved && status.hostObservedResult?.result.kind === "BLOCKED" ? "blocked"
     : status.status !== "pending" ? "terminal" : "pending";
   return {
     outcome,
+    delivery: received ? "mcp" : hostObserved ? "host_observed" : "none",
     nextAction: received
       ? status.status === "received" ? "persist_then_ack" : "stop"
       : outcome === "pending" ? "inspect_exact_response" : "stop",

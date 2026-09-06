@@ -615,7 +615,7 @@ public artifacts. The structured `resultContract` exposes the same instructions.
 Ask ChatGPT to check that `submit_control_result` is callable in this message
 before spending work on research/analysis. Tool names quoted in history and
 catalog membership are not proof. If `get_control_result_status` is exposed,
-call it with the exact correlation and proceed only for `pending`. Its absence
+call it with `context_id` only and proceed only for the bound `pending` request. Its absence
 alone does not block a usable callback; the host reads and acknowledges the
 authoritative mailbox. This is a host/prompt workflow, not a claim that the CLI
 can introspect or force the webpage's tool selection.
@@ -625,7 +625,7 @@ turn. Record phase, request ID, timestamp and sanitized observed error/trace;
 distinguish actual MCP error evidence from a model-reported error. Do not infer
 that missing selection caused a rejection, or that a safety check came from
 C2C. Do not bypass platform checks, change read/write annotations, switch
-accounts/models/apps, or forge a result from browser text. If the same callback
+accounts/models/apps, or treat arbitrary browser text as a result. If the same callback
 is available and permitted it may submit `BLOCKED`; otherwise report locally.
 The host checks the mailbox before cancelling that exact failed pending request,
 and consumes any receipt that won the race. Do not cancel merely for a generation
@@ -634,9 +634,11 @@ the failed authorization.
 
 ## Result payloads
 
-`submit_control_result` takes `context_id`, `requestId`, `localSessionId`,
-`taskId`, `iteration`, `phase`, `kind` and `payload`. Copy the exact correlation
-from `control open`; do not send the whole CLI response as tool arguments.
+`submit_control_result` takes only `context_id`, `kind` and `payload`.
+`get_control_result_status` takes only `context_id`; optional progress takes
+`context_id`, `status` and optional `message`. The capability binding supplies
+the exact request, workspace, local session, task, iteration and phase. Extra
+or legacy correlation fields are rejected instead of overriding the binding.
 `resultContract.examples` contains schema-valid scaffolds for all allowed kinds
 of the requested phase. Replace their placeholders with actual findings. They
 are not evidence and must never be submitted verbatim as a successful answer.
@@ -682,6 +684,10 @@ reconcile the failed attempt separately.
 and the original request phase. It does not use the RESEARCH payload shape.
 PLAN accepts PLAN/BLOCKED; REVIEW accepts REVIEW/DONE/BLOCKED. Use DONE for
 a clean review instead of inventing findings to populate a REVIEW payload.
+New results are limited to 16 KiB of canonical UTF-8 JSON, with tighter text
+and list limits; `BLOCKED.reason` is at most 600 characters and `needs` contains
+at most five items of 240 characters. Reject overflow rather than truncating it.
+Previously accepted mailbox results retain their original 32 KiB read limit.
 
 Acceptance requires `pending -> received -> acknowledged` for each exact
 request. Test consecutive messages in one chat and concurrent requests in
@@ -735,7 +741,7 @@ TASK_GOAL: <short goal without pasted repository content>
 
 Use MCP with context_id "<context-id>" for every call. Work only in the
 workspace identified by that context. Return the requested phase result using
-submit_control_result for this exact RESULT_REQUEST_ID. Before starting, check
+submit_control_result with context_id, kind and payload only. Before starting, check
 that this callback is callable in the current message, not just in history.
 Follow the resultContract instructions and phase example from control open.
 For local-only RESEARCH, use sources: [] and cite relative files/lines in
@@ -747,10 +753,13 @@ source, diffs, logs, or credentials into this prompt. Do not modify files;
 Codex executes locally.
 On a business refusal, failed business read, missing input or inability to
 complete, proactively submit BLOCKED with payload {reason, needs} through
-submit_control_result, using this exact request and original phase, before
+submit_control_result before
 your final page reply. Do not wait for the user to interrupt or prompt again.
 Progress reporting is optional. Respect platform blocks and revoked/expired
-authorization; a page-only failure is not an MCP receipt.
+authorization. If no permitted callback exists, end the exact response with
+`C2C_HOST_OBSERVED_RESULT` and one schema-valid allowed `{kind,payload}` JSON
+object paired to the request ID. This may be recorded as host-observed evidence,
+but it is never an MCP receipt.
 
 `DELEGATION_MODE: CHATGPT_FIRST` is a routing policy, not an authorization
 grant. The Connector exposes only the bounded MCP tools listed above. Web
@@ -816,6 +825,7 @@ has been accepted; it does not establish that ChatGPT is still generating.
 | `elapsedMs` | Time since original request creation, for diagnostics only |
 | `checkPageAfterMs` | At most 30 seconds; earlier at half the remaining activity lease |
 | `outcome` | `pending`, `delivered`, `blocked` or `terminal` |
+| `delivery` | `mcp`, `host_observed` or `none`; only `mcp` is a receipt |
 | `nextAction` | `inspect_exact_response`, `persist_then_ack` or `stop` |
 
 `control wait` caps each slice at 30 seconds even if a larger `--timeout-ms`
@@ -859,7 +869,14 @@ this example is neither a probe nor evidence:
   "reason": "platform_blocked",
   "source": "model_reported",
   "tool": "report_control_progress",
-  "errorCode": "SAFETY_CHECK_BLOCKED"
+  "errorCode": "SAFETY_CHECK_BLOCKED",
+  "terminalResult": {
+    "kind": "BLOCKED",
+    "payload": {
+      "reason": "The final callback was unavailable",
+      "needs": ["End this attempt"]
+    }
+  }
 }
 ```
 
@@ -903,13 +920,18 @@ is `TOKEN_REVOKED`, `TOKEN_EXPIRED`, `STALE_BINDING_EPOCH`, `TOOL_UNAVAILABLE`,
 `SAFETY_CHECK_BLOCKED`, `APPROVAL_REQUIRED` or `UNKNOWN`. Unknown causes remain
 unknown. Raw excerpts and arbitrary error strings are rejected without echoing
 them. No capability, key, cookie or business payload belongs in this record.
+`terminalResult` is optional and accepts only one current schema-valid
+`{kind,payload}` allowed by the original request phase. It must come from the
+exact final response after the marker above, never from an older quoted reply.
 
 The authenticated host-only `/admin/mailbox/observe` endpoint is not an MCP
-tool and cannot write a result. A confirmed failure atomically reconciles under
+tool and cannot create an MCP result. A confirmed failure atomically reconciles under
 the existing session/request locks: a received result wins and remains available
 for checkpoint persistence followed by acknowledgment; otherwise the pending
 request is cancelled and its exact capabilities are revoked. The cancellation
-stores `hostFailure` separately, retaining the last accepted progress. Do not
+stores `hostFailure` and any validated `hostObservedResult` separately, retaining
+the last accepted progress. `result` remains null, no result ID or receipt is
+created, and no acknowledgment is allowed. Do not
 ack a nonexistent result or describe this as ChatGPT having submitted BLOCKED.
 Other sessions and task checkpoints are not changed. Repeated observation of
 the same terminal request is idempotent.
@@ -939,5 +961,7 @@ rotation, claim a new generation and issue a new context. On gateway restart,
 wait for the new `bootEpoch`, re-register the workspace, and issue a new
 context. Never reuse a stale capability.
 
-Browser text is never accepted as a control result. Recovery resumes or cancels
-the exact protected mailbox request and issues a fresh context when required.
+Browser text is never accepted as an MCP control result. Only a schema-valid
+terminal object paired to the exact response may be retained as separately
+labelled host-observed evidence; it cannot become a receipt. Recovery resumes
+or cancels the exact protected mailbox request and issues a fresh context when required.

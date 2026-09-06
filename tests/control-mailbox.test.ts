@@ -362,18 +362,19 @@ describe("control result mailbox", () => {
           iteration: 3,
           payload: {
             goal: "reject oversized results",
-            rationale: "x".repeat(4_000),
-            actions: Array.from({ length: 20 }, (_, index) => ({
+            rationale: "x".repeat(1_900),
+            actions: Array.from({ length: 12 }, (_, index) => ({
               file: `src/file-${index}.ts`,
-              change: "x".repeat(1_000),
-              why: "y".repeat(1_000),
+              change: "x".repeat(500),
+              why: "y".repeat(500),
+              risks: Array.from({ length: 4 }, () => "risk ".padEnd(280, "z")),
             })),
             tests: [],
             successCriteria: ["rejected"],
           },
         })
       )
-    ).toThrow(/exceeds 32768 bytes/);
+    ).toThrow(/exceeds 16384 bytes/);
   });
 
   it("receives and acknowledges local-only research without invented external sources", () => {
