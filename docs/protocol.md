@@ -816,6 +816,13 @@ independently observed Project/chat URLs match the selected Project may the
 local harness save or replace the session URL. A page answer, host-observed
 terminal object or BOOT progress event is not a receipt.
 
+Surface commit is a durable, idempotent sequence rather than an indivisible
+filesystem transaction. If route storage or BOOT acknowledgement persists but
+later active-pointer cleanup fails, replay the exact same candidate, BOOT
+request, generation, tab, and observed chat URL. The replay completes the
+acknowledgement cleanup and request-scoped revocation without creating another
+BOOT result or route.
+
 ## Control prompt
 
 Each control prompt must contain all of these fields and no pasted diff/log:
@@ -998,6 +1005,16 @@ tab/chat/generation, canonical chat URL and fresh timestamp (within 60 seconds,
 not before the request). It does not independently verify the host's UI claim.
 `responseToRequestId` means the host observed which prompt the response answers;
 do not fill it from an unrelated page or a quoted request ID.
+
+Those page, route, lease, and freshness checks gate only the first persistence
+of an observation. Once a cancellation marker with `hostFailure` is durable, an
+exact terminal replay may bypass the current-page and 60-second gates solely to
+finish observation and active-pointer cleanup after delay, restart, or route
+replacement. Mailbox comparison must prove the replay matches the stored
+failure and optional host-observed result exactly; it cannot refresh the event,
+renew access, reclassify the outcome, or create an MCP receipt. Plain
+cancellation similarly revokes the exact request once its terminal marker is
+durable, even if active-pointer cleanup fails and must be replayed.
 
 All states include `tabId`, `generation`, `observedAt`,
 `responseToRequestId`, and `observationSequence`. States observed on a live page

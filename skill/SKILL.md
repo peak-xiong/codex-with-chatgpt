@@ -523,8 +523,10 @@ After a successful check, inspect the current page URL. If ChatGPT created the
 first conversation, it must be a `/g/<project>/c/<chat>` URL belonging to the
 claimed Project. Commit the exact verified lease through the coordinated surface
 operation, supplying that observed URL and the real BOOT mailbox request.
-`surface commit` atomically verifies and acknowledges that BOOT receipt, revokes
-its remaining capability, and saves the Project/chat route for this local session:
+`surface commit` durably coordinates BOOT receipt verification, route storage,
+acknowledgement, capability revocation, and active-pointer cleanup. Each step is
+idempotent, so replay the exact same commit after a partial local write failure;
+never create another BOOT request or candidate to complete cleanup:
 
 ```sh
 c2c surface commit \
@@ -767,6 +769,16 @@ transition, or replace the response identity. `page_lost` and
 Use `authority_invalid` only after the exact request capability actually
 returned a revoked, expired, or stale-binding error; the Gateway rejects it
 while any matching capability remains live.
+
+The current page, lease, route, and 60-second freshness gates apply when first
+recording an observation. If a terminal marker and `hostFailure` are already
+durable, an exact replay may run later or after page replacement solely to
+finish observation and active-pointer cleanup. It must match the stored terminal
+records exactly, cannot refresh `observedAt`, renew authority, or create a new
+result, and still revokes only that exact request. A normal cancellation also
+revokes that request as soon as its cancellation marker is durable, even when
+active-pointer cleanup must be retried.
+
 Resolve the exact owned tab and inspect only the response paired with this
 request's prompt. Never classify quoted historical BLOCKED text or another
 response as this turn's failure. This is a bounded health check, not the normal

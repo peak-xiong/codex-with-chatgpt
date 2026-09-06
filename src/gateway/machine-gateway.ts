@@ -308,13 +308,11 @@ export class MachineGateway {
       ...routeOptions,
       requireProjectSelection: true,
     });
-    if (boot.status === "received") {
-      acknowledgeControlResult(identity.workspaceId, bootRequestId, identity.localSessionId, {
-        taskId: boot.request!.taskId,
-        iteration: boot.request!.iteration,
-        phase: "BOOT",
-      });
-    }
+    acknowledgeControlResult(identity.workspaceId, bootRequestId, identity.localSessionId, {
+      taskId: boot.request!.taskId,
+      iteration: boot.request!.iteration,
+      phase: "BOOT",
+    });
     this.broker.revokeRequest({
       ...identity,
       taskId: boot.request!.taskId,
@@ -533,16 +531,27 @@ export class MachineGateway {
     expected: ControlResultCorrelation,
   ): ControlStatus {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
-    const status = cancelControlResultRequest(
-      identity.workspaceId,
-      requestId,
-      identity.localSessionId,
-      expected,
-    );
-    if (status.status === "cancelled") {
-      this.broker.revokeRequest({ ...identity, ...expected, requestId });
+    try {
+      const status = cancelControlResultRequest(
+        identity.workspaceId,
+        requestId,
+        identity.localSessionId,
+        expected,
+      );
+      if (status.status === "cancelled") {
+        this.broker.revokeRequest({ ...identity, ...expected, requestId });
+      }
+      return status;
+    } catch (error) {
+      try {
+        const latest = this.getControlResultStatus(identity, requestId, expected);
+        if (latest.status === "cancelled") {
+          this.broker.revokeRequest({ ...identity, ...expected, requestId });
+        }
+      } finally {
+        throw error;
+      }
     }
-    return status;
   }
 
   observeControlPage(
@@ -555,6 +564,19 @@ export class MachineGateway {
     const observation = parseControlPageObservation(input);
     const status = this.getControlResultStatus(identity, requestId, expected);
     if (status.status !== "pending" && status.status !== "cancelled") return status;
+    if (status.status === "cancelled" && status.hostFailure !== undefined) {
+      try {
+        return observeControlResultRequest(
+          identity.workspaceId,
+          requestId,
+          identity.localSessionId,
+          expected,
+          observation,
+        );
+      } finally {
+        this.broker.revokeRequest({ ...identity, ...expected, requestId });
+      }
+    }
     if (
       status.status === "pending" &&
       observation.state === "authority_invalid" &&
