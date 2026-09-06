@@ -171,7 +171,11 @@ export function advanceControlPageObservation(
   const observation = parseControlPageObservation(input);
   if (previous && observation.observationSequence === previous.latest.observationSequence) {
     if (JSON.stringify(observation) === JSON.stringify(previous.latest)) {
-      return { state: previous, idempotentReplay: true, terminal: null };
+      return {
+        state: previous,
+        idempotentReplay: true,
+        terminal: isTerminalObservation(previous.latest) ? previous.latest : null,
+      };
     }
     throw new ControlMailboxError("MAILBOX_PROGRESS_OUT_OF_ORDER", "page observation sequence conflicts with an existing event");
   }

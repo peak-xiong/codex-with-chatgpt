@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -35,7 +36,7 @@ afterEach(() => {
 });
 
 describe("terminal observation recovery", () => {
-  it("revokes authority immediately and repairs cleanup after a partial terminal write", () => {
+  it("revokes authority immediately and repairs cleanup after partial terminal writes", () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("terminal-observation-recovery");
     cleanups.push(root);
@@ -108,6 +109,75 @@ describe("terminal observation recovery", () => {
 
     expect(gateway.observeControlPage(identity, request.requestId, turn, terminal))
       .toMatchObject({ status: "cancelled", pageObservation: { latest: terminal } });
+    expect(getActiveControlResultStatus(identity.workspaceId, identity.localSessionId)).toBeNull();
+
+    expect(gateway.observeControlPage(identity, request.requestId, turn, terminal))
+      .toMatchObject({ status: "cancelled", pageObservation: { latest: terminal } });
+
+    const nextTurn = { ...turn, iteration: 1 };
+    const { request: nextRequest } = gateway.openControlResultRequest(identity, nextTurn);
+    const nextGrant = gateway.issueTurn({
+      ...identity,
+      ...nextTurn,
+      requestId: nextRequest.requestId,
+      scopes: ["workspace.read", "c2c.result.write"],
+      compactionEpoch: 0,
+      generation: page.generation,
+    });
+    const nextBase = {
+      ...base,
+      observedAt: new Date().toISOString(),
+      responseToRequestId: nextRequest.requestId,
+    };
+    gateway.observeControlPage(identity, nextRequest.requestId, nextTurn, {
+      ...nextBase,
+      observationSequence: 1,
+      state: "send_attempted",
+    });
+    gateway.observeControlPage(identity, nextRequest.requestId, nextTurn, {
+      ...nextBase,
+      observationSequence: 2,
+      state: "sent",
+    });
+    gateway.observeControlPage(identity, nextRequest.requestId, nextTurn, {
+      ...nextBase,
+      observationSequence: 3,
+      responseId: "response-terminal-active-cleanup",
+      state: "response_created",
+    });
+    const nextTerminal = {
+      ...nextBase,
+      observationSequence: 4,
+      responseId: "response-terminal-active-cleanup",
+      state: "final" as const,
+      responseIsFinal: true as const,
+      reason: "callback_missing" as const,
+      source: "host_observed" as const,
+    };
+
+    const originalRemove = fs.rmSync.bind(fs);
+    let failActiveRemoval = true;
+    const removeSpy = vi.spyOn(fs, "rmSync").mockImplementation(((...args: any[]) => {
+      const target = String(args[0]);
+      if (
+        failActiveRemoval &&
+        target.includes(`${path.sep}control-mailbox${path.sep}`) &&
+        target.includes(`${path.sep}active${path.sep}`)
+      ) {
+        failActiveRemoval = false;
+        throw new Error("injected active pointer cleanup failure");
+      }
+      return originalRemove(...args);
+    }) as typeof fs.rmSync);
+    expect(() => gateway.observeControlPage(identity, nextRequest.requestId, nextTurn, nextTerminal))
+      .toThrow(/injected active pointer cleanup failure/);
+    removeSpy.mockRestore();
+
+    expect(gateway.turnStatus(nextGrant.token).status).toBe("revoked");
+    expect(getActiveControlResultStatus(identity.workspaceId, identity.localSessionId))
+      .toMatchObject({ status: "cancelled", requestId: nextRequest.requestId });
+    expect(gateway.observeControlPage(identity, nextRequest.requestId, nextTurn, nextTerminal))
+      .toMatchObject({ status: "cancelled", pageObservation: { latest: nextTerminal } });
     expect(getActiveControlResultStatus(identity.workspaceId, identity.localSessionId)).toBeNull();
   });
 });
