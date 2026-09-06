@@ -3,6 +3,7 @@ import type { ControlStatus } from "./mailbox.js";
 import {
   ControlMailboxError,
   c2cIdSchema,
+  parseControlResultSubmission,
   controlResultSubmissionSchema,
 } from "./result-schema.js";
 
@@ -49,7 +50,11 @@ export type ControlPageObservation = z.infer<typeof controlPageObservationSchema
 export function parseControlPageObservation(value: unknown): ControlPageObservation {
   const parsed = controlPageObservationSchema.safeParse(value);
   if (!parsed.success) throw new ControlMailboxError("INVALID_RESULT", "invalid control page observation; raw page text and unlisted diagnostic fields are not accepted");
-  return parsed.data;
+  if (parsed.data.state !== "blocked" || !parsed.data.terminalResult) return parsed.data;
+  return {
+    ...parsed.data,
+    terminalResult: parseControlResultSubmission(parsed.data.terminalResult),
+  };
 }
 
 export function controlWaitPolicy(status: ControlStatus, now = Date.now()) {

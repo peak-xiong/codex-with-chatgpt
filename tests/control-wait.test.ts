@@ -13,6 +13,9 @@ import {
   CONTROL_PAGE_CHECK_INTERVAL_MS,
   controlWaitPolicy, parseControlPageObservation, type ControlHostFailure,
 } from "../src/control/wait-policy.js";
+import {
+  canonicalJson, MAX_CONTROL_RESULT_BYTES, type ControlResultSubmission,
+} from "../src/control/result-schema.js";
 import { MachineGateway, requireCurrentTurnSurface } from "../src/gateway/machine-gateway.js";
 import { createMcpServer } from "../src/mcp/server.js";
 import { nullLogger } from "../src/logger/index.js";
@@ -23,7 +26,11 @@ const cleanups: string[] = [];
 const correlation = { taskId: "terminal-test", iteration: 0, phase: "RESEARCH" as const };
 const projectUrl = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
 
-function fixture(session = "session-a", gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface })) {
+function fixture(
+  session = "session-a",
+  gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface }),
+  turnCorrelation = correlation,
+) {
   const root = makeTmpDir("control-wait");
   cleanups.push(root);
   const identity = { ...gateway.registerWorkspace(root), localSessionId: session };
@@ -33,9 +40,9 @@ function fixture(session = "session-a", gateway = new MachineGateway({ surfaceVa
     projectSelection: projectSelection(projectUrl), chatUrl: url,
   });
   gateway.surfaceCommit(identity, page, {});
-  const { request } = gateway.openControlResultRequest(identity, correlation);
+  const { request } = gateway.openControlResultRequest(identity, turnCorrelation);
   const grant = gateway.issueTurn({
-    ...identity, ...correlation, requestId: request.requestId, generation: page.generation,
+    ...identity, ...turnCorrelation, requestId: request.requestId, generation: page.generation,
     scopes: ["c2c.result.write"], compactionEpoch: 0,
   });
   const observation: ControlHostFailure = {
@@ -45,6 +52,58 @@ function fixture(session = "session-a", gateway = new MachineGateway({ surfaceVa
     source: "model_reported", tool: "report_control_progress", errorCode: "SAFETY_CHECK_BLOCKED",
   };
   return { gateway, identity, request, grant, observation };
+}
+
+function planSubmissionAtBytes(targetBytes: number): ControlResultSubmission {
+  const submission = {
+    kind: "PLAN" as const,
+    payload: {
+      goal: "g",
+      rationale: "r",
+      actions: Array.from({ length: 12 }, () => ({
+        change: "c",
+        why: "w",
+        risks: ["r", "r", "r", "r"],
+      })),
+      tests: Array.from({ length: 12 }, () => "t"),
+      successCriteria: Array.from({ length: 8 }, () => "s"),
+    },
+  };
+  const slots: Array<{ get: () => string; set: (value: string) => void; max: number }> = [
+    { get: () => submission.payload.goal, set: (value) => { submission.payload.goal = value; }, max: 600 },
+    { get: () => submission.payload.rationale, set: (value) => { submission.payload.rationale = value; }, max: 2_000 },
+  ];
+  for (const action of submission.payload.actions) {
+    slots.push(
+      { get: () => action.change, set: (value) => { action.change = value; }, max: 600 },
+      { get: () => action.why, set: (value) => { action.why = value; }, max: 600 },
+    );
+    action.risks.forEach((_, index) => slots.push({
+      get: () => action.risks[index]!,
+      set: (value) => { action.risks[index] = value; },
+      max: 300,
+    }));
+  }
+  submission.payload.tests.forEach((_, index) => slots.push({
+    get: () => submission.payload.tests[index]!,
+    set: (value) => { submission.payload.tests[index] = value; },
+    max: 300,
+  }));
+  submission.payload.successCriteria.forEach((_, index) => slots.push({
+    get: () => submission.payload.successCriteria[index]!,
+    set: (value) => { submission.payload.successCriteria[index] = value; },
+    max: 300,
+  }));
+
+  let remaining = targetBytes - Buffer.byteLength(canonicalJson(submission), "utf8");
+  for (const slot of slots) {
+    if (remaining <= 0) break;
+    const added = Math.min(remaining, slot.max - slot.get().length);
+    slot.set(`${slot.get()}${"x".repeat(added)}`);
+    remaining -= added;
+  }
+  if (remaining !== 0) throw new Error(`unable to build a ${targetBytes}-byte PLAN result`);
+  return submission;
 }
 
 function generatingObservation(f: ReturnType<typeof fixture>) {
@@ -252,6 +311,69 @@ describe("exact response terminal observations", () => {
     });
     expect(controlWaitPolicy(status)).toMatchObject({ nextAction: "stop", delivery: "host_observed" });
     expect(f.gateway.turnStatus(f.grant.token).status).toBe("revoked");
+  });
+
+  it("accepts a host-observed result at the aggregate byte boundary", () => {
+    const planCorrelation = { taskId: "terminal-size-test", iteration: 0, phase: "PLAN" as const };
+    const boundary = fixture("session-boundary", new MachineGateway({ surfaceValidator: requireCurrentTurnSurface }), planCorrelation);
+    const accepted = planSubmissionAtBytes(MAX_CONTROL_RESULT_BYTES);
+    expect(Buffer.byteLength(canonicalJson(accepted), "utf8")).toBe(MAX_CONTROL_RESULT_BYTES);
+    expect(boundary.gateway.observeControlPage(
+      boundary.identity,
+      boundary.request.requestId,
+      planCorrelation,
+      { ...boundary.observation, terminalResult: accepted },
+    )).toMatchObject({
+      status: "cancelled",
+      result: null,
+      hostObservedResult: { result: { kind: "PLAN" } },
+    });
+  });
+
+  it("rejects oversized host observations before changing request state", () => {
+    const planCorrelation = { taskId: "terminal-size-test", iteration: 0, phase: "PLAN" as const };
+    const f = fixture("session-oversized", new MachineGateway({ surfaceValidator: requireCurrentTurnSurface }), planCorrelation);
+    const oversized = planSubmissionAtBytes(MAX_CONTROL_RESULT_BYTES + 1);
+    const oversizedObservation = { ...f.observation, terminalResult: oversized };
+    expect(Buffer.byteLength(canonicalJson(oversized), "utf8")).toBe(MAX_CONTROL_RESULT_BYTES + 1);
+    expect(() => parseControlPageObservation(oversizedObservation)).toThrow(/exceeds 16384 bytes/);
+    expect(() => recordControlHostFailure(
+      f.identity.workspaceId,
+      f.request.requestId,
+      f.identity.localSessionId,
+      planCorrelation,
+      oversizedObservation,
+    )).toThrow(/exceeds 16384 bytes/);
+
+    const multibyte = planSubmissionAtBytes(MAX_CONTROL_RESULT_BYTES);
+    if (multibyte.kind !== "PLAN") throw new Error("expected PLAN fixture");
+    multibyte.payload.goal = `${multibyte.payload.goal.slice(0, -1)}界`;
+    expect(Buffer.byteLength(canonicalJson(multibyte), "utf8")).toBe(MAX_CONTROL_RESULT_BYTES + 2);
+    expect(() => parseControlPageObservation({ ...f.observation, terminalResult: multibyte }))
+      .toThrow(/exceeds 16384 bytes/);
+
+    const pending = f.gateway.getControlResultStatus(f.identity, f.request.requestId, planCorrelation);
+    expect(pending).toMatchObject({ status: "pending", result: null });
+    expect(pending.hostObservedResult).toBeUndefined();
+    expect(getActiveControlResultStatus(f.identity.workspaceId, f.identity.localSessionId)?.requestId)
+      .toBe(f.request.requestId);
+    expect(f.gateway.turnStatus(f.grant.token).status).toBe("issued");
+
+    const lease = f.gateway.claimTurn(f.grant.token, ["c2c.result.write"]);
+    const fence = f.gateway.beginCompletion(f.grant.token);
+    f.gateway.releaseTurn(f.grant.token, lease.lease);
+    f.gateway.completeControlResult(f.grant.token, fence, {
+      kind: "PLAN",
+      payload: {
+        goal: "Complete after rejecting oversized host evidence",
+        rationale: "The request and capability remained live",
+        actions: [{ change: "Continue the original turn", why: "No lifecycle state was mutated" }],
+        tests: ["Read the authoritative mailbox"],
+        successCriteria: ["The real completion is received"],
+      },
+    });
+    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, planCorrelation))
+      .toMatchObject({ status: "received", result: { kind: "PLAN" } });
   });
 
   it("rejects a host-observed kind that the request phase does not allow", () => {

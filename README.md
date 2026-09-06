@@ -267,6 +267,13 @@ or administrator settings, rather than selecting a public URL or OAuth.
 Tell Codex the connector is configured before proceeding to step 6. A connector
 card alone is not proof of result delivery.
 
+After creating the app, open its action menu, choose **Manage**, and select
+**Refresh** once while the local gateway is healthy. This pulls the current
+tools, descriptions, server instructions, and input schemas from the MCP
+server. Repeat this refresh after a local C2C runtime update; restarting the
+Tunnel alone does not refresh ChatGPT's cached app metadata. Refresh the same
+global app instead of creating another connector for a project.
+
 ### 6. Verify installation, then the real round trip
 
 Use the global command from now on:
@@ -377,6 +384,10 @@ and keep the existing connector; updates do not require per-project installs.
 Run setup with the **updated source entrypoint** shown above, not the old
 installed `c2c`, which would reuse its own runtime. The Skill obtains fresh
 authorizations after restart and preserves established Project/chat mappings.
+In ChatGPT Plugins, open the existing `Codex with ChatGPT` app's action menu,
+choose **Manage**, and select **Refresh** once before the next control turn.
+Confirm that its displayed tool schemas match the updated runtime; do not create
+a replacement connector or repeat this per project.
 `c2c update-check --json` checks for updates; it does not install them. A
 `checked: false` response is not proof that your installation is up to date.
 
@@ -411,7 +422,7 @@ the machine-wide capacity of 100 active session/page leases.
 | Installer requires clean Git source | Use a Git clone and preserve your changes before installing; a ZIP download is insufficient |
 | Tunnel absent in ChatGPT | Verify the selected account/workspace, tunnel association, and Read + Use permissions |
 | Machine not ready | Run `c2c machine doctor --no-fix --json`; check network/key permissions and the one managed client |
-| Reads work but no mailbox result | Check current-message callback availability; do not claim full success or bypass platform approval |
+| Reads work but no mailbox result | In the existing app choose Manage > Refresh, then check current-message callback availability; do not create another connector, claim full success, or bypass platform approval |
 
 For controlled repair and exact-session recovery, see [Troubleshooting](docs/troubleshooting.md).
 

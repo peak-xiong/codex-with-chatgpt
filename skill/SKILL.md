@@ -133,8 +133,13 @@ c2c sandbox-clean --json
 ```
 
 If an update is available, update, rebuild, reinstall this Skill, and resume
-the original task. `sandbox-clean` is idempotent and removes obsolete global
-write grants; it does not grant access to a machine-wide state directory.
+the original task. After a runtime update, refresh the existing global app once
+from ChatGPT Plugins > its action menu > Manage > Refresh before opening a new
+control request, then verify its displayed callback schemas match the installed
+runtime. Restarting the Tunnel alone does not refresh ChatGPT's cached app
+metadata. Do not create a replacement connector or repeat this per workspace.
+`sandbox-clean` is idempotent and removes obsolete global write grants; it does
+not grant access to a machine-wide state directory.
 
 ## First-time machine setup
 
@@ -167,6 +172,12 @@ Do not create a connector for a workspace, session, turn, or task. Do not
 change another connector. If the selected Tunnel changes, update this one
 machine connector through the settings flow; never put a runtime key in Project
 instructions.
+
+After first creation, and after `machine setup` installs an updated runtime,
+open this same app's action menu in ChatGPT Plugins, choose Manage, and select
+Refresh once. Confirm the result tools and input schemas reflect the installed
+runtime before pairing or sending a control turn. This refresh is machine-wide;
+it is not a per-project install.
 
 Verify before any workspace chat operation:
 

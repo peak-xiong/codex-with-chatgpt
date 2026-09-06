@@ -72,6 +72,13 @@ Do not put a runtime key, admin token, or capability token in Project
 instructions, source files, prompts other than the current `CONTEXT_ID`, or
 logs.
 
+After first creation and after every runtime update, refresh this same app from
+ChatGPT Plugins > its action menu > Manage > Refresh while the gateway is
+healthy. ChatGPT caches the discovered tool definitions; restarting the local
+Tunnel does not by itself update those cached schemas. Verify the callback
+tools show the current input contract before opening a control request. This is
+one machine-app refresh, not a per-workspace connector installation.
+
 On macOS, enable machine autostart once after setup and verify it:
 
 ```sh

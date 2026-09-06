@@ -31,6 +31,7 @@ import {
   type ControlResultEnvelope,
   type ControlResultReceipt,
   type ControlResultRequest,
+  parseControlResultSubmission,
   parseSubmitControlResultInput,
   parseStoredSubmitControlResultInput,
   parseReportControlProgressInput,
@@ -1117,7 +1118,10 @@ export function recordControlHostFailure(
 ): ControlStatus {
   const parsed = controlTerminalObservationSchema.safeParse(observation);
   if (!parsed.success) throw new ControlMailboxError("INVALID_RESULT", "invalid host failure observation");
-  const { terminalResult, ...failureInput } = parsed.data;
+  const { terminalResult: terminalResultInput, ...failureInput } = parsed.data;
+  const terminalResult = terminalResultInput
+    ? parseControlResultSubmission(terminalResultInput)
+    : undefined;
   const failure = controlHostFailureSchema.parse(failureInput);
   if (failure.responseToRequestId !== requestId) {
     throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "observation belongs to another response");

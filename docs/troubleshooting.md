@@ -97,6 +97,13 @@ URL. Do not create a connector per workspace or alter a connector belonging to
 another purpose. After the connector reports connected, test it in the owned
 chat with `workspace_info`.
 
+If reads work but callback tools are absent or show an older input schema, keep
+the gateway healthy, open the existing app's action menu in ChatGPT Plugins,
+choose **Manage**, and select **Refresh**. Confirm the displayed callback schema
+matches the installed runtime before starting a fresh authorized request.
+Restarting the Tunnel alone does not refresh ChatGPT's cached app metadata, and
+creating another connector is not the repair.
+
 ## `workspace_info` reports the wrong workspace
 
 Stop sending control messages. Check the local route and page lease:
