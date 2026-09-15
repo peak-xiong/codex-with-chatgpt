@@ -267,6 +267,30 @@ installed key in place. **Setup does not create a cloud tunnel, associate a
 ChatGPT workspace, or create the ChatGPT connector**; for first-time setup, the
 first two must already be completed in step 3.
 
+**If this machine reaches `api.openai.com` only through a proxy**, export the
+proxy in the shell that runs setup. The LaunchAgent that supervises the tunnel
+is started by launchd from a fixed environment and does **not** inherit a proxy
+set only in an interactive shell; a tunnel without it polls the control plane
+until it times out, and ChatGPT sees a dead connector while every local check
+still reports `ready`. Setup records validated `http`/`https`/`socks` proxy URLs
+(and `NO_PROXY`) into the LaunchAgent so the managed tunnel uses the same egress
+as the CLI. Verify the running process actually received them:
+
+```sh
+ps -E -p $(pgrep -f 'tunnel-client run' | head -1) | tr ' ' '\n' | grep -iE '^(HTTPS?_PROXY|ALL_PROXY)='
+```
+
+An empty result means the service never received the proxy. Re-export it and
+re-run setup, then restart the managed pair. See
+[ChatGPT cannot call the connector](docs/troubleshooting.md#chatgpt-cannot-call-the-connector-but-the-machine-looks-healthy)
+for the full diagnosis.
+
+Note that plain UDP/53 DNS can be hijacked on such networks (for example
+`api.openai.com` resolving into `2a03:2880::/29`, a Meta range). Changing the
+DNS server alone does not help, because the forged answer arrives on the wire;
+encrypted DNS (DoH/DoT) is required when the program does not go through the
+proxy.
+
 The official generic tutorial's `tunnel-client init/run` commands and sample
 MCP server are for standalone integrations. Here, `machine setup` manages
 those local components. **Do not also run that sample setup**, or start another
@@ -382,6 +406,16 @@ Acceptance has three separate levels:
 | Installed and connected | Global Skill matches; machine ready; doctor passes |
 | Workspace reads | BOOT returns the expected workspace/project IDs and actual local evidence |
 | Result delivery | Computer Use validates the exact tab/chat/generation/response and its schema-bound result marker |
+
+Levels one and two are strictly local: a healthy machine, a passing doctor, and a
+`ready` tunnel only prove the managed components are consistent with each other.
+They do **not** prove that ChatGPT can reach this machine. The first signal that
+a real call arrived is the tunnel log line
+`forwarded command to MCP server`; if no call has been made, it will not appear
+regardless of how healthy everything looks locally. If calls fail while the
+tunnel log is clean, refresh the ChatGPT app's cached tool schema first
+(Plugins → the app → **Manage** → **Refresh**); restarting the tunnel does not
+refresh platform-side metadata.
 
 Mailbox callback code and historical live-return records are retained for a
 later comparison. Production currently does not register those callback tools.

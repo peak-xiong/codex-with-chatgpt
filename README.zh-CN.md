@@ -214,6 +214,25 @@ Tunnel 托管网关。首次安装形式会私密复制用户提供的密钥；�
 密钥。**安装器不会创建云端 Tunnel、关联 ChatGPT 工作区，也不会在 ChatGPT 中创建
 连接器**；首次安装时，前两项必须已在第 3 步完成。
 
+**如果本机只能通过代理访问 `api.openai.com`**，请在执行安装的 Shell 中先导出代理。
+托管 Tunnel 的 LaunchAgent 由 launchd 以固定环境启动，**不会**继承只在交互式 Shell
+中设置的代理；缺少代理时隧道会持续轮询控制平面直到超时，ChatGPT 侧表现为连接器
+不可用，而所有本地检查仍然报告 `ready`。安装器会把校验通过的 `http`/`https`/`socks`
+代理地址（以及 `NO_PROXY`）写入 LaunchAgent，使托管隧道与 CLI 使用同一出口。
+可用下面的命令确认运行中的进程确实拿到了它们：
+
+```sh
+ps -E -p $(pgrep -f 'tunnel-client run' | head -1) | tr ' ' '\n' | grep -iE '^(HTTPS?_PROXY|ALL_PROXY)='
+```
+
+输出为空说明服务进程没有收到代理。重新导出后再次执行安装，然后重启托管进程对。
+完整诊断见[排障文档](docs/troubleshooting.md#chatgpt-cannot-call-the-connector-but-the-machine-looks-healthy)
+（英文）。
+
+注意这类网络上的明文 UDP/53 查询可能被劫持（例如 `api.openai.com` 被解析到
+`2a03:2880::/29`，即 Meta 网段）。仅更换 DNS 服务器无效，因为伪造应答出现在链路
+上；程序不走代理时必须使用加密 DNS（DoH/DoT）。
+
 官方通用教程中的 `tunnel-client init/run` 和示例 MCP 服务用于独立接入。
 本项目由 `machine setup` 管理这些本地组件，**不要再并行执行那套示例**，也不要为
 单个项目另外启动 `tunnel-client` 或 `serve-machine`。

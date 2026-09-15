@@ -92,6 +92,60 @@
 | C2C-025 | 安装提示把首次配置与已有安装升级混为一谈 | 新增显式 `machine setup --reuse-existing`，只在已有官方 Tunnel 配置和受保护密钥存在时复用；禁止与首次安装参数混用。中英文安装说明、协议、Skill 和排障文档区分首次安装、升级、Tunnel 更换及密钥轮换。 |
 | C2C-026 | ChatGPT-first 仅按任务类型分派，导致任意 commit/ref 审查和部署判定在已知工具缺口下仍被派发 | 增加证据闭包门禁、支持/禁止能力矩阵、最小 scope 指引及混合任务拆分；已知缺口留在 Codex，只有有效分派后才允许用 BLOCKED 报告新发现的缺口。 |
 
+## 控制平面出网与错误归因
+
+- 2026-09-15：机器级 LaunchAgent 的环境白名单只放行 `C2C_STATE_DIR`，**排除全部代理变量**。
+  在必须经本地代理出网的网络下，tunnel-client 的控制平面长轮询无法连接
+  `api.openai.com`：ChatGPT 失去向本机投递 MCP 调用的唯一通道，而所有本地检查
+  （`healthy`、`ready`、gateway `/health`）仍然通过。累计 10997 次
+  `dial tcp ...: i/o timeout`。
+- 根因不是连通性缺失，而是进程环境不完整。实测对比：同一个
+  `api.openai.com/v1/models`，走代理 `http=401`（0.42s，连通但无凭据），
+  不走代理 `http=000`（20s 超时）。代理同时规避了本网络的 DoH 之外解析污染
+  （`api.openai.com` 被解析进 `2a03:2880::/29`，Meta 网段）。
+- 新增 `src/config/tunnel-env.ts` 作为隧道可继承环境的唯一定义，由启动器与
+  LaunchAgent 生成器共用。代理值经校验后才写入 plist（`http`/`https`/`socks`
+  URL，`NO_PROXY` 按主机列表单独校验），避免 shell 中的笔误污染长期运行的机器服务。
+- 错误归因修正：原先 `gateway healthy && !tunnel.ok` 直接断言存在 split broker，
+  但**无法连接 OpenAI 的隧道依然合法拥有**它的 stdio 子进程，本地网关并非
+  未授权的第二个 broker。该措辞刷出 5302 行日志，引导排查一个不存在的进程。
+  现在先用 `openAiTunnelIdentityMatchesConfig` 证明隧道身份与 stdio 命令完全匹配，
+  成立则报告控制平面出网故障，不成立才保留原有的 split broker 拒绝。
+- `machine status` / `machine doctor` 增加 `controlPlaneDown` 与 `controlPlaneDetail`，
+  并解析隧道自身的 `controlPlanePoll` 快照。
+- 本地验证：类型检查、构建通过；`machine-daemon`、`autostart`、
+  `openai-secure-tunnel` 共 76 项测试通过；全量 41 个文件、601 项测试通过，
+  退出码 0。
+- 修复后实测：隧道重启于 18:08:59，进程持有 8 个代理变量；至 23:14 共 5 小时
+  零 WARN/ERROR（修复前每 40 秒一条 `poll timed out`）。
+- **端到端尚未验收。** 判定端到端成功的唯一日志标志是
+  `forwarded command to MCP server`（ChatGPT 调用真正抵达 MCP 服务）。
+  重启后该标志出现 **0 次**，链路中没有任何真实调用走通。控制平面恢复只证明
+  隧道能连接 OpenAI，不证明 ChatGPT 页面能成功调用本机工具。仍需在同一
+  Project Chat 完成一次真实只读调用（例如 `workspace_info`）并确认该日志出现。
+- 若调用失败但隧道日志正常，优先检查 ChatGPT 应用管理页是否缓存旧的 MCP
+  schema（参见 C2C-023）：在 Plugins 页对该应用执行 Manage > Refresh。
+  仅重启隧道不足以刷新平台侧的工具元数据。
+- 已知限制：tunnel-client 的 `control_plane_poll_health` 恒为
+  `"no live admin UI system snapshot"` / `unknown`，即使一切正常也不报告 `ok`。
+  因此 `controlPlanePoll` 仅作诊断参考，不能作为健康判据；`controlPlaneDown`
+  只在隧道真正报告 not-ready 时触发，在本轮「隧道自报 ready 但 poll 全失败」的
+  故障形态下不会触发。该分支的真实触发条件尚未在真实网页上观察到。
+- 本机 DNS 污染另案处理，**未纳入本仓库代码**。实测：该网络按域名选择性劫持
+  明文 UDP/53 —— `api.openai.com` 与 `chatgpt.com` 被解析进 `2a03:2880::/29`
+  （Meta 网段），而 `github.com`、`api.anthropic.com`、`www.baidu.com` 正常。
+  直连 `8.8.8.8` 明文查询同样返回伪造值，证明更换 DNS 服务器无效，只有加密
+  DNS 可信。
+- 尝试通过 Clash Verge 启用 mihomo DNS 修复系统级解析，结果**失败并已完整回滚**
+  （`enable_dns_settings` 恢复 `false`，profile merge 与实际配置恢复原状）。
+  两点失败原因值得记录：(1) `doh.pub`、`dns.alidns.com` 对 `api.openai.com`
+  同样返回伪造地址，境内 DoH 上游不可用；(2) 改用 `1.1.1.1` 后 mihomo 能返回
+  正确的 Cloudflare 地址，但该上游必须经代理转发（直连 `1.1.1.1:443` 超时），
+  而启用后 `api.openai.com`、`chatgpt.com`、`www.google.com` 均出现
+  `SSL_ERROR_SYSCALL` TLS 中断。回滚后全部恢复（`api.openai.com` 401、
+  `chatgpt.com` 403）。系统级 DNS 仍为原状，**未解决**，且不影响已修复的隧道，
+  因为隧道经代理出网时由代理远端解析。
+
 ## 本机收口结果
 
 - 页面复用/插件工具收口：全量运行 36 个文件、482 项用例，其中 481 项通过、1 项原有 CLI 流程超过 30 秒；调整该文件子进程等待至 30 秒、两个长流程至 90 秒后，整个 CLI 文件 11 项复跑通过。类型检查、构建、Skill 校验和生产依赖审计通过。早期还遇到一次临时测试服务启动超时，单独复跑通过；没有更改产品超时或权限来掩盖测试问题。
