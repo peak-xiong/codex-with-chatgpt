@@ -118,6 +118,47 @@ describe("machine autostart LaunchAgent", () => {
     expect(second.programArguments).toEqual(first.programArguments);
   });
 
+  // launchd starts the tunnel with this fixed environment. A proxy that exists
+  // only in an interactive shell never reached the tunnel, so its control-plane
+  // poll to api.openai.com timed out while the local gateway stayed healthy.
+  it("carries validated proxy settings into the LaunchAgent environment", () => {
+    const stateDir = makeTmpDir("autostart-proxy-state");
+    const home = makeTmpDir("autostart-proxy-home");
+    dirs.push(stateDir, home);
+
+    const config = buildAutostartConfig({
+      stateDir,
+      homeDir: home,
+      ...executablePaths(home),
+      env: {
+        HTTPS_PROXY: "http://127.0.0.1:7890",
+        ALL_PROXY: "socks5://127.0.0.1:7890",
+        NO_PROXY: "localhost,127.0.0.1",
+      },
+    });
+
+    expect(config.environment.HTTPS_PROXY).toBe("http://127.0.0.1:7890");
+    expect(config.environment.ALL_PROXY).toBe("socks5://127.0.0.1:7890");
+    expect(config.environment.NO_PROXY).toBe("localhost,127.0.0.1");
+    expect(renderLaunchAgentPlist(config)).toContain("<key>HTTPS_PROXY</key>");
+  });
+
+  it("drops a malformed proxy value instead of poisoning the machine service", () => {
+    const stateDir = makeTmpDir("autostart-bad-proxy-state");
+    const home = makeTmpDir("autostart-bad-proxy-home");
+    dirs.push(stateDir, home);
+
+    const config = buildAutostartConfig({
+      stateDir,
+      homeDir: home,
+      ...executablePaths(home),
+      env: { HTTPS_PROXY: "127.0.0.1:7890", HTTP_PROXY: "   " },
+    });
+
+    expect(config.environment.HTTPS_PROXY).toBeUndefined();
+    expect(config.environment.HTTP_PROXY).toBeUndefined();
+  });
+
   it("requires a bounded launch interval", () => {
     expect(normalizeAutostartIntervalSeconds()).toBe(60);
     expect(normalizeAutostartIntervalSeconds("300")).toBe(300);

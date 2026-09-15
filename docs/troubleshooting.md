@@ -97,6 +97,67 @@ processes report the same machine runtime, stop the managed owner cleanly and
 run doctor again; do not delete a runtime record belonging to an unknown
 process.
 
+## ChatGPT cannot call the connector, but the machine looks healthy
+
+This is the most common failure and it is not a gateway problem. Read
+`controlPlaneDown` and `controlPlaneDetail` from:
+
+```sh
+c2c machine status --json
+```
+
+When `controlPlaneDown` is true, the gateway is healthy and provably owned by
+the configured tunnel, but that tunnel cannot reach `api.openai.com` for its
+control-plane poll. ChatGPT delivers every MCP call through that long poll, so
+the page sees a dead connector — timing out or dropping tools mid-conversation —
+while every local check passes.
+
+The managed tunnel is started by launchd from a fixed environment. It does
+**not** inherit a proxy exported in an interactive shell, so `machine status`
+can report `ready` while every poll fails. Two causes are worth checking, in
+this order:
+
+1. **Proxy not visible to the service.** Verify the tunnel process actually has
+   the proxy, not just your shell:
+
+   ```sh
+   ps -E -p $(pgrep -f 'tunnel-client run' | head -1) | tr ' ' '\n' | grep -iE '^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY)='
+   ```
+
+   An empty result means the service never received it. Re-export the proxy in
+   a shell and re-run the install step so the LaunchAgent records the validated
+   values:
+
+   ```sh
+   c2c autostart enable --json
+   ```
+
+   Then restart the managed pair and confirm the poll recovers. Only validated
+   `http`, `https`, and `socks` URLs are persisted; a malformed value is dropped
+   rather than written into the machine service.
+
+2. **DNS answers are not real OpenAI addresses.** Resolve and compare:
+
+   ```sh
+   dscacheutil -q host -a name api.openai.com
+   ```
+
+   `api.openai.com` does not live in `2a03:2880::/29` (Meta) or behind
+   `108.160.169.178` / `128.242.240.91`. A public resolver such as
+   `114.114.114.114` is frequently polluted for this name. If the answers are
+   wrong, pin a trusted resolver and confirm the tunnel's poll recovers.
+
+Confirm the diagnosis against the tunnel's own log before restarting anything:
+
+```sh
+tail -n 200 "/Users/<you>/Library/Application Support/tunnel-client/logs/codex-with-chatgpt.log"
+```
+
+Repeated `poll timed out; backing off` or `poll failed; backing off` with a
+`dial tcp ...: i/o timeout` error is the control-plane outage described above.
+`poller recovered; polling operational` marks the recovery. Restarting the
+tunnel does not fix a blocked egress path; it only resets the backoff.
+
 ## Connector cannot connect
 
 In ChatGPT connector settings verify exactly:

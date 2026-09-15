@@ -94,6 +94,7 @@ import {
 } from "../gateway/runtime.js";
 import { Logger } from "../logger/index.js";
 import {
+  controlPlaneDownDetail,
   ensureMachineGateway,
   observeManagedMachine,
   restoreMachineGateway,
@@ -712,6 +713,10 @@ machine
         ok: observation.ready,
         configured: observation.config !== null,
         ready: observation.ready,
+        controlPlaneDown: observation.controlPlaneDown,
+        ...(observation.controlPlaneDown
+          ? { controlPlaneDetail: controlPlaneDownDetail(observation.tunnel) }
+          : {}),
         config: tunnelConfigView(observation.config),
         connector: localConnectorStatus(observation.config, observation.gateway.state === "healthy" ? observation.gateway.runtime : undefined),
         tunnel: openAiTunnelRuntimeStatusView(observation.tunnel),
@@ -725,6 +730,9 @@ machine
         if (!observation.ready) process.exitCode = 1;
       } else if (observation.ready && info) {
         check(`机器级安全连接正常（${info.workspaceCount} 个已注册 workspace）`);
+      } else if (observation.controlPlaneDown) {
+        cross(controlPlaneDownDetail(observation.tunnel));
+        process.exitCode = 1;
       } else {
         cross(observation.config ? "机器级安全连接未就绪" : "机器级安全连接尚未配置");
         process.exitCode = 1;
@@ -786,6 +794,10 @@ machine
         ok,
         configured: true,
         repaired,
+        controlPlaneDown: before.controlPlaneDown,
+        ...(before.controlPlaneDown
+          ? { controlPlaneDetail: controlPlaneDownDetail(before.tunnel) }
+          : {}),
         config: tunnelConfigView(config),
         tunnel: openAiTunnelRuntimeStatusView(before.tunnel),
         gateway: {
@@ -800,6 +812,9 @@ machine
         if (!ok) process.exitCode = 1;
       } else if (ok) {
         check(repaired ? "机器级安全连接已修复" : "机器级安全连接健康");
+      } else if (before.controlPlaneDown) {
+        cross(controlPlaneDownDetail(before.tunnel));
+        process.exitCode = 1;
       } else {
         cross("机器级安全连接仍未就绪");
         process.exitCode = 1;

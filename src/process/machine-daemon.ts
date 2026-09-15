@@ -21,6 +21,21 @@ import {
   type OpenAiTunnelStopResult,
 } from "../tunnel/openai-secure.js";
 
+/** Turns a control-plane outage into one plain sentence for logs and status. */
+export function controlPlaneDownDetail(tunnel: OpenAiTunnelRuntimeStatus | null): string {
+  const poll = tunnel?.controlPlanePoll;
+  const reason = tunnel?.controlPlanePollReason;
+  const suffix = poll === "degraded" ? " (tunnel reports a degraded poll)"
+    : poll === "unknown" ? " (tunnel reports no live poll snapshot)"
+    : "";
+  return [
+    "The managed OpenAI tunnel cannot reach api.openai.com for its control-plane poll,",
+    "so ChatGPT cannot deliver MCP calls to this machine.",
+    "The local gateway is healthy and the tunnel still owns it; this is a network egress problem,",
+    "not a second gateway. Check the proxy or DNS path to api.openai.com before restarting.",
+  ].join(" ") + suffix + (reason ? ` Reported reason: ${reason}` : "");
+}
+
 const MACHINE_START_LOCK_TIMEOUT_MS = 25_000;
 const MACHINE_START_LOCK_STALE_MS = 3 * 60_000;
 const MACHINE_SETUP_LOCK_TIMEOUT_MS = 5 * 60_000;
@@ -80,6 +95,11 @@ export interface ManagedMachineObservation {
   tunnel: OpenAiTunnelRuntimeStatus | null;
   gateway: MachineRuntimeObservation;
   ready: boolean;
+  /**
+   * The gateway is healthy and provably owned by this machine's managed
+   * tunnel, but that tunnel cannot reach its control plane.
+   */
+  controlPlaneDown: boolean;
 }
 
 /** One startup lock for the whole machine, independent of any workspace. */
@@ -164,6 +184,29 @@ function uncertain(observation: Extract<MachineRuntimeObservation, { state: "unk
   return new Error(`Machine gateway state is uncertain (${observation.reason}); refusing to start another gateway.`);
 }
 
+/**
+ * True when the running tunnel is provably this machine's managed runtime and
+ * only its readiness flag is down. That distinction matters: a tunnel whose
+ * control-plane poll cannot reach OpenAI still owns the exact stdio child, so
+ * the local gateway is not an unauthorized second broker. Reporting it as one
+ * sends the operator after a nonexistent split process instead of the egress
+ * failure that actually broke the connection.
+ */
+function tunnelIdentityIntact(
+  config: OpenAiTunnelConfig,
+  tunnel: OpenAiTunnelRuntimeStatus,
+  gateway: MachineRuntimeObservation
+): boolean {
+  if (tunnel.ok || !gateway.runtime) return false;
+  if (!tunnel.processRunning) return false;
+  return openAiTunnelIdentityMatchesConfig(
+    config,
+    tunnel,
+    machineMcpCommand(config),
+    gateway.runtime.pid
+  );
+}
+
 function assertManagedPair(
   config: OpenAiTunnelConfig,
   tunnel: OpenAiTunnelRuntimeStatus,
@@ -186,6 +229,9 @@ function assertManagedPair(
     return gateway.runtime;
   }
   if (gateway.state === "healthy" && !tunnel.ok) {
+    if (tunnelIdentityIntact(config, tunnel, gateway)) {
+      throw new Error(controlPlaneDownDetail(tunnel));
+    }
     throw new Error(
       "A machine gateway is running outside the configured OpenAI tunnel runtime; refusing to create a split broker."
     );
@@ -268,7 +314,7 @@ export async function observeManagedMachine(
 ): Promise<ManagedMachineObservation> {
   const config = options.config ?? readOpenAiTunnelConfig();
   const gateway = await observeMachineRuntime();
-  if (!config) return { config: null, tunnel: null, gateway, ready: false };
+  if (!config) return { config: null, tunnel: null, gateway, ready: false, controlPlaneDown: false };
   const tunnel = tunnelFunctions(options.tunnelFunctions).status(config, options.tunnelDependencies);
   const ready = (() => {
     try {
@@ -277,7 +323,9 @@ export async function observeManagedMachine(
       return false;
     }
   })();
-  return { config, tunnel, gateway, ready };
+  const controlPlaneDown =
+    gateway.state === "healthy" && !ready && tunnelIdentityIntact(config, tunnel, gateway);
+  return { config, tunnel, gateway, ready, controlPlaneDown };
 }
 
 /** Observe the restored configuration before starting anything in rollback. */

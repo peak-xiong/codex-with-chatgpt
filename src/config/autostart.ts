@@ -5,6 +5,7 @@ import { randomBytes } from "node:crypto";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { getStateDir } from "./paths.js";
 import { runtimeEntryPath } from "./runtime-install.js";
+import { proxyEnvironment } from "./tunnel-env.js";
 
 /** The single LaunchAgent supervising the machine-scoped gateway. */
 export const AUTOSTART_LABEL = "dev.codex-with-chatgpt.machine";
@@ -126,6 +127,14 @@ function autostartEnvironment(
   for (const key of AUTOSTART_ENV_KEYS) {
     const value = env[key]?.trim();
     if (value && key !== "C2C_STATE_DIR" && !result[key]) result[key] = value;
+  }
+  // The tunnel this agent wakes reaches api.openai.com over its control-plane
+  // poll. launchd starts it with this fixed environment, so a proxy that is
+  // only present in an interactive shell would never reach it: the gateway
+  // would report healthy while every poll timed out. Persist the validated
+  // proxy keys so the managed child can use the same egress as the CLI.
+  for (const [key, value] of Object.entries(proxyEnvironment(env))) {
+    result[key] ??= value;
   }
   return result;
 }

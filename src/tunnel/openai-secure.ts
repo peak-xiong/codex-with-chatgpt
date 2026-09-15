@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
+import { TUNNEL_ENV_KEYS } from "../config/tunnel-env.js";
 import { getStateDir, withFileLockAsync } from "../config/paths.js";
 import { OPENAI_TUNNEL_ARCHIVE_SHA256, OPENAI_TUNNEL_BINARY_SHA256 } from "./openai-secure-hashes.js";
 import { verifyAndExtractOpenAiTunnelArchive } from "./openai-secure-integrity.js";
@@ -118,6 +119,12 @@ export interface OpenAiTunnelRuntimeStatus {
   targetKind?: string;
   targetValue?: string;
   pid?: number;
+  /**
+   * The tunnel's own view of its control-plane poll. `unknown` means the
+   * snapshot carried no live state, which is not evidence of failure.
+   */
+  controlPlanePoll?: "ok" | "degraded" | "unknown";
+  controlPlanePollReason?: string;
   detail: string;
 }
 
@@ -666,31 +673,6 @@ export function sanitizeOpenAiTunnelOutput(value: unknown): string {
   return safeTunnelDetail(value);
 }
 
-const TUNNEL_ENV_KEYS = [
-  "HOME",
-  "USERPROFILE",
-  "PATH",
-  "TMPDIR",
-  "TEMP",
-  "TMP",
-  "HTTP_PROXY",
-  "HTTPS_PROXY",
-  "ALL_PROXY",
-  "NO_PROXY",
-  "http_proxy",
-  "https_proxy",
-  "all_proxy",
-  "no_proxy",
-  "SSL_CERT_FILE",
-  "SSL_CERT_DIR",
-  "REQUESTS_CA_BUNDLE",
-  "CURL_CA_BUNDLE",
-  "NODE_EXTRA_CA_CERTS",
-  "XDG_CONFIG_HOME",
-  "XDG_CACHE_HOME",
-  "XDG_DATA_HOME",
-  "XDG_STATE_HOME",
-] as const;
 
 function tunnelStateRoot(profileDir: string): string {
   return path.dirname(path.dirname(path.resolve(profileDir)));
@@ -849,6 +831,19 @@ export function parseOpenAiTunnelStatus(
     const targetValue = typeof processInfo?.target_value === "string" ? processInfo.target_value : undefined;
     const rawPid = processInfo?.pid ?? parsed.pid;
     const pid = typeof rawPid === "number" && Number.isSafeInteger(rawPid) && rawPid > 0 ? rawPid : undefined;
+    // The tunnel reports its own poll state here. It is diagnostic only: a
+    // missing snapshot must not be read as a failure, and it never upgrades
+    // `ok`, which stays the honest readiness answer.
+    const pollHealth = parsed.control_plane_poll_health && typeof parsed.control_plane_poll_health === "object"
+      ? parsed.control_plane_poll_health as Record<string, unknown>
+      : null;
+    const pollState = pollHealth?.state;
+    const controlPlanePoll = pollState === "ok" || pollState === "degraded"
+      ? pollState
+      : processRunning ? "unknown" : undefined;
+    const controlPlanePollReason = typeof pollHealth?.reason === "string"
+      ? safeTunnelDetail(pollHealth.reason, associationNonce ? [associationNonce] : [])
+      : undefined;
     return {
       ok: !auth && processRunning && healthy && ready,
       processRunning,
@@ -863,6 +858,8 @@ export function parseOpenAiTunnelStatus(
       ...(targetKind ? { targetKind } : {}),
       ...(targetValue ? { targetValue } : {}),
       ...(pid ? { pid } : {}),
+      ...(controlPlanePoll ? { controlPlanePoll } : {}),
+      ...(controlPlanePollReason ? { controlPlanePollReason } : {}),
       detail,
     };
   } catch {

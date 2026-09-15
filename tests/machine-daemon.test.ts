@@ -9,8 +9,10 @@ import {
   type MachineRuntimeState,
 } from "../src/gateway/runtime.js";
 import {
+  controlPlaneDownDetail,
   ensureMachineGateway,
   machineMcpCommand,
+  observeManagedMachine,
   restoreMachineGateway,
   stopMachineGateway,
   withMachineSetupLock,
@@ -154,6 +156,82 @@ describe("tunnel-owned machine gateway lifecycle", () => {
       /outside the configured OpenAI tunnel/
     );
     expect(managed.connect).not.toHaveBeenCalled();
+  });
+
+  // A tunnel that cannot reach its control plane still owns the exact stdio
+  // child. Reporting that as a second broker sent operators after a process
+  // that does not exist instead of the egress failure that broke ChatGPT.
+  it("reports a control-plane outage instead of a split broker when the tunnel identity is exact", async () => {
+    cleanupDirs.push(isolateStateDir());
+    const machine = runtime();
+    writeMachineRuntime(machine);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
+    const degraded: OpenAiTunnelRuntimeStatus = {
+      ...READY,
+      ok: false,
+      healthy: false,
+      ready: false,
+      detail: "process_running=true healthy=false ready=false",
+      controlPlanePoll: "degraded",
+      controlPlanePollReason: "poll timed out; backing off",
+    };
+    const managed = functions({ status: vi.fn(() => degraded) });
+
+    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.toThrow(
+      /control-plane poll/
+    );
+    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.not.toThrow(
+      /split broker/
+    );
+    expect(managed.connect).not.toHaveBeenCalled();
+  });
+
+  it("still refuses a non-ready tunnel whose stdio command is not ours", async () => {
+    cleanupDirs.push(isolateStateDir());
+    const machine = runtime();
+    writeMachineRuntime(machine);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
+    const managed = functions({
+      status: vi.fn(() => ({ ...READY, ok: false, ready: false, targetValue: "\"/tmp/other-gateway\"" })),
+    });
+
+    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.toThrow(
+      /outside the configured OpenAI tunnel/
+    );
+  });
+
+  it("marks the observation as a control-plane outage without claiming readiness", async () => {
+    cleanupDirs.push(isolateStateDir());
+    const machine = runtime();
+    writeMachineRuntime(machine);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
+    const degraded: OpenAiTunnelRuntimeStatus = {
+      ...READY,
+      ok: false,
+      ready: false,
+      controlPlanePoll: "degraded",
+    };
+    const managed = functions({ status: vi.fn(() => degraded) });
+
+    const observation = await observeManagedMachine({ config: config(), tunnelFunctions: managed });
+
+    expect(observation.ready).toBe(false);
+    expect(observation.controlPlaneDown).toBe(true);
+    expect(controlPlaneDownDetail(observation.tunnel)).toContain("api.openai.com");
+    expect(controlPlaneDownDetail(observation.tunnel)).toContain("degraded poll");
+  });
+
+  it("does not report a control-plane outage when the tunnel is simply stopped", async () => {
+    cleanupDirs.push(isolateStateDir());
+    const machine = runtime();
+    writeMachineRuntime(machine);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
+    const managed = functions({ status: vi.fn(() => STOPPED) });
+
+    const observation = await observeManagedMachine({ config: config(), tunnelFunctions: managed });
+
+    expect(observation.ready).toBe(false);
+    expect(observation.controlPlaneDown).toBe(false);
   });
 
   it("starts only through tunnel-client with the stdio machine command", async () => {
