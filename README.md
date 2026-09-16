@@ -305,19 +305,26 @@ UI version, the entry may be called an app, plugin, or connector.
 | --- | --- |
 | Name | A distinct device name, e.g. `Codex with ChatGPT - Laptop`; existing single-device names can be kept |
 | Connection | `Server URL` (not `Tunnel`) |
-| MCP Server URL | The `/mcp` URL from `c2c machine endpoint get` |
-| Authentication | `Bearer token` (or an Authorization header) with the value from `c2c machine auth show --reveal` |
+| MCP Server URL | The `/mcp` URL from `c2c machine endpoint get`, with the token from `c2c machine auth show --reveal` appended: `<public-base-url>/mcp/<token>` |
+| Authentication | `No authentication` |
+
+`No authentication` is not a mistake: this form offers only `OAuth`,
+`No authentication`, and `Mixed`, keeps no field for a static token, and ChatGPT
+cannot present a custom API key, so the token travels in the URL. Any other MCP
+client should still send it as an `Authorization: Bearer` header, which takes
+precedence over the URL.
 
 Reuse this connector if it already exists. There is no tunnel to select and no
-runtime key: the public URL plus the bearer token are the whole transport
+runtime key: the public URL plus the token are the whole transport
 configuration. Keep the tunnel and the gateway running during tool discovery.
 If the URL field is rejected, confirm the base URL was recorded without a
 trailing `/mcp` (C2C appends it) and that the tunnel is still forwarding.
-A `401` response means the token in the connector does not match the machine's
-current token — recheck with `c2c machine auth show --reveal`, or rotate both
-sides together with `c2c machine auth rotate`.
+A `401` response means the token in the connector URL does not match the
+machine's current token — recheck with `c2c machine auth show --reveal`, or
+rotate both sides together with `c2c machine auth rotate`. Treat the full
+`/mcp/<token>` URL as a password: it is the transport credential.
 
-A valid bearer token only proves the caller reached this gateway. It does not
+A valid token only proves the caller reached this gateway. It does not
 grant workspace access: ChatGPT must still supply a `context_id` issued by
 `c2c control open` before any tool acts on a workspace. Tell Codex the connector
 is configured before proceeding to step 6. A connector card alone is not proof

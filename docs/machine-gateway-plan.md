@@ -17,7 +17,8 @@ no longer exist.
 ## Product requirements
 
 1. Configure one ChatGPT connector per machine:
-   `Codex with ChatGPT`, a public `Server URL`, and a bearer token.
+   `Codex with ChatGPT`, a public `Server URL` carrying the transport token
+   (`/mcp/<token>`), and `Authentication: No authentication`.
 2. Reach the gateway through one third-party tunnel forwarding the fixed
    loopback port `48765`.
 3. Let the machine daemon own one `c2c serve-http` gateway process.
@@ -63,7 +64,9 @@ process only clears its own exact record.
 
 - Start the gateway as hidden `c2c serve-http`, binding loopback port `48765`
   (`DEFAULT_MACHINE_HTTP_PORT`, overridable by `C2C_HTTP_PORT`).
-- Serve MCP at `POST /mcp`, guarded by a bearer token; an unauthenticated
+- Serve MCP at `POST /mcp`, guarded by a transport token presented either as an
+  `Authorization: Bearer` header or in the URL (`/mcp/<token>`, because the
+  ChatGPT app form has no field for a static token); an unauthenticated
   request returns `401`, and the process refuses to start without a token.
 - Let the operator's third-party tunnel forward to that port. C2C neither
   installs nor supervises the tunnel client. Any tunnel that forwards a public
@@ -258,7 +261,7 @@ changed, while an uncertain gateway state fails closed.
 | --- | --- |
 | Build | `corepack pnpm typecheck` and `corepack pnpm build` |
 | Tests | Full Vitest suite, including machine gateway, HTTP transport, mailbox and surface tests |
-| Transport | `serve-http` binds the recorded loopback port, refuses to start without a token, and answers `401` to an unauthenticated `POST /mcp` |
+| Transport | `serve-http` binds the recorded loopback port, refuses to start without a token, and answers `401` to an untokened `POST /mcp` on either channel |
 | Endpoint | `machine endpoint set/get/clear` round-trips the public base URL and derives `<base>/mcp` |
 | Isolation | Two or more workspaces and sessions route to their own roots/pages |
 | Capacity | 100 unique `(projectId, localSessionId)` identities execute concurrently; a new 101st claim is rejected and retries until a lease releases, expires, or retires |
@@ -266,7 +269,7 @@ changed, while an uncertain gateway state fails closed.
 | Dormant mailbox | Duplicate open, late result, cancellation and write failure remain covered by tests |
 | Browser | Exact `tabId` targeting; ordinary user tabs are untouched |
 | Secrets | Bearer token, admin token and raw context absent from normal output |
-| Docs | README, protocol, security and Skill agree on one connector, a public URL and a bearer token |
+| Docs | README, protocol, security and Skill agree on one connector, a public URL and one transport token |
 
 ## Rollout order
 

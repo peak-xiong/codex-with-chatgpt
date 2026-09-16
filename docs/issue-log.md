@@ -204,7 +204,44 @@
   因此「本机 HTTP 链路可用」不等于「网页已能调用本机工具」，端到端仍需一次
   真实连接器调用才能收口。
 
+## 连接器身份验证方式更正：令牌走 URL 通道
+
+> 说明：本节**更正**「传输层改为公网 HTTP 端点」一节里「填入公网 Server URL 并在
+> Authorization 头携带 bearer 令牌」的连接器配置方式——它在当前 ChatGPT 界面上做不到。
+
+- 事实核对：ChatGPT 连接器/应用创建表单的身份验证只有 `OAuth` /
+  `No authentication` / `Mixed` 三项，**没有静态令牌输入框**。OpenAI Apps SDK
+  鉴权文档明确写明 ChatGPT *"cannot present custom API keys"*，只在 OAuth 2.1
+  （授权码 + PKCE）跑完后才把令牌附到 `Authorization: Bearer`；而 `OAuth` 选项需要
+  服务端暴露 `/.well-known/oauth-protected-resource`、授权服务器元数据、动态客户端
+  注册与 `/authorize`、`/token`，本网关有意不实现授权服务器。`Mixed` 是工具级
+  `noauth` + `oauth2` 声明，匿名调用同样不带该头，被声明要鉴权的工具仍走 OAuth。
+  第三方文档里那个「API 密钥 → `Bearer` / 自定义标头」是 **GPT Actions**
+  （自定义 GPT）的能力，被误记为 MCP 连接器能力，本仓库文档此前跟着写错了。
+- 因此 `POST /mcp` 增加 **URL 令牌通道**：`/mcp/<令牌>`（推荐）与
+  `/mcp?token=<令牌>`，连接器的 `Authentication` 选 `No authentication`。
+  `Authorization: Bearer` 头仍然有效且**优先**：请求带非空 `Authorization` 头时
+  只认该头，即使它无效也不回退到 URL——否则「两个凭据不一致时用了哪个」无法解释，
+  轮换与事故复盘都会失去依据。路径只接受 `/mcp` 之后恰好一段，且不解析百分号转义
+  （令牌字母表本身 URL 安全，编码过的一律格式不合法）。
+- 这是**有意的降级且已设边界**：URL 会被隧道供应商与沿途各跳记录，连接器自身也保存
+  它，取得完整 `/mcp/<令牌>` 地址即持有传输凭据。因此头通道保持不变、非空头优先、
+  可发送头的客户端继续用头，`C2C_DISABLE_URL_TOKEN=1` 可整体关闭 URL 通道回到仅头
+  契约（此时需由隧道注入头，例如 ngrok 的 `--request-header-add`，或 traffic policy
+  的 `remove-headers` + `add-headers`；注意 `add-headers` 是追加语义，不先删除会让
+  客户端自带的头与注入值合并成一个不匹配的串）。降级说明写入 `docs/security.md`，
+  不作为等价通道表述。
+- 令牌轮换（`machine auth rotate`）后必须同步更新连接器 URL，与原先「同步更新头部
+  取值」是同一件事；`docs/troubleshooting.md` 与两个 README 的配置表同步改为
+  `MCP Server URL = <公网基地址>/mcp/<令牌>`、`Authentication = No authentication`。
+- 验证：新增 8 项通道解析单测与 1 项真实 HTTP 集成用例（无令牌 `401`、头 `200`、
+  路径 `200`、查询 `200`、错误路径令牌 `401`、头与 URL 冲突时 `401`）；
+  类型检查干净，全量测试 42 个文件、579 项通过。
+- **未验证：** ChatGPT 侧真实连接器仍未发起过一次端到端调用；本轮只证明本机
+  HTTP 一跳按新契约工作。
+
 ## 本机收口结果
+
 
 - 页面复用/插件工具收口：全量运行 36 个文件、482 项用例，其中 481 项通过、1 项原有 CLI 流程超过 30 秒；调整该文件子进程等待至 30 秒、两个长流程至 90 秒后，整个 CLI 文件 11 项复跑通过。类型检查、构建、Skill 校验和生产依赖审计通过。早期还遇到一次临时测试服务启动超时，单独复跑通过；没有更改产品超时或权限来掩盖测试问题。
 - 本轮 PLAN 与 REVIEW 均复用原 tab 9 / generation 12 / 同一 Chat，并通过 MCP 写回本地；REVIEW 返回定向通过。未新开标签，未关闭其他用户页面。原标签内归档恢复、helper 关闭和第三方插件实际调用仍未实测，不以代码测试替代这些验收。
@@ -262,7 +299,7 @@
 
 | ID | 项目 | 状态 |
 | --- | --- | --- |
-| C2C-101 | 一个全局连接器 | `Codex with ChatGPT`、公网 Server URL 加 bearer 令牌、一个第三方隧道、一个机器 Gateway。 |
+| C2C-101 | 一个全局连接器 | `Codex with ChatGPT`、公网 Server URL（令牌在路径上：`/mcp/<令牌>`，`Authentication: No authentication`）、一个第三方隧道、一个机器 Gateway。 |
 | C2C-102 | 全局安装更新 | Skill 与托管 runtime 一次安装；各项目只注册和保存本项目状态，无需复制插件或逐项目维护版本。 |
 | C2C-103 | 并发 | 最多 100 个未过期的 `(projectId, localSessionId)` 页面租约；同 session 串行，不同 session 独立。101 个新 session 需等待容量释放，不抢占已有页面。 |
 | C2C-104 | ChatGPT-first | RESEARCH/PLAN/REVIEW 优先交给网页和只读 MCP；Web Search 使用 ChatGPT 自带能力。编辑、命令、测试、Git 与最终验证留在本地。 |

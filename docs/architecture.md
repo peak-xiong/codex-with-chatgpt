@@ -27,12 +27,12 @@ The key distinction is:
            +-------+-------+
                    |
       Connector: Codex with ChatGPT
-        Server URL + Authorization: Bearer
+      Server URL: /mcp/<token>, no auth header
                    |
       third-party public tunnel
-              <public-url>/mcp
+            <public-url>/mcp/<token>
                    |
-   c2c serve-http on 127.0.0.1:48765 (bearer-gated /mcp)
+   c2c serve-http on 127.0.0.1:48765 (token-gated /mcp)
                    |
      Machine Gateway (loopback admin API)
        |          |             |
@@ -60,8 +60,12 @@ recorded endpoint then has to be updated.
 
 The official OpenAI Secure MCP Tunnel used to authenticate this transport,
 which is why the connector could use `Authentication: None`. A public URL has no
-such guarantee, so `POST /mcp` now requires a bearer token: a missing or wrong
+such guarantee, so `POST /mcp` requires a transport token: a missing or wrong
 token gets `401`, and `serve-http` refuses to start without a token. The token
+is accepted from the `Authorization: Bearer` header or from the URL
+(`/mcp/<token>`, `/mcp?token=<token>`) because the ChatGPT app form has no field
+for a static token and cannot present custom API keys; a non-empty header always
+decides alone, and `C2C_DISABLE_URL_TOKEN=1` removes the URL channel. The token
 is created lazily by `c2c machine auth show --reveal` (rotated with
 `c2c machine auth rotate`) and stored 0600 at `<state>/http/auth.json`; the
 public URL is recorded at `<state>/http/endpoint.json`.
@@ -76,8 +80,9 @@ configuration used to carry that value across restarts; the gateway now
 generates and persists its own, because an id that changed on every start would
 make the stored connector binding report `stale` after each restart.
 
-ChatGPT is configured with the public Server URL and a bearer token instead of
-selecting a tunnel. The bearer token is a transport gate only: a caller that
+ChatGPT is configured with the public Server URL, the token appended to the
+`/mcp` path, and `Authentication: No authentication`, instead of selecting a
+tunnel. The token is a transport gate only: a caller that
 passes it still needs a valid `context_id` issued by `control open` before any
 tool acts on a workspace, and each tool keeps its own scope check.
 
@@ -283,9 +288,13 @@ continue unaffected.
 ## Design decisions
 
 - One connector reduces user configuration to one machine-level action.
-- A public URL plus a transport-level bearer token keeps connector setup
+- A public URL plus a transport-level token keeps connector setup
   independent of workspace credentials; the token is only a gate, and each turn
   still needs its own `context_id` capability.
+- The token is accepted from the URL as well as from a header, because ChatGPT's
+  app form cannot send a static credential. The header keeps precedence, the URL
+  channel can be disabled, and `docs/security.md` states the cost instead of
+  treating the two channels as equivalent.
 - `c2c serve-http` is spawned directly by the machine daemon, so the MCP gateway
   lifecycle is unambiguous, the tunnel stays replaceable, and there is no
   split-brain broker.

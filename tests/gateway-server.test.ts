@@ -11,6 +11,7 @@ import {
   writeMachineRuntime,
 } from "../src/gateway/runtime.js";
 import { claimSurface, commitVerifiedSurfaceRoute, type SurfaceLease } from "../src/session/surface-ownership.js";
+import { requireHttpAuthToken } from "../src/config/http-auth.js";
 import { cleanup, isolateStateDir, makeTmpDir, write, projectSelection, receiveBootResult } from "./helpers.js";
 
 async function admin<T>(
@@ -109,6 +110,57 @@ describe("machine gateway control server", () => {
       { root: rootA }
     );
     expect(registrationAgain.body).toEqual(registeredA.body);
+  });
+
+  it("accepts the transport token from the URL so a client with no header field can reach /mcp", async () => {
+    cleanups.push(isolateStateDir());
+    server = await startMachineGatewayServer({ port: 0, connectHttp: true, connectStdio: false });
+    const token = requireHttpAuthToken().token;
+    const base = server.localBaseUrl();
+    const initialize = async (url: string, headers: Record<string, string> = {}) => {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          ...headers,
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "url-token", version: "0" },
+          },
+        }),
+      });
+      return { status: response.status, body: (await response.json().catch(() => ({}))) as Record<string, any> };
+    };
+
+    const anonymous = await initialize(`${base}/mcp`);
+    expect(anonymous.status).toBe(401);
+    expect(anonymous.body.error).toBe("unauthorized");
+
+    const viaHeader = await initialize(`${base}/mcp`, { authorization: `Bearer ${token}` });
+    expect(viaHeader.status).toBe(200);
+    expect(viaHeader.body).toMatchObject({ id: 1, result: { serverInfo: { name: expect.any(String) } } });
+
+    const viaPath = await initialize(`${base}/mcp/${token}`);
+    expect(viaPath.status).toBe(200);
+    expect(viaPath.body).toMatchObject({ id: 1, result: { serverInfo: { name: expect.any(String) } } });
+
+    const viaQuery = await initialize(`${base}/mcp?token=${token}`);
+    expect(viaQuery.status).toBe(200);
+    expect(viaQuery.body).toMatchObject({ id: 1, result: { serverInfo: { name: expect.any(String) } } });
+
+    const wrongPathToken = await initialize(`${base}/mcp/c2c_mcp_${"x".repeat(43)}`);
+    expect(wrongPathToken.status).toBe(401);
+
+    // A present-but-wrong header decides on its own; the URL must not rescue it.
+    const conflicting = await initialize(`${base}/mcp/${token}`, { authorization: "Bearer stale" });
+    expect(conflicting.status).toBe(401);
   });
 
   it.each(["tab-admin-surface", "browser-use:fc6c0073-5fb5-4a4e-81f7-307535575b6a"])("routes the complete surface lifecycle for %s through authenticated admin endpoints", async (tabId) => {

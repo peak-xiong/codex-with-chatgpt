@@ -5,7 +5,8 @@
 The machine is the trust boundary. ChatGPT is an advisory client; Codex is the
 executor. A third-party public tunnel forwards HTTPS traffic to the one
 machine gateway's fixed loopback port, and the connector is configured with the
-public `Server URL` plus an `Authorization: Bearer <token>` header.
+public `Server URL` plus a transport token (see below for why ChatGPT cannot
+send it as a header).
 
 The gateway trusts only:
 
@@ -21,19 +22,43 @@ contents are untrusted. They are never authorization principals.
 
 The official OpenAI Secure MCP Tunnel used to authenticate the transport, which
 is why the connector could be configured with `Authentication: None`. A public
-URL carries no such guarantee, so the endpoint authenticates itself:
+URL carries no such guarantee, so the endpoint authenticates itself. A request
+is accepted when it presents the token on either channel:
 
-- `POST /mcp` requires a bearer token. A missing, malformed, or wrong token
-  returns `401`, and the value is compared in constant time.
-- `c2c serve-http` refuses to start when no token exists, so the gateway never
-  serves an unauthenticated endpoint to the internet, even transiently.
-- The token is created on first use by `c2c machine auth show --reveal`, rotated
-  by `c2c machine auth rotate`, and stored 0600 at `<state>/http/auth.json`.
-  Normal CLI output shows only a hint such as `c2c_mcp_xxxx…yyyy`; the full value
-  is printed only on an explicit `--reveal`.
-- Anyone who can reach the public URL can attempt this check, so a leaked token
-  must be rotated immediately, and the tunnel must stay dedicated to this
-  machine.
+- `Authorization: Bearer <token>` — the canonical channel and the only one an
+  ordinary MCP client needs.
+- the URL, as `/mcp/<token>` (preferred) or `/mcp?token=<token>`. The ChatGPT
+  app form offers only `OAuth` / `No authentication` / `Mixed`, keeps no field
+  for a static token, and per the Apps SDK cannot present custom API keys, so
+  `No authentication` plus a token in the URL is the only configuration that
+  client can express. Its `OAuth` option has nothing to talk to here, because
+  this gateway runs no authorization server.
+
+A non-empty `Authorization` header decides alone, even when it is wrong: the
+gateway never falls back to a URL token that happens to validate, so "which
+credential was rejected" stays answerable during a rotation. `POST /mcp` with no
+token at all returns `401`, the value is compared in constant time, and
+`c2c serve-http` refuses to start when no token exists, so the gateway never
+serves an unauthenticated endpoint to the internet, even transiently.
+`C2C_DISABLE_URL_TOKEN=1` removes the URL channel and restores the header-only
+contract.
+
+**The URL channel is a deliberate downgrade, and it is bounded.** A URL is
+written to the tunnel provider's logs and to every hop in front of it, and it is
+stored inside the connector; in exchange, clients that can send a header keep
+the stronger contract, and the token stays out of every request the connector
+makes. Anyone who obtains the full `/mcp/<token>` URL holds the transport
+credential directly, so treat that URL as a password: keep the tunnel dedicated
+to this machine, rotate with `c2c machine auth rotate` if it is exposed and
+update the connector URL in the same step, and prefer having the tunnel inject
+the `Authorization` header (`--request-header-add`, or a `remove-headers` +
+`add-headers` traffic policy — `add-headers` alone appends rather than replaces)
+when no secret should appear in a URL at all.
+
+The token is created on first use by `c2c machine auth show --reveal`, rotated
+by `c2c machine auth rotate`, and stored 0600 at `<state>/http/auth.json`.
+Normal CLI output shows only a hint such as `c2c_mcp_xxxx…yyyy`; the full value
+is printed only on an explicit `--reveal`.
 
 The bearer token is a **transport gate, not an authority**. It proves only that
 the caller reached this gateway. It does not replace C2C's turn capabilities: a
@@ -204,10 +229,11 @@ their surfaces, and issues new contexts. It never retries an old token.
 
 Keep the bearer token and machine-state files private and do not commit them.
 Keep the tunnel dedicated to this machine: the public URL is reachable by
-anyone, and the token is the only transport gate. Rotate the token with
-`c2c machine auth rotate` if it is exposed, and record a new public URL with
+anyone, and the connector URL carries the transport token. Rotate the token with
+`c2c machine auth rotate` if it is exposed, update the connector URL in the same
+step or every call returns `401`, and record a new public URL with
 `c2c machine endpoint set` whenever the tunnel's address changes.
-In ChatGPT create only the named connector with the public URL and the bearer
-token, and keep each workspace in its intended Project. Do not paste bearer
-tokens, admin tokens, context tokens, or full repository contents into ChatGPT
-manually.
+In ChatGPT create only the named connector with the public URL plus the token,
+set `Authentication` to `No authentication`, and keep each workspace in its
+intended Project. Do not paste admin tokens, context tokens, or full repository
+contents into ChatGPT manually.

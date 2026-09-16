@@ -15,6 +15,11 @@ import { Logger, nullLogger } from "../logger/index.js";
 import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
 import { verifyHttpAuthToken } from "../config/http-auth.js";
+import {
+  MCP_PATH,
+  TRANSPORT_TOKEN_QUERY_PARAMETER,
+  presentedTransportToken,
+} from "./transport-token.js";
 import { newAssociationNonce, resolveMachineAssociation } from "./association.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { requireCurrentTurnSurface } from "./machine-gateway.js";
@@ -676,27 +681,38 @@ export async function startMachineGatewayServer(
 
   if (connectHttp) {
     // A public tunnel forwards the whole path, so /mcp is reachable from the
-    // internet. The bearer check below is the only thing separating it from an
-    // anonymous client; it is not optional. Inside the handler the normal turn
-    // capability rules still apply, so this token alone grants no workspace
-    // access.
-    app.all("/mcp", express.json({ limit: "8mb" }), (req, res, next) => {
-      const header = req.headers.authorization ?? "";
-      const presented = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : null;
-      if (!verifyHttpAuthToken(presented)) {
-        res
-          .status(401)
-          .set("WWW-Authenticate", 'Bearer realm="c2c"')
-          .json({ error: "unauthorized", error_description: "A valid bearer token is required" });
-        return;
+    // internet. The token check below is the only thing separating it from an
+    // anonymous client; it is not optional. The token may arrive in the
+    // `Authorization` header or in the URL (`/mcp/<token>` or
+    // `/mcp?token=<token>`) because the ChatGPT app form has no field for a
+    // static token — see ./transport-token.ts for why, and for the precedence
+    // rule when both are present. Inside the handler the normal turn capability
+    // rules still apply, so this token alone grants no workspace access.
+    app.all(
+      [MCP_PATH, `${MCP_PATH}/:token`],
+      express.json({ limit: "8mb" }),
+      (req, res, next) => {
+        const presented = presentedTransportToken({
+          authorizationHeader: req.headers.authorization,
+          pathname: req.path,
+          queryToken: (req.query as Record<string, unknown> | undefined)?.[TRANSPORT_TOKEN_QUERY_PARAMETER],
+        });
+        if (!verifyHttpAuthToken(presented.token)) {
+          res
+            .status(401)
+            .set("WWW-Authenticate", 'Bearer realm="c2c"')
+            .json({ error: "unauthorized", error_description: "A valid transport token is required" });
+          return;
+        }
+        next();
+      },
+      (req, res) => {
+        void createMcpHttpHandler(
+          () => createMcpServer({ gateway, logger, machine: { machineId: identity.machineId, associationId } }),
+          logger
+        )(req, res);
       }
-      next();
-    }, (req, res) => {
-      void createMcpHttpHandler(
-        () => createMcpServer({ gateway, logger, machine: { machineId: identity.machineId, associationId } }),
-        logger
-      )(req, res);
-    });
+    );
   }
 
   if (connectStdio) {

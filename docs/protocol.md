@@ -77,13 +77,33 @@ Record the endpoint before configuring ChatGPT:
 ```text
 Name:            <this device's exact ChatGPT app name>
 Connection:      Server URL
-MCP Server URL:  <public-base-url>/mcp
-Authentication:  Authorization: Bearer <token from `machine auth show --reveal`>
+MCP Server URL:  <public-base-url>/mcp/<token from `machine auth show --reveal`>
+Authentication:  No authentication
 ```
 
-There is no tunnel to select and no runtime key. Do not put the bearer token,
-admin token, or capability token in Project instructions, source files, prompts
-other than the current `CONTEXT_ID`, or logs.
+There is no tunnel to select and no runtime key. `Authentication` is
+`No authentication` because that form keeps no other honest answer: it offers
+only `OAuth`, `No authentication`, and `Mixed`, has no field for a static token,
+and the Apps SDK documentation states that ChatGPT cannot present custom API
+keys — it attaches `Authorization: Bearer` only after completing an OAuth 2.1
+flow, and this gateway runs no authorization server for it to talk to. `Mixed`
+is a per-tool `noauth` + `oauth2` declaration and ends in that same flow. So the
+token travels in the URL, in one of two shapes: `/mcp/<token>` (preferred) or
+`/mcp?token=<token>`.
+
+The `Authorization: Bearer` header stays the canonical channel, and any other
+MCP client should use it. When a request carries a non-empty `Authorization`
+header, that header alone decides even if it is wrong: the gateway never falls
+back to a URL token that happens to validate, because two credentials
+disagreeing about the caller would make both rotation and incident analysis
+ambiguous. `C2C_DISABLE_URL_TOKEN=1` removes the URL channels and restores the
+header-only contract, which then requires the tunnel to inject the header.
+
+A URL is a weaker home for a secret than a header: the tunnel provider and every
+hop in front of it can log the path, and the connector stores it. Treat the full
+`/mcp/<token>` URL as a password. Do not put the admin token, capability token,
+or full connector URL in Project instructions, source files, prompts other than
+the current `CONTEXT_ID`, or logs.
 
 The bearer token is a transport gate only. It proves the caller reached this
 gateway and nothing more: a caller that passes it still needs a valid

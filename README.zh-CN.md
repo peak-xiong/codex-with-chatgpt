@@ -243,16 +243,21 @@ Security and login，可能需管理员先授权）。打开 [ChatGPT 插件页]
 | --- | --- |
 | 名称 | 能区分设备的完整名称，例如 `Codex with ChatGPT - Laptop`；现有名称可以保留 |
 | Connection（连接方式） | `Server URL`（不是 `Tunnel`） |
-| MCP Server URL | `c2c machine endpoint get` 返回的 `/mcp` 地址 |
-| Authentication | `Bearer token`（或 Authorization 头），值为 `c2c machine auth show --reveal` 的输出 |
+| MCP Server URL | `c2c machine endpoint get` 返回的 `/mcp` 地址后面接上 `c2c machine auth show --reveal` 的令牌：`<公网基地址>/mcp/<令牌>` |
+| Authentication | `No authentication`（无身份验证） |
+
+选「无身份验证」不是配置错误：该表单只有 `OAuth`、`No authentication`、`Mixed`
+三项，没有静态令牌输入框，ChatGPT 也无法携带自定义 API 密钥，所以令牌走 URL。
+其他 MCP 客户端应继续使用 `Authorization: Bearer` 头，它优先于 URL。
 
 已有该连接器时直接复用，不重复创建。这里没有 Tunnel 可选，也没有运行密钥：
-公网地址加 bearer 令牌就是传输配置的全部。工具发现期间保持隧道和网关运行。
+公网地址加令牌就是传输配置的全部。工具发现期间保持隧道和网关运行。
 地址被拒绝时，确认记录的是不带 `/mcp` 后缀的公网基地址（C2C 自行追加），并且隧道
-仍在转发。返回 `401` 说明连接器里的令牌与本机当前令牌不一致：用
+仍在转发。返回 `401` 说明连接器 URL 里的令牌与本机当前令牌不一致：用
 `c2c machine auth show --reveal` 核对，或用 `c2c machine auth rotate` 两边一起轮换。
+请把完整的 `/mcp/<令牌>` 地址当作密码，它就是传输凭据。
 
-通过 bearer 校验只证明调用方到达了本机网关，并不授予工作区访问权限：ChatGPT 仍须
+通过传输令牌校验只证明调用方到达了本机网关，并不授予工作区访问权限：ChatGPT 仍须
 在每次工具调用中携带 `c2c control open` 签发的 `context_id`，否则任何工具都不会对
 工作区生效。完成后通知 Codex“连接器已配置”，再继续第 6 步；看到连接器卡片不等于
 回传验收已通过。

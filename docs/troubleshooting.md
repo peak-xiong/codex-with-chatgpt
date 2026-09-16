@@ -158,6 +158,11 @@ through the four layers in order; each has its own evidence.
    `initialize` proves only this leg. It does **not** prove that ChatGPT is
    reaching it — that requires a real connector call.
 
+   Repeat the request against `"$MCP_URL/$(c2c machine auth show --reveal)"` with
+   **no** `Authorization` header. It must succeed too: that is the exact shape
+   the ChatGPT connector sends, so a `401` here while the header form passes
+   means the connector's URL is missing its token.
+
 3. **Is the tunnel actually running and pointed at the right port?** C2C does
    not own the tunnel process. Check it with the provider's own client and
    confirm its target is `127.0.0.1:48765`. A quick tunnel's public address
@@ -201,18 +206,26 @@ In ChatGPT connector settings verify exactly:
 ```text
 Name:            Codex with ChatGPT
 Connection:      Server URL
-MCP Server URL:  the /mcp URL from `c2c machine endpoint get`
-Authentication:  Bearer token / Authorization header
-                 value from `c2c machine auth show --reveal`
+MCP Server URL:  <public-base-url>/mcp/<token from `c2c machine auth show --reveal`>
+Authentication:  No authentication
 ```
 
-Do not select `Tunnel` or `Authentication: None`: the official Secure MCP Tunnel
-is not part of this transport. A `401` means the header value is stale — compare
-it with `c2c machine auth show --reveal`, or rotate both sides with
-`c2c machine auth rotate`. Do not create a connector per workspace or alter a
-connector belonging to another purpose. After the connector reports connected,
-test it in the owned chat with `workspace_info`. Note that a valid bearer token
-alone grants no workspace access; the turn still needs a live `context_id`.
+That form offers only `OAuth`, `No authentication`, and `Mixed`, and keeps no
+field for a static token — the Apps SDK documents that ChatGPT cannot present
+custom API keys — so `No authentication` is the correct choice and the token
+rides in the URL. `OAuth` cannot work: this gateway runs no authorization server
+for ChatGPT to discover. `Mixed` is a per-tool `noauth` + `oauth2` declaration
+and ends in that same OAuth flow. Do not select `Tunnel`: the official Secure
+MCP Tunnel is not part of this transport.
+
+A `401` means the token in the URL is stale or missing — compare it with
+`c2c machine auth show --reveal`, or rotate both sides with
+`c2c machine auth rotate` and update the connector URL in the same step. A
+connection that points at a bare `/mcp` (the token lost on a copy/paste) is the
+other common cause. Do not create a connector per workspace or alter a connector
+belonging to another purpose. After the connector reports connected, test it in
+the owned chat with `workspace_info`. Note that a valid token alone grants no
+workspace access; the turn still needs a live `context_id`.
 
 The active comparison mode intentionally exposes no result callback tools. If
 the app still lists `get_control_result_status`, `report_control_progress`, or
