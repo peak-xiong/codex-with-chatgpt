@@ -459,6 +459,40 @@ describe("machine autostart LaunchAgent", () => {
     expect(autostartPlistDrifted(config)).toBe(false);
   });
 
+  // The interpreter and PATH are chosen by whichever process ran enable, so
+  // they differ across shells and node installs without anything being wrong.
+  it("ignores an interpreter and PATH that came from another process", () => {
+    const stateDir = makeTmpDir("autostart-drift-runtime-state");
+    const home = makeTmpDir("autostart-drift-runtime-home");
+    const otherHome = makeTmpDir("autostart-drift-runtime-other-home");
+    dirs.push(stateDir, home, otherHome);
+    const config = machineConfig(stateDir, home);
+    fs.mkdirSync(path.dirname(config.plistPath), { recursive: true });
+    const enabledElsewhere = {
+      ...config,
+      programArguments: [executablePaths(otherHome).nodePath, ...config.programArguments.slice(1)],
+      environment: { ...config.environment, PATH: "/usr/bin:/bin" },
+    };
+    fs.writeFileSync(config.plistPath, renderLaunchAgentPlist(enabledElsewhere));
+
+    expect(autostartPlistDrifted(config)).toBe(false);
+    expect(autostartStatus(config, { platform: "linux" }).drifted).toBe(false);
+  });
+
+  it("reports drift when the recorded interpreter no longer exists", () => {
+    const stateDir = makeTmpDir("autostart-drift-missing-node-state");
+    const home = makeTmpDir("autostart-drift-missing-node-home");
+    dirs.push(stateDir, home);
+    const config = machineConfig(stateDir, home);
+    fs.mkdirSync(path.dirname(config.plistPath), { recursive: true });
+    fs.writeFileSync(config.plistPath, renderLaunchAgentPlist(config));
+    // Node was upgraded away from under the plist. launchd still loads it, and
+    // the job only fails once it tries to start.
+    fs.rmSync(config.nodePath);
+
+    expect(autostartPlistDrifted(config)).toBe(true);
+  });
+
   it("reports unsupported platforms without invoking launchctl", () => {
     const stateDir = makeTmpDir("autostart-status-state");
     const home = makeTmpDir("autostart-status-home");

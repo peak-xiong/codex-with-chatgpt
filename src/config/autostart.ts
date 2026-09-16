@@ -504,6 +504,43 @@ export function disableAutostart(
   return { config, commands };
 }
 
+/** Stand-in for the values the checking process supplies rather than the build. */
+const PROCESS_DEPENDENT_VALUE = "<process-dependent>";
+
+/**
+ * Blank out the two values that legitimately differ between the process that
+ * wrote a plist and the process reading it back.
+ *
+ * The interpreter is `process.execPath` and PATH is derived from the ambient
+ * environment, so the same build enabled from a login shell, a CI node, or an
+ * editor's bundled runtime renders three different files. Comparing those
+ * byte-for-byte reports drift on a perfectly good plist, and the advice —
+ * re-run `autostart enable` — would then rewrite the plist to match whichever
+ * process happens to ask next. Everything else is the service contract and
+ * stays exact.
+ */
+function maskProcessDependentValues(plist: string): string {
+  return plist
+    .replace(/(<key>ProgramArguments<\/key>\n  <array>\n    <string>)[^<]*/, `$1${PROCESS_DEPENDENT_VALUE}`)
+    .replace(/(<key>PATH<\/key>\n    <string>)[^<]*/, `$1${PROCESS_DEPENDENT_VALUE}`);
+}
+
+/** Interpreter launchd would run, as recorded in an installed plist. */
+function installedInterpreterPath(plist: string): string | undefined {
+  const match = /<key>ProgramArguments<\/key>\n  <array>\n    <string>([^<]*)/.exec(plist);
+  return match?.[1] || undefined;
+}
+
+function interpreterUsable(interpreter: string): boolean {
+  try {
+    if (!fs.statSync(interpreter).isFile()) return false;
+    fs.accessSync(interpreter, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Compare the installed plist against what this build would write.
  *
@@ -516,7 +553,16 @@ export function autostartPlistDrifted(config: AutostartConfig): boolean {
   if (!stat) return false;
   assertSecureLaunchAgentTarget(config.plistPath);
   const installed = fs.readFileSync(config.plistPath, "utf8");
-  return installed !== renderLaunchAgentPlist(config);
+  if (
+    maskProcessDependentValues(installed) !== maskProcessDependentValues(renderLaunchAgentPlist(config))
+  ) {
+    return true;
+  }
+  // The interpreter is exempt from the byte comparison, so it is verified
+  // directly: a plist left pointing at a node that was upgraded away still
+  // loads, and only fails once launchd tries to start the job.
+  const interpreter = installedInterpreterPath(installed);
+  return !interpreter || !interpreterUsable(interpreter);
 }
 
 export function autostartStatus(
