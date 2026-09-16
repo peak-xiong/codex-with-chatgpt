@@ -91,6 +91,15 @@ export interface RuntimeInstallOptions {
   pnpmPath?: string;
   /** Corepack executable used when pnpmPath is not supplied. */
   corepackPath?: string;
+  /**
+   * Content-addressable store the build installs from. Defaults to an
+   * ephemeral store under the build stage, which forces a full download of
+   * every dependency on every attempt. Pointing this at an already-populated
+   * store (for example the operator's own pnpm store) lets an offline or
+   * slow-network install succeed; the packages are still copied into the
+   * runtime, so the deployed tree never depends on that store at run time.
+   */
+  storeDir?: string;
   /** Home directory used to resolve the machine launcher. */
   homeDir?: string;
   /** Test and packaging override for the current process entrypoint. */
@@ -472,7 +481,7 @@ function buildRuntimeSource(
     "--frozen-lockfile",
     "--ignore-scripts",
     "--store-dir",
-    path.join(buildStage, ".pnpm-store"),
+    resolveStoreDir(options, path.join(buildStage, ".pnpm-store")),
     "--package-import-method",
     "copy",
   ]);
@@ -592,6 +601,22 @@ function buildStagePath(installation: string): string {
   return path.join(installation, `${BUILD_STAGE_PREFIX}${process.pid}-${Date.now()}-${randomUUID()}`);
 }
 
+/**
+ * Store the dependency installs read from.
+ *
+ * The default keeps the store inside the throwaway build stage, which is the
+ * most isolated choice but re-downloads every dependency on each attempt: an
+ * install that fails partway leaves nothing to resume from. Supplying
+ * `storeDir` (or `C2C_PNPM_STORE_DIR`) lets the build reuse an already
+ * populated store so a slow or offline network can still complete. Packages
+ * are copied into the runtime either way, so the deployed tree never reads
+ * from that store afterwards.
+ */
+function resolveStoreDir(options: RuntimeInstallOptions, fallback: string): string {
+  const configured = options.storeDir?.trim() || process.env.C2C_PNPM_STORE_DIR?.trim();
+  return configured ? path.resolve(configured) : fallback;
+}
+
 function installProductionDependencies(
   sourceRoot: string,
   stage: string,
@@ -608,7 +633,7 @@ function installProductionDependencies(
     "--frozen-lockfile",
     "--ignore-scripts",
     "--store-dir",
-    path.join(sourceRoot, ".pnpm-store"),
+    resolveStoreDir(options, path.join(sourceRoot, ".pnpm-store")),
     "--package-import-method",
     "copy",
   ]);

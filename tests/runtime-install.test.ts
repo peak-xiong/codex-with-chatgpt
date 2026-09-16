@@ -179,6 +179,79 @@ describe("machine runtime installation", () => {
     ).toBe("module.exports = 42;\n");
   });
 
+  it("defaults the dependency store to the throwaway build stage", () => {
+    const stateRoot = makeTmpDir("runtime-store-default-state");
+    const sourceRoot = makeSource();
+    const homeDir = makeTmpDir("runtime-store-default-home");
+    dirs.push(stateRoot, homeDir);
+    const stores: string[] = [];
+    const runner = vi.fn((_command: string, args: string[], options: { cwd: string }) => {
+      const storeIndex = args.indexOf("--store-dir");
+      if (storeIndex !== -1) stores.push(args[storeIndex + 1]);
+      if (args.includes("build")) write(options.cwd, "dist/cli/index.js", "runtime\n");
+      if (args.includes("--prod")) fs.mkdirSync(path.join(options.cwd, "node_modules"), { recursive: true });
+      return { status: 0, stdout: "deployed", stderr: "" };
+    });
+
+    installRuntime({ stateRoot, checkoutRoot: sourceRoot, homeDir, runner });
+
+    expect(stores).toHaveLength(2);
+    for (const store of stores) {
+      expect(store).toContain(`${path.sep}.pnpm-store`);
+    }
+  });
+
+  it("reads dependencies from an operator-supplied store so a failed install can resume", () => {
+    const stateRoot = makeTmpDir("runtime-store-state");
+    const sourceRoot = makeSource();
+    const homeDir = makeTmpDir("runtime-store-home");
+    const storeParent = makeTmpDir("runtime-store-shared");
+    const storeDir = path.join(storeParent, "v11");
+    fs.mkdirSync(storeDir, { recursive: true });
+    dirs.push(stateRoot, homeDir, storeParent);
+    const stores: string[] = [];
+    const runner = vi.fn((_command: string, args: string[], options: { cwd: string }) => {
+      const storeIndex = args.indexOf("--store-dir");
+      if (storeIndex !== -1) stores.push(args[storeIndex + 1]);
+      if (args.includes("build")) write(options.cwd, "dist/cli/index.js", "runtime\n");
+      if (args.includes("--prod")) fs.mkdirSync(path.join(options.cwd, "node_modules"), { recursive: true });
+      return { status: 0, stdout: "deployed", stderr: "" };
+    });
+
+    installRuntime({ stateRoot, checkoutRoot: sourceRoot, homeDir, runner, storeDir });
+
+    expect(stores).toHaveLength(2);
+    for (const store of stores) {
+      expect(store).toBe(storeDir);
+    }
+  });
+
+  it("accepts the store override through C2C_PNPM_STORE_DIR when no option is given", () => {
+    const stateRoot = makeTmpDir("runtime-store-env-state");
+    const sourceRoot = makeSource();
+    const homeDir = makeTmpDir("runtime-store-env-home");
+    const storeParent = makeTmpDir("runtime-store-env-shared");
+    const storeDir = path.join(storeParent, "v11");
+    fs.mkdirSync(storeDir, { recursive: true });
+    dirs.push(stateRoot, homeDir, storeParent);
+    vi.stubEnv("C2C_PNPM_STORE_DIR", storeDir);
+    const stores: string[] = [];
+    const runner = vi.fn((_command: string, args: string[], options: { cwd: string }) => {
+      const storeIndex = args.indexOf("--store-dir");
+      if (storeIndex !== -1) stores.push(args[storeIndex + 1]);
+      if (args.includes("build")) write(options.cwd, "dist/cli/index.js", "runtime\n");
+      if (args.includes("--prod")) fs.mkdirSync(path.join(options.cwd, "node_modules"), { recursive: true });
+      return { status: 0, stdout: "deployed", stderr: "" };
+    });
+
+    installRuntime({ stateRoot, checkoutRoot: sourceRoot, homeDir, runner });
+
+    expect(stores).toHaveLength(2);
+    for (const store of stores) {
+      expect(store).toBe(storeDir);
+    }
+  });
+
   it("rejects a runtime that cannot load after its production install", () => {
     const stateRoot = makeTmpDir("runtime-smoke-state");
     const sourceRoot = makeSource();
