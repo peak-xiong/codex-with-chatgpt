@@ -9,9 +9,10 @@ production result delivery is temporarily `computer_use`. See
 `docs/protocol.md` for the active flow.
 
 Transport note: the official OpenAI Secure MCP Tunnel was removed and replaced
-by a public HTTP endpoint reached through a third-party tunnel. Layer 2 below
-describes the current transport; the `--tunnel-id` / `--runtime-key-file` /
-`--reuse-existing` options and `serve-machine --stdio` no longer exist.
+by a public HTTP endpoint reached through a third-party tunnel; the provider is
+not fixed. Layer 2 below describes the current transport; the `--tunnel-id` /
+`--runtime-key-file` / `--reuse-existing` options and `serve-machine --stdio`
+no longer exist.
 
 ## Product requirements
 
@@ -65,7 +66,10 @@ process only clears its own exact record.
 - Serve MCP at `POST /mcp`, guarded by a bearer token; an unauthenticated
   request returns `401`, and the process refuses to start without a token.
 - Let the operator's third-party tunnel forward to that port. C2C neither
-  installs nor supervises the tunnel client.
+  installs nor supervises the tunnel client. Any tunnel that forwards a public
+  HTTPS URL to the loopback port is valid; a Cloudflare named tunnel is
+  preferred because its hostname survives reconnects, while a quick tunnel
+  (Cloudflare `trycloudflare.com` or ngrok) changes hostname on every reconnect.
 - Record the public base URL with `c2c machine endpoint set --url <https-url>`;
   the MCP URL is `<public-base-url>/mcp`.
 - Persist the machine association id so the stored connector binding does not

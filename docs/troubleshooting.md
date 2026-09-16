@@ -82,15 +82,22 @@ c2c machine endpoint set --url https://<your-tunnel-public-base-url> --json
 c2c machine endpoint get --json
 ```
 
-Use the base URL without `/mcp`; C2C appends that itself. On the ngrok free plan
-the address changes on every restart, so repeat this step each time.
+Use the base URL without `/mcp`; C2C appends that itself. A quick tunnel's public
+address changes on every reconnect, so repeat this step each time; a Cloudflare
+named tunnel keeps the same hostname. The connector must be updated to match
+whenever the address changes.
 
-## ngrok exits with `ERR_NGROK_9009`
+## The tunnel client refuses to start because of a proxy
 
-The free plan refuses to run when proxy environment variables are set. Unset
-`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` in the shell or service
-definition that starts ngrok, then start it again. The C2C gateway itself binds
-loopback only and does not need a proxy.
+The general rule: the tunnel client needs its own egress, and a proxy on the
+machine can make it refuse to start or fail to connect. Give the process that
+runs the tunnel client a direct route.
+
+One verified provider-specific case: **ngrok's free plan refuses to run when
+proxy environment variables are set**. Unset `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`, and `NO_PROXY` in the shell or service definition that starts
+ngrok, then start it again; ngrok reports `ERR_NGROK_9009`. The C2C gateway
+itself binds loopback only and does not need a proxy.
 
 ## `/mcp` returns `401`
 
@@ -153,17 +160,19 @@ through the four layers in order; each has its own evidence.
 
 3. **Is the tunnel actually running and pointed at the right port?** C2C does
    not own the tunnel process. Check it with the provider's own client and
-   confirm its target is `127.0.0.1:48765`. On the ngrok free plan the public
-   address changes on every restart, so an old address pasted into the
-   connector will fail even though everything local is healthy. Re-record it:
+   confirm its target is `127.0.0.1:48765`. A quick tunnel's public address
+   changes on every reconnect, so an old address pasted into the connector will
+   fail even though everything local is healthy. Re-record it:
 
    ```sh
    c2c machine endpoint set --url https://<current-public-base-url> --json
    ```
 
-   ngrok's free plan also refuses to start when proxy variables are set
-   (`ERR_NGROK_9009`); unset `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
-   `NO_PROXY` for the process that runs it.
+   A Cloudflare named tunnel keeps its hostname, so it does not have this
+   failure mode. Proxy variables are a separate trap: the tunnel client needs
+   its own egress, and ngrok's free plan specifically refuses to start when
+   proxy variables are set (`ERR_NGROK_9009`); unset `HTTP_PROXY`,
+   `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` for the process that runs it.
 
 4. **Is ChatGPT itself using current metadata?** Restarting the tunnel does not
    refresh the platform's cached tool schema. In ChatGPT Plugins, open the

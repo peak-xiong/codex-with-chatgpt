@@ -37,7 +37,7 @@
 
 - 每台设备各绑定一个连接器；同一个 ChatGPT 账号可以有多台设备的 C2C 插件。
   插件完整名称与稳定链接记录在机器级配置中，本机所有项目和会话复用。
-- 连接器指向**公网 HTTPS 地址**：由第三方隧道（ngrok）转发到本机，并在
+- 连接器指向**公网 HTTPS 地址**：由第三方隧道转发到本机，并在
   Authorization 头携带 bearer 令牌。该令牌只是传输层门禁，不是项目凭据，
   不能替代 C2C 的轮次能力授权。
 - C2C 守护进程启动唯一的 `c2c serve-http` 网关，绑定回环端口 `48765`
@@ -62,7 +62,7 @@
 这是供用户自行部署的开源项目。每位用户在自己的电脑上安装，并使用自己的隧道和
 凭据；公开 Git 仓库不代表共享维护者的电脑、公网地址或令牌。
 
-当前传输方式是**公网 HTTPS 地址**：由第三方隧道（ngrok）转发到网关固定的回环
+当前传输方式是**公网 HTTPS 地址**：由你运行的第三方隧道转发到网关固定的回环
 端口，ChatGPT 连接器使用 `<公网基地址>/mcp`，并在 Authorization 头携带 bearer
 令牌。本项目不使用官方 OpenAI Secure MCP Tunnel，因为本网络在 TLS SNI 层重置该
 端点：TCP 能连到 `api.openai.com` 的真实地址，但只有 SNI 为 `api.openai.com`
@@ -84,7 +84,7 @@
 实际可用的稳定链接，用 `machine connector set` 记录一次，之后所有本机项目复用，
 不要按相似名称选择另一台电脑的插件。
 否则在前置检查和干净源码构建完成后运行 `machine setup --json`，把输出的 MCP 地址
-和令牌提示告诉我，并指导我启动 ngrok 隧道、用 `machine endpoint set` 记录公网地址。
+和令牌提示告诉我，并指导我启动隧道、用 `machine endpoint set` 记录公网地址。
 不要猜测账号、组织、工作区、地址或凭据，除非我明确要求，不要输出完整 bearer 令牌。
 缺少权限或遇到登录、授权步骤时，说明需要我完成的操作；不要自行切换账号、
 扩大权限，或改用其他隧道方案或 OAuth。
@@ -95,7 +95,7 @@
 
 | 操作 | 谁来完成 |
 | --- | --- |
-| 登录隧道服务并启动一条转发到网关回环端口的隧道 | 用户启动并保持隧道运行；ngrok 免费版需要注册账号 |
+| 登录隧道服务并启动一条转发到网关回环端口的隧道 | 用户启动并保持隧道运行；Cloudflare 命名隧道需要账号和域名，Cloudflare 快速隧道两者都不需要，ngrok 免费版需要注册账号 |
 | 记录公网地址并避免在聊天中泄露 bearer 令牌 | Codex 用 `machine endpoint set` 记录地址；令牌可见范围由用户控制 |
 | 检查环境、构建源码、全局安装、诊断 | Codex 在本地执行，不在 ChatGPT 对话中执行 |
 | 使用公网地址和 Authorization 头创建/复用 ChatGPT 连接器 | 用户在已确认的 ChatGPT 工作区中完成，随后由 Codex 验证 |
@@ -109,8 +109,12 @@
   不会自动获得网页操作能力。
 - ChatGPT 账号/工作区能够使用开发者模式的自定义应用。请在自己的账号中确认入口
   和管理员授权，不能仅凭订阅名称认定功能可用。
-- 可用的第三方隧道账号与客户端（本项目使用 ngrok），能够把本机端口以 HTTPS 暴露
-  到公网。免费版的公网地址每次隧道重启都会变化，地址变化后必须重新记录。
+- 可用的第三方隧道客户端，能够把本机端口以 HTTPS 暴露到公网。只要能把公网
+  HTTPS 地址转发到网关的回环端口，任何隧道都可以。优先使用 **Cloudflare 命名隧道**：
+  域名稳定、一条隧道可以服务多个域名、重连后地址不变；只有在没有 Cloudflare 账号
+  和域名时才用快速隧道（Cloudflare `trycloudflare.com` 或 ngrok），它们每次重连都会
+  换一个新域名，地址变化后必须重新记录。其中 Cloudflare 快速隧道不需要账号，
+  ngrok 免费版需要注册账号。
 - 电脑能够出站访问隧道服务、GitHub 和包仓库。ChatGPT 调用本地工具期间，电脑必须
   保持唤醒、联网，隧道和 C2C 网关必须同时运行。
 
@@ -145,20 +149,28 @@ git status --short
 这一阶段在隧道服务自己的页面和客户端完成，**不是本地 `machine setup` 的功能**。
 如果前置检查已经确认存在健康、已记录公网地址且隧道正在运行的 C2C 安装，则跳过本节。
 
-1. 登录隧道服务，为这台电脑保留或复用它专用的一条隧道；不要复用另一台电脑的隧道
-   或公网地址。
+只要能把公网 HTTPS 地址转发到网关的回环端口，任何隧道都可以。优先使用
+**Cloudflare 命名隧道**：域名稳定、一条隧道可以服务多个域名、重连后地址不变；
+只有在没有 Cloudflare 账号和域名时才用快速隧道（Cloudflare `trycloudflare.com`
+或 ngrok）。
+
+1. 在隧道服务中配置，并为这台电脑保留或复用它专用的一条隧道；不要复用另一台电脑的
+   隧道或公网地址。Cloudflare 命名隧道需要账号和域名，快速隧道两者都不需要。
 2. 把该隧道指到网关的回环端口 `48765`（即默认 `C2C_HTTP_PORT`）。这个端口是有意
    固定的：隧道配置指向它，端口在两次启动之间变化会静默破坏公网地址。隧道必须与
    网关运行在同一台机器上。
-3. 复制隧道给出的 HTTPS 基地址，例如 `https://<your-subdomain>.ngrok-free.dev`，
+3. 复制隧道给出的 HTTPS 基地址，例如 `https://<your-subdomain>.example.com`，
    不要带 `/mcp` 后缀；`c2c machine endpoint set --url <https-url>` 会自行追加
    `/mcp`。
-4. 保持隧道运行。ngrok 免费版的公网地址每次隧道重启都会变化，变化后必须用
-   `machine endpoint set` 重新记录。
+4. 保持隧道运行。快速隧道的公网地址每次重连都会变化，变化后必须用
+   `machine endpoint set` 重新记录，ChatGPT 连接器也要同步更新；Cloudflare
+   命名隧道没有这个问题。
 
-**如果机器设置了代理环境变量，ngrok 免费版会拒绝启动**：它以 `ERR_NGROK_9009`
-退出，并提示 ngrok agent 不能在设置了代理环境变量的环境中运行。请在运行 ngrok
-的 Shell（或服务定义）中取消 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、
+**出网与代理。** 隧道客户端需要自己的出网通道。如果本机通过代理上网，隧道客户端
+可能拒绝启动或连接失败，请让运行它的进程直连。有一个已验证的坑是 ngrok 特有的：
+**ngrok 免费版在设置了代理环境变量时会拒绝启动**，它以 `ERR_NGROK_9009` 退出，
+并提示 ngrok agent 不能在设置了代理环境变量的环境中运行。请在运行 ngrok 的
+Shell（或服务定义）中取消 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、
 `NO_PROXY`，让 ngrok 直连。
 
 不要把 bearer 令牌放进命令行参数、截图、Project 指令或 Git。令牌由 C2C 生成并保存；
@@ -203,8 +215,9 @@ Skill 和 `c2c` 命令入口，通过机器守护进程启动唯一的 `c2c serv
 更新连接器的 Authorization 头，否则所有调用都会返回 `401`。
 
 **代理说明。** C2C 网关只绑定回环地址，本身不需要代理。隧道客户端需要自己的出网，
-而 ngrok 免费版在有代理变量时拒绝运行（见第 3 步）。如果本网络按域名劫持明文 UDP/53
-查询（例如 `api.openai.com` 被解析到 `2a03:2880::/29`，即 Meta 网段），仅更换 DNS
+代理可能让它拒绝启动或连接失败；ngrok 免费版尤其在有代理变量时拒绝运行（见第 3 步）。
+如果本网络按域名劫持明文 UDP/53 查询（例如 `api.openai.com` 被解析到
+`2a03:2880::/29`，即 Meta 网段），仅更换 DNS
 服务器无效，因为伪造应答出现在链路上；程序不走代理时必须使用加密 DNS（DoH/DoT）。
 
 不要再并行运行官方 OpenAI Secure MCP Tunnel 的客户端或示例 MCP 服务。C2C 已移除该
@@ -425,7 +438,7 @@ c2c autostart disable --json
 | `machine setup` 拒绝 `--tunnel-id` 或 `--reuse-existing` | 这两个参数已随 Secure Tunnel 传输方式移除；只运行 `machine setup --json` |
 | `machine endpoint get` 没有地址 | 用 `c2c machine endpoint set --url <https-url>` 记录运行中隧道的 HTTPS 基地址 |
 | 连接器返回 `401` | Authorization 头的令牌与 `c2c machine auth show --reveal` 不一致；更新其中一侧或两边一起轮换 |
-| ngrok 以 `ERR_NGROK_9009` 退出 | 取消 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`；免费版在设置代理变量时拒绝运行 |
+| 隧道客户端因代理报错退出（例如 ngrok 的 `ERR_NGROK_9009`） | 让隧道客户端直连出网；ngrok 免费版需取消 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`，它在设置代理变量时拒绝运行 |
 | 安装器要求干净 Git 源码 | 使用 Git 克隆并先保存自己的修改，不能用 ZIP 代替 |
 | 机器未 ready | 执行 `c2c machine doctor --no-fix --json`，它会分别报告 `gateway`、`endpoint`、`auth` 三项检查 |
 | 能读文件但收不到结果 | 检查当前消息的回传工具可用性，不能宣称完整成功或绕过平台授权 |
@@ -442,7 +455,7 @@ ChatGPT Project A                 ChatGPT Project B
              \                       /
               一个全局连接器（Server URL + Bearer 令牌）
                               |
-              第三方公网隧道（ngrok）-> <公网地址>/mcp
+              第三方公网隧道 -> <公网地址>/mcp
                               |
            c2c serve-http 监听 127.0.0.1:48765（/mcp 需 bearer 令牌）
                               |

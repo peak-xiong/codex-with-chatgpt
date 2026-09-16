@@ -49,7 +49,7 @@ The connection is configured once per machine:
 - One connector per device, with an exact device-specific name recorded locally.
   One ChatGPT account can contain several devices' C2C connectors.
 - The connector points at a **public HTTPS URL** that a third-party tunnel
-  (ngrok) forwards to this machine, and sends an
+  forwards to this machine, and sends an
   `Authorization: Bearer <token>` header. The token is a transport gate only;
   it is not a project credential and does not replace C2C's turn capabilities.
 - The C2C daemon starts one `c2c serve-http` gateway that binds loopback port
@@ -77,7 +77,7 @@ This is a self-hosted project: each user installs it on their own computer and
 uses their own tunnel and credentials. A public Git repository does not give
 other users access to the maintainer's machine, endpoint, or token.
 
-The transport is a **public HTTPS endpoint** — a third-party tunnel (ngrok)
+The transport is a **public HTTPS endpoint** — a third-party tunnel you run
 forwards to the gateway's fixed loopback port, and the ChatGPT connector uses
 `<public-base-url>/mcp` with an `Authorization: Bearer <token>` header. C2C
 does not use the official OpenAI Secure MCP Tunnel, because this network resets
@@ -107,7 +107,7 @@ observed stable plugin URL with `machine connector set`, and reuse that binding
 for all projects. Never choose another computer's app by a similar name.
 Otherwise, after preflight and a clean source build, run `machine setup --json`,
 tell me the exact MCP URL and bearer-token hint it reports, and guide me through
-starting the ngrok tunnel and recording its public URL.
+starting the tunnel and recording its public URL.
 Do not guess accounts, organizations, workspaces, URLs, or credentials.
 Do not print the bearer token unless I explicitly ask for it. If permissions,
 login, or consent are missing, explain the user action needed. Do not switch
@@ -120,7 +120,7 @@ references for Codex or users checking its work.
 
 | Operation | Responsible party |
 | --- | --- |
-| Log in to a tunnel provider and start one tunnel that forwards to the gateway's loopback port | User starts and keeps the tunnel running; ngrok's free plan needs a provider account |
+| Log in to a tunnel provider and start one tunnel that forwards to the gateway's loopback port | User starts and keeps the tunnel running; a Cloudflare named tunnel needs an account and a domain, a Cloudflare quick tunnel needs neither, and ngrok's free plan needs an account |
 | Record the public base URL and keep the bearer token out of chat | Codex records the URL with `machine endpoint set`; the user controls who sees the token |
 | Check the environment, build, install globally, run diagnostics | Codex executes locally, not in a ChatGPT conversation |
 | Create or reuse the ChatGPT connector with the public URL and the Authorization header | User in the confirmed ChatGPT workspace; Codex then verifies it |
@@ -136,9 +136,14 @@ references for Codex or users checking its work.
 - A ChatGPT account/workspace with developer-mode custom apps. Availability and
   administrator permissions must be checked in your own account; a subscription
   alone is not proof of access.
-- A third-party tunnel account and client (ngrok is used here) that can expose a
-  local port over HTTPS. The public URL changes on the free plan, so the recorded
-  endpoint must be updated whenever the tunnel restarts.
+- A third-party tunnel client that can expose a local port over HTTPS. Any tunnel
+  that forwards a public HTTPS URL to the gateway's loopback port works. Prefer a
+  **Cloudflare named tunnel**: it gives a stable hostname, one tunnel can serve
+  several hostnames, and it reconnects without changing the URL. Use a quick
+  tunnel (Cloudflare `trycloudflare.com` or ngrok) only when no Cloudflare
+  account and domain are available; those hand out a new hostname on every
+  reconnect, so the recorded endpoint must be updated each time. A Cloudflare
+  quick tunnel needs no account, while ngrok's free plan does.
 - Outbound HTTPS access to the tunnel provider and to GitHub and the package
   registry for installation. The computer must remain awake and online while
   ChatGPT uses local tools, and the tunnel plus the C2C gateway must both keep
@@ -181,24 +186,36 @@ This stage happens in your tunnel provider's own UI and client, **not through
 local `machine setup`**. Skip it when preflight confirms a healthy existing C2C
 installation with a recorded public endpoint and a running tunnel.
 
-1. Log in to your tunnel provider and reserve or reuse one tunnel dedicated to
-   this computer. Do not reuse another computer's tunnel or its public URL.
+Any tunnel that forwards a public HTTPS URL to the gateway's loopback port is
+valid. Prefer a **Cloudflare named tunnel**: it gives a stable hostname, one
+tunnel can serve several hostnames, and it reconnects without changing the URL.
+Use a quick tunnel (Cloudflare `trycloudflare.com` or ngrok) only when no
+Cloudflare account and domain are available.
+
+1. Set up your tunnel provider and reserve or reuse one tunnel dedicated to this
+   computer. Do not reuse another computer's tunnel or its public URL. A
+   Cloudflare named tunnel needs an account and a domain; a quick tunnel needs
+   neither.
 2. Point that tunnel at the gateway's loopback port, `48765` (the default
    `C2C_HTTP_PORT`). This value is fixed on purpose: the tunnel configuration
    points at it, so a port that changes between starts silently breaks the
    endpoint. Run the tunnel on the same machine as the gateway.
 3. Copy the HTTPS base URL the tunnel reports, for example
-   `https://<your-subdomain>.ngrok-free.dev`, without the `/mcp` suffix.
+   `https://<your-subdomain>.example.com`, without the `/mcp` suffix.
    `c2c machine endpoint set --url <https-url>` appends `/mcp` itself.
-4. Keep the tunnel running. On the ngrok free plan the public URL changes each
-   time the tunnel restarts, and the recorded endpoint must then be updated
-   again with `machine endpoint set`.
+4. Keep the tunnel running. A quick tunnel's public URL changes on every
+   reconnect, and the recorded endpoint must then be updated again with
+   `machine endpoint set`; the ChatGPT connector must be updated to match. A
+   Cloudflare named tunnel avoids this.
 
-**If the machine uses proxy environment variables, ngrok's free plan refuses to
-start**: it exits with `ERR_NGROK_9009` and the message that the ngrok agent
-cannot be run with proxy environment variables set. Unset `HTTP_PROXY`,
-`HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` in the shell (or the service
-definition) that runs ngrok, and let ngrok connect directly.
+**Egress and proxy.** The tunnel client needs its own egress. If the machine
+routes traffic through a proxy, the tunnel client may refuse to start or fail to
+connect; give the process that runs it a direct route. One verified trap is
+ngrok-specific: **ngrok's free plan refuses to start when proxy environment
+variables are set**. It exits with `ERR_NGROK_9009` and the message that the
+ngrok agent cannot be run with proxy environment variables set. Unset
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` in the shell (or the
+service definition) that runs ngrok, and let ngrok connect directly.
 
 Do not put the bearer token in a shell argument, a screenshot, a Project
 instruction, or Git. The token is generated and stored by C2C; never reuse
@@ -254,8 +271,9 @@ working immediately, so update the connector header in the same session or
 every call returns `401`.
 
 **Proxy note.** The C2C gateway itself binds loopback only and needs no proxy.
-Your tunnel client does need its own egress, and ngrok's free plan will not run
-with proxy variables set (see step 3). If your network hijacks plain UDP/53 DNS
+Your tunnel client does need its own egress, and a proxy can make it refuse to
+start or fail to connect; ngrok's free plan specifically will not run with proxy
+variables set (see step 3). If your network hijacks plain UDP/53 DNS
 (for example `api.openai.com` resolving into `2a03:2880::/29`, a Meta range),
 changing the DNS server alone does not help, because the forged answer arrives
 on the wire; encrypted DNS (DoH/DoT) is required when the program does not go
@@ -515,7 +533,7 @@ the machine-wide capacity of 100 active session/page leases.
 | `machine setup` rejects `--tunnel-id` or `--reuse-existing` | Those options were removed with the Secure Tunnel transport; run `machine setup --json` alone |
 | `machine endpoint get` shows no URL | Record the running tunnel's HTTPS base URL with `c2c machine endpoint set --url <https-url>` |
 | Connector returns `401` | The header token does not match `c2c machine auth show --reveal`; update one side or rotate both |
-| ngrok exits with `ERR_NGROK_9009` | Unset `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`; the free plan refuses to run with proxy variables set |
+| Tunnel client exits with a proxy error (for example ngrok's `ERR_NGROK_9009`) | Give the tunnel client a direct egress; for ngrok's free plan unset `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`, which it refuses to run with |
 | Installer requires clean Git source | Use a Git clone and preserve your changes before installing; a ZIP download is insufficient |
 | Machine not ready | Run `c2c machine doctor --no-fix --json`; it reports `gateway`, `endpoint`, and `auth` checks separately |
 | Final response is not detected | Verify the exact owned tab, chat, generation, response id, request id, and `C2C_HOST_OBSERVED_RESULT` marker; do not inspect another page or resend while generation is active |
@@ -532,7 +550,7 @@ ChatGPT Project A                 ChatGPT Project B
              \                       /
               one global Connector (Server URL + Bearer token)
                               |
-             third-party public tunnel (ngrok) -> <public-url>/mcp
+             third-party public tunnel -> <public-url>/mcp
                               |
                c2c serve-http on 127.0.0.1:48765 (bearer-gated /mcp)
                               |

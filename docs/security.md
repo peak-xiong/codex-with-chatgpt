@@ -3,7 +3,7 @@
 ## Trust boundaries
 
 The machine is the trust boundary. ChatGPT is an advisory client; Codex is the
-executor. A third-party public tunnel (ngrok) forwards HTTPS traffic to the one
+executor. A third-party public tunnel forwards HTTPS traffic to the one
 machine gateway's fixed loopback port, and the connector is configured with the
 public `Server URL` plus an `Authorization: Bearer <token>` header.
 

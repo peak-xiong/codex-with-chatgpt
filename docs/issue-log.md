@@ -162,7 +162,10 @@
   不提供回退分支。
 - 现在网关由隐藏命令 `c2c serve-http` 直接启动，绑定固定回环端口 `48765`
   （`DEFAULT_MACHINE_HTTP_PORT`，仅测试可用 `C2C_HTTP_PORT` 覆盖），
-  由第三方隧道（ngrok）转发，MCP 地址为 `<公网基地址>/mcp`。
+  由第三方隧道转发，MCP 地址为 `<公网基地址>/mcp`。隧道供应商不固定：只要能把
+  公网 HTTPS 地址转发到回环端口即可，优先使用 Cloudflare 命名隧道（域名稳定、
+  一条隧道可服务多个域名、重连不变），快速隧道（Cloudflare `trycloudflare.com`
+  或 ngrok）只在没有账号和域名时使用，代价是每次重连换域名。
   进程托管改由机器守护进程本身负责，`serve-machine --stdio`、`src/tunnel/`、
   运行密钥和 pinned 客户端全部删除。
 - 公网地址没有官方隧道提供的传输认证，因此 `POST /mcp` **必须携带 bearer 令牌**：
@@ -188,14 +191,15 @@
   连接器绑定 schema 去掉了 `tunnelId` 与 `associationId`，改为
   machineId + 名称 + 可选 pluginUrl；机器级 association id 改为持久化保存，
   否则每次重启都会让已保存的绑定误报 `stale`。
-- 操作提示：ngrok 免费版在设置了代理环境变量时拒绝运行并报 `ERR_NGROK_9009`，
-  启动它的 Shell 或服务必须去掉 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` /
-  `NO_PROXY`；免费版公网地址每次重启变化，变化后必须重新执行
-  `machine endpoint set`。
+- 操作提示：隧道客户端需要自己的出网，本机走代理时可能拒绝启动或连接失败；
+  其中 ngrok 免费版是已验证的具体一例——设置了代理环境变量时拒绝运行并报
+  `ERR_NGROK_9009`，启动它的 Shell 或服务必须去掉 `HTTP_PROXY` / `HTTPS_PROXY` /
+  `ALL_PROXY` / `NO_PROXY`。此外快速隧道的公网地址每次重连都会变化，变化后必须
+  重新执行 `machine endpoint set` 并同步更新连接器；Cloudflare 命名隧道没有这个问题。
 - **已验证：** 真实进程下，未带令牌的 `POST /mcp` 返回 `401`，错误令牌返回
   `401`，正确令牌可以完成 `initialize` 并枚举全部九个工具；公网地址与回环端口
   经真实 curl 走通。类型检查、构建与全量测试（40 个文件、555 项）通过。
-- **未验证：** ChatGPT 连接器经由 ngrok 的真实调用。本轮只验证了 HTTP 这一跳，
+- **未验证：** ChatGPT 连接器经由真实隧道的调用。本轮只验证了 HTTP 这一跳，
   隧道的转发另外用探针确认过，**没有**用真实 ChatGPT 连接器发起过一次调用。
   因此「本机 HTTP 链路可用」不等于「网页已能调用本机工具」，端到端仍需一次
   真实连接器调用才能收口。

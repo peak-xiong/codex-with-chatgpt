@@ -29,7 +29,7 @@ The key distinction is:
       Connector: Codex with ChatGPT
         Server URL + Authorization: Bearer
                    |
-      third-party public tunnel (ngrok)
+      third-party public tunnel
               <public-url>/mcp
                    |
    c2c serve-http on 127.0.0.1:48765 (bearer-gated /mcp)
@@ -51,8 +51,12 @@ C2C does not implement or supervise the tunnel. The gateway is started directly
 as hidden `c2c serve-http`, which binds the fixed loopback port `48765`
 (`DEFAULT_MACHINE_HTTP_PORT`, overridable only through `C2C_HTTP_PORT`). The port
 is recorded rather than ephemeral because the tunnel's configuration points at
-it. A third-party tunnel (ngrok) forwards to that port, and the MCP URL is
-`<public-base-url>/mcp`.
+it. A third-party tunnel the operator runs forwards to that port, and the MCP
+URL is `<public-base-url>/mcp`. Any tunnel that forwards a public HTTPS URL to
+the loopback port is valid; a Cloudflare named tunnel is preferred because its
+hostname is stable across reconnects, while a quick tunnel (Cloudflare
+`trycloudflare.com` or ngrok) gets a new hostname on every reconnect and the
+recorded endpoint then has to be updated.
 
 The official OpenAI Secure MCP Tunnel used to authenticate this transport,
 which is why the connector could use `Authentication: None`. A public URL has no

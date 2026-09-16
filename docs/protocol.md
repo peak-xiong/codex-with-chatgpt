@@ -64,9 +64,13 @@ OpenAI endpoint at the TLS SNI layer.
 The gateway is started as hidden `c2c serve-http`, binds loopback port `48765`
 (`DEFAULT_MACHINE_HTTP_PORT`, overridable through `C2C_HTTP_PORT`) and serves MCP
 at `POST /mcp`. A third-party tunnel that the operator runs forwards to that
-port; C2C neither installs nor supervises it. `machine endpoint set --url
+port; C2C neither installs nor supervises it. Any tunnel that forwards a public
+HTTPS URL to the loopback port is valid; a Cloudflare named tunnel is preferred
+because its hostname survives reconnects. `machine endpoint set --url
 <https-base-url>` records the public base URL, and the MCP URL is
-`<public-base-url>/mcp`. Re-record it whenever the tunnel's address changes.
+`<public-base-url>/mcp`. A quick tunnel (Cloudflare `trycloudflare.com` or
+ngrok) hands out a new hostname on every reconnect, so the endpoint and the
+connector both have to be updated when that happens.
 
 Record the endpoint before configuring ChatGPT:
 

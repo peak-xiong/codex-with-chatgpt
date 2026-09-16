@@ -61,6 +61,21 @@ once the tunnel that forwards to this machine is up, and never print the token
 except through the explicit `machine auth show --reveal`. Do not guess accounts
 or substitute another tunnel provider without being asked.
 
+Any tunnel that forwards a public HTTPS URL to the gateway's loopback port is
+valid. Prefer a **Cloudflare named tunnel**: it gives a stable hostname, one
+tunnel can serve several hostnames, and it reconnects without changing the URL.
+Use a quick tunnel (Cloudflare `trycloudflare.com` or ngrok) only when no
+Cloudflare account and domain are available; those hand out a new hostname on
+every reconnect, so the recorded endpoint and the ChatGPT connector must both be
+updated each time. ngrok's free plan also refuses to start while proxy
+environment variables are set (`ERR_NGROK_9009`).
+
+Choose one and stay with it. Do not add a second tunnel acting as a fallback:
+two agents competing for one fixed hostname or one gateway port is a fault, not
+redundancy. Never write the operator's real hostname, account identifiers, or
+tunnel credentials into a tracked file — documentation and examples use
+placeholders such as `https://<your-subdomain>.example.com`.
+
 After an app/schema change, verify task-needed contracts. Use Refresh only if
 the actual UI offers it and discovery needs updating. A catalog card or opening
 Manage proves neither refreshed metadata nor a successful MCP call. Do not
