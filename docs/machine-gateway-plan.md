@@ -8,12 +8,18 @@ Current experiment note: the mailbox design below is retained and tested, but
 production result delivery is temporarily `computer_use`. See
 `docs/protocol.md` for the active flow.
 
+Transport note: the official OpenAI Secure MCP Tunnel was removed and replaced
+by a public HTTP endpoint reached through a third-party tunnel. Layer 2 below
+describes the current transport; the `--tunnel-id` / `--runtime-key-file` /
+`--reuse-existing` options and `serve-machine --stdio` no longer exist.
+
 ## Product requirements
 
 1. Configure one ChatGPT connector per machine:
-   `Codex with ChatGPT`, `Authentication: None`.
-2. Use one official OpenAI Secure MCP Tunnel.
-3. Let that Tunnel own one `serve-machine --stdio` process.
+   `Codex with ChatGPT`, a public `Server URL`, and a bearer token.
+2. Reach the gateway through one third-party tunnel forwarding the fixed
+   loopback port `48765`.
+3. Let the machine daemon own one `c2c serve-http` gateway process.
 4. Route any registered workspace from trusted local `cwd` state.
 5. Give every workspace one ChatGPT Project.
 6. Give every local Codex session one persistent Project chat and one owned
@@ -38,8 +44,8 @@ production result delivery is temporarily `computer_use`. See
 
 - Resolve a stable machine identity and create a unique `bootEpoch` per gateway
   lifetime.
-- Store tunnel configuration, runtime key, admin token, lifetime record and
-  workspace registrations in protected machine state.
+- Store the recorded public endpoint, bearer token, admin token, lifetime record
+  and workspace registrations in protected machine state.
 - Store mutable workspace data inside the repository boundary: Git checkouts
   use `<git-common-dir>/codex-with-chatgpt`; non-Git workspaces use
   `<workspace-root>/.codex-with-chatgpt`.
@@ -47,35 +53,37 @@ production result delivery is temporarily `computer_use`. See
   index in protected machine state. Workspace page files are recovery mirrors
   only and are never imported into that authority.
 - Make state writes atomic and owner-checked.
-- Never include runtime keys or raw capabilities in status output.
+- Never include bearer tokens or raw capabilities in status output.
 
 Acceptance: a second process cannot publish over a healthy runtime; a stopped
 process only clears its own exact record.
 
-### Layer 2: Official Tunnel runtime
+### Layer 2: Public HTTP transport
 
-- Install and checksum-verify the pinned official tunnel client.
-- Start it with the configured tunnel id and file-based runtime key.
-- Pass the child command as:
+- Start the gateway as hidden `c2c serve-http`, binding loopback port `48765`
+  (`DEFAULT_MACHINE_HTTP_PORT`, overridable by `C2C_HTTP_PORT`).
+- Serve MCP at `POST /mcp`, guarded by a bearer token; an unauthenticated
+  request returns `401`, and the process refuses to start without a token.
+- Let the operator's third-party tunnel forward to that port. C2C neither
+  installs nor supervises the tunnel client.
+- Record the public base URL with `c2c machine endpoint set --url <https-url>`;
+  the MCP URL is `<public-base-url>/mcp`.
+- Persist the machine association id so the stored connector binding does not
+  report `stale` after every restart.
+- Stop the gateway process directly; it clears its own ownership record.
 
-  ```text
-  node <checkout>/bin/c2c.js serve-machine --stdio --port 0
-  ```
-
-- Report ready only when the Tunnel, child process and gateway health endpoint
-  all agree.
-- Stop the supervisor first so child ownership remains unambiguous.
-
-Acceptance: `machine status` exposes configured/healthy/ready state and the
-actual admin port without exposing secrets.
+Acceptance: `machine status` exposes the transport view (`mcpUrl`, `localPort`,
+`authConfigured`, `authTokenHint`) and `machine doctor` reports gateway, endpoint
+and auth as separate checks — without exposing secrets.
 
 ### Layer 3: Machine autostart
 
 - Install one machine-wide LaunchAgent only on macOS.
 - Its `ProgramArguments` must be the hidden command
   `c2c autostart run --quiet`.
-- The wake command only invokes `ensureMachineGateway`; it reuses the official
-  Tunnel-owned child and never starts a workspace-specific process.
+- The wake command only invokes `ensureMachineGateway`; it restarts the one
+  `c2c serve-http` gateway if it is down and never starts a workspace-specific
+  process or the tunnel.
 - Enable and verify it once after machine setup:
 
   ```sh
@@ -86,7 +94,7 @@ actual admin port without exposing secrets.
 - Disable it with `c2c autostart disable --json`.
 
 Acceptance: a login or wake event can recover the one managed machine runtime,
-while no second Tunnel, gateway, or browser-page scheduler is created.
+while no second gateway or browser-page scheduler is created.
 
 ### Layer 4: Workspace registry
 
@@ -178,7 +186,9 @@ MCP call.
 Machine lifecycle:
 
 ```text
-c2c machine setup --tunnel-id ... --runtime-key-file ...
+c2c machine setup [--json]
+c2c machine endpoint get|set --url <https-url>|clear [--json]
+c2c machine auth show [--reveal]|rotate [--json]
 c2c skill status [--json]
 c2c machine start
 c2c machine status [--json]
@@ -190,6 +200,9 @@ c2c autostart enable [--json]
 c2c autostart status [--json]
 c2c autostart disable [--json]
 ```
+
+`serve-http` is a hidden internal command; the machine daemon starts it and
+callers should use `machine start`/`machine doctor` instead.
 
 Workspace and context:
 
@@ -240,20 +253,21 @@ changed, while an uncertain gateway state fails closed.
 | Area | Required check |
 | --- | --- |
 | Build | `corepack pnpm typecheck` and `corepack pnpm build` |
-| Tests | Full Vitest suite, including machine, tunnel, gateway, mailbox and surface tests |
-| Tunnel | Official client checksum/version and child `serve-machine --stdio` |
+| Tests | Full Vitest suite, including machine gateway, HTTP transport, mailbox and surface tests |
+| Transport | `serve-http` binds the recorded loopback port, refuses to start without a token, and answers `401` to an unauthenticated `POST /mcp` |
+| Endpoint | `machine endpoint set/get/clear` round-trips the public base URL and derives `<base>/mcp` |
 | Isolation | Two or more workspaces and sessions route to their own roots/pages |
 | Capacity | 100 unique `(projectId, localSessionId)` identities execute concurrently; a new 101st claim is rejected and retries until a lease releases, expires, or retires |
 | Stale state | Old boot, registration, generation, epoch and context are rejected |
 | Dormant mailbox | Duplicate open, late result, cancellation and write failure remain covered by tests |
 | Browser | Exact `tabId` targeting; ordinary user tabs are untouched |
-| Secrets | Runtime key, admin token and raw context absent from normal output |
-| Docs | README, protocol, security and Skill agree on one connector and `None` auth |
+| Secrets | Bearer token, admin token and raw context absent from normal output |
+| Docs | README, protocol, security and Skill agree on one connector, a public URL and a bearer token |
 
 ## Rollout order
 
 1. Build and test the machine gateway, registry and broker locally.
-2. Install and verify the official Tunnel runtime.
+2. Start the gateway, record the public endpoint and issue the bearer token.
 3. On macOS, enable autostart once and verify its status.
 4. Register one workspace and claim one Project chat.
 5. Run a read-only BOOT check and a Computer Use result turn.

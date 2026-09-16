@@ -8,8 +8,8 @@ state remain isolated.
 
 The key distinction is:
 
-- **Machine scope:** one OpenAI Secure MCP Tunnel, one connector, one gateway
-  process and one machine identity.
+- **Machine scope:** one public endpoint backed by one third-party tunnel, one
+  connector, one gateway process and one machine identity.
 - **Workspace scope:** one trusted local root, one stable Project identity and
   one registration in the machine gateway.
 - **Session scope:** one local Codex session, one ChatGPT Project chat and one
@@ -27,11 +27,12 @@ The key distinction is:
            +-------+-------+
                    |
       Connector: Codex with ChatGPT
-           Authentication: None
+        Server URL + Authorization: Bearer
                    |
-       OpenAI Secure MCP Tunnel
+      third-party public tunnel (ngrok)
+              <public-url>/mcp
                    |
-   tunnel-owned `serve-machine --stdio`
+   c2c serve-http on 127.0.0.1:48765 (bearer-gated /mcp)
                    |
      Machine Gateway (loopback admin API)
        |          |             |
@@ -44,32 +45,37 @@ The key distinction is:
              execution records
 ```
 
-### OpenAI Secure MCP Tunnel
+### Public HTTP transport
 
-The official pinned tunnel client is installed into protected machine state.
-Its runtime key is supplied by file reference and is never placed in a command
-line argument, connector instruction, repository file, or normal output.
+C2C does not implement or supervise the tunnel. The gateway is started directly
+as hidden `c2c serve-http`, which binds the fixed loopback port `48765`
+(`DEFAULT_MACHINE_HTTP_PORT`, overridable only through `C2C_HTTP_PORT`). The port
+is recorded rather than ephemeral because the tunnel's configuration points at
+it. A third-party tunnel (ngrok) forwards to that port, and the MCP URL is
+`<public-base-url>/mcp`.
 
-The tunnel supervises exactly:
+The official OpenAI Secure MCP Tunnel used to authenticate this transport,
+which is why the connector could use `Authentication: None`. A public URL has no
+such guarantee, so `POST /mcp` now requires a bearer token: a missing or wrong
+token gets `401`, and `serve-http` refuses to start without a token. The token
+is created lazily by `c2c machine auth show --reveal` (rotated with
+`c2c machine auth rotate`) and stored 0600 at `<state>/http/auth.json`; the
+public URL is recorded at `<state>/http/endpoint.json`.
 
-```text
-node <checkout>/bin/c2c.js serve-machine --stdio --port 0
-```
+This network resets the OpenAI endpoint at the TLS SNI layer — TCP to the real
+`api.openai.com` address succeeds, and the handshake dies only when SNI is
+`api.openai.com` — so the tunnel transport cannot connect here at all and was
+removed with no fallback path. `serve-machine --stdio` no longer exists.
 
-The `stdio` stream is the MCP data transport. The child also exposes a
-loopback-only admin API on an ephemeral port for local registration and turn
-issuance. C2C reuses the pair only when the 0.0.14 status payload reports a
-healthy runtime whose alias, `tunnel_id`, `profile_path`, target kind and
-`target_value` match the configured profile and exact `serve-machine` command,
-and whose gateway association and health checks match. When the status payload
-includes a child PID, it must also match the gateway runtime PID. The pinned
-0.0.14 client may omit that PID, so exact target, association and health checks
-remain the primary proof. This is still a status-backed local configuration
-match rather than a cryptographic process identity proof. A healthy standalone
-gateway is not adopted as a second broker.
+The gateway keeps a persistent `associationId` in machine state. The tunnel
+configuration used to carry that value across restarts; the gateway now
+generates and persists its own, because an id that changed on every start would
+make the stored connector binding report `stale` after each restart.
 
-ChatGPT selects the Secure Tunnel configured for this connector. There is no
-public Server URL for the user to copy into project or workspace settings.
+ChatGPT is configured with the public Server URL and a bearer token instead of
+selecting a tunnel. The bearer token is a transport gate only: a caller that
+passes it still needs a valid `context_id` issued by `control open` before any
+tool acts on a workspace, and each tool keeps its own scope check.
 
 ### Machine autostart
 
@@ -81,9 +87,9 @@ c2c autostart status --json
 ```
 
 launchd runs hidden `c2c autostart run --quiet`. That entry point only invokes
-`ensureMachineGateway`, which reuses the official Tunnel-owned child. It does
-not start a per-workspace process, create another Tunnel, or schedule browser
-pages. Disable it with `c2c autostart disable --json`.
+`ensureMachineGateway`, which restarts the one `c2c serve-http` gateway if it is
+down. It does not start a per-workspace process, the tunnel, or browser pages.
+Disable it with `c2c autostart disable --json`.
 
 ### Machine Gateway
 
@@ -102,9 +108,10 @@ while non-Git workspaces use `<workspace-root>/.codex-with-chatgpt`. Linked
 worktrees share project metadata and a non-authoritative page recovery mirror;
 session routes and execution records are isolated below
 `workspaces/<workspaceId>/`. Runtime installations, the authoritative mailbox,
-Tunnel configuration and keys, the authoritative cross-workspace Project URL,
-physical-tab and generation ownership index, gateway ownership records,
-machine identity, locks and logs remain in protected machine state.
+the recorded public endpoint and bearer token, the machine association id, the
+authoritative cross-workspace Project URL, physical-tab and generation ownership
+index, gateway ownership records, machine identity, locks and logs remain in
+protected machine state.
 `sandbox-clean` removes obsolete global write grants and does not expose a
 machine-wide state directory to Codex.
 
@@ -259,11 +266,11 @@ capability binding and the trusted local root.
 ## Recovery ownership
 
 `machine start` and `machine doctor` operate on the one machine runtime. They
-check the status-matched tunnel runtime target, gateway health, owner record and
-bound admin port.
-`machine stop` stops the tunnel supervisor first; the child exits through its
-stdio owner. C2C does not send a child shutdown request while the supervisor is
-still responsible for it.
+check gateway health, the owner record, the bound admin port, the recorded public
+endpoint and the bearer token.
+`machine stop` sends SIGTERM to the gateway process it owns; the process clears
+its own runtime record on the way out. C2C never stops a process whose live
+health payload does not match this machine's ownership record.
 
 If one browser page fails, only that session renews or replaces its surface
 lease. Other sessions, pages, workspace registrations and their conversations
@@ -272,10 +279,12 @@ continue unaffected.
 ## Design decisions
 
 - One connector reduces user configuration to one machine-level action.
-- `Authentication: None` keeps connector setup independent of workspace
-  credentials; the official Tunnel handles its runtime association.
-- `serve-machine --stdio` makes the MCP child lifecycle unambiguous and avoids
-  split-brain brokers.
+- A public URL plus a transport-level bearer token keeps connector setup
+  independent of workspace credentials; the token is only a gate, and each turn
+  still needs its own `context_id` capability.
+- `c2c serve-http` is spawned directly by the machine daemon, so the MCP gateway
+  lifecycle is unambiguous, the tunnel stays replaceable, and there is no
+  split-brain broker.
 - Explicit context capabilities prevent a Project, URL, path, or visible tab
   from becoming an accidental security principal.
 - Persistent session pages preserve independent ChatGPT histories without

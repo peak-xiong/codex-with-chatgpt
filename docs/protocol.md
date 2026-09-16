@@ -50,51 +50,51 @@ reserved for dormant mailbox callback tests and is not granted by production
 The machine is configured once:
 
 ```sh
-c2c machine setup \
-  --tunnel-id <tunnel-id> \
-  --runtime-key-file <runtime-key-file>
+c2c machine setup --json
+c2c machine endpoint set --url <https://public-base-url> --json
 ```
 
-That two-argument form is required for first-time setup, a tunnel change, or
-runtime-key rotation. To deploy an updated clean source revision over a healthy
-existing installation without requesting the original key-file path again, run:
+`machine setup` takes only `--json`. It installs or updates the one global Skill
+and the runtime, starts the one machine gateway over HTTP, and issues the bearer
+token on first use. It no longer accepts `--tunnel-id`, `--runtime-key-file`, or
+`--reuse-existing`; those options were removed together with the official OpenAI
+Secure MCP Tunnel transport, which cannot connect on a network that resets the
+OpenAI endpoint at the TLS SNI layer.
 
-```sh
-c2c machine setup --reuse-existing
-```
+The gateway is started as hidden `c2c serve-http`, binds loopback port `48765`
+(`DEFAULT_MACHINE_HTTP_PORT`, overridable through `C2C_HTTP_PORT`) and serves MCP
+at `POST /mcp`. A third-party tunnel that the operator runs forwards to that
+port; C2C neither installs nor supervises it. `machine endpoint set --url
+<https-base-url>` records the public base URL, and the MCP URL is
+`<public-base-url>/mcp`. Re-record it whenever the tunnel's address changes.
 
-Reuse is explicit, requires an existing protected machine configuration, and
-cannot be combined with either first-time option. It preserves the tunnel
-association, protected runtime key, connector, and saved Project/chat routes.
-
-Both forms install or update the one global Skill and pinned official OpenAI
-Secure MCP Tunnel client, store configuration in protected machine state, and
-start the tunnel-owned child. First-time setup copies the supplied runtime key;
-reuse mode leaves the protected installed key in place:
+Record the endpoint before configuring ChatGPT:
 
 ```text
-c2c serve-machine --stdio --port 0
+Name:            <this device's exact ChatGPT app name>
+Connection:      Server URL
+MCP Server URL:  <public-base-url>/mcp
+Authentication:  Authorization: Bearer <token from `machine auth show --reveal`>
 ```
 
-Each device has one connector association; one ChatGPT account may contain
-several devices' connectors. Bind each device's exact app separately:
+There is no tunnel to select and no runtime key. Do not put the bearer token,
+admin token, or capability token in Project instructions, source files, prompts
+other than the current `CONTEXT_ID`, or logs.
 
-```text
-Name:           <this device's exact ChatGPT app name>
-Secure Tunnel:  the tunnel configured above
-Authentication: None
-```
-
-Select the configured tunnel in ChatGPT; there is no public server URL to copy.
-Do not put a runtime key, admin token, or capability token in Project
-instructions, source files, prompts other than the current `CONTEXT_ID`, or
-logs.
+The bearer token is a transport gate only. It proves the caller reached this
+gateway and nothing more: a caller that passes it still needs a valid
+`context_id` from `control open` before any tool acts on a workspace, and each
+tool enforces its own scope. `machine auth show --reveal` prints the full token;
+`machine auth rotate` issues a new one and invalidates the old immediately, so
+the connector header must be updated at the same time or calls return `401`.
+The token is stored 0600 at `<state>/http/auth.json` and the endpoint at
+`<state>/http/endpoint.json`.
 
 After creation or a tool/schema update, inspect the existing app's task-needed
 tool contracts while the gateway is healthy. If the actual UI offers Refresh
 and discovery needs updating, use it once and recheck. Do not assume a fixed
 Manage > Refresh path exists, or treat opening Manage as proof of refresh.
-Restarting the Tunnel alone is not evidence that ChatGPT discovered new schemas.
+Restarting the tunnel alone is not evidence that ChatGPT discovered new schemas.
 Confirm required read tools and input contracts; callback tools are intentionally
 absent in Computer Use mode. A scoped real read validates transport separately
 from catalog visibility. If contracts remain unavailable or stale, report that
@@ -109,15 +109,15 @@ c2c autostart status --json
 ```
 
 The LaunchAgent invokes hidden `c2c autostart run --quiet`. That command only
-calls `ensureMachineGateway` and reuses the official Tunnel-owned
-`serve-machine --stdio` child. It never starts a workspace-specific gateway or
-another Tunnel. Disable it with `c2c autostart disable --json`.
+calls `ensureMachineGateway` and restarts the one `c2c serve-http` gateway if it
+is down. It never starts a workspace-specific gateway or your tunnel. Disable it
+with `c2c autostart disable --json`.
 
 ## Workspace registration
 
 ### Device connector binding
 
-Routing starts above the workspace: device identity → configured Tunnel → exact
+Routing starts above the workspace: device identity → public endpoint → exact
 ChatGPT app → local workspace/Project → local session/Chat/owned tab. A product
 name or matching repository on two computers is not a device selector.
 
@@ -134,9 +134,11 @@ The URL is optional when not exposed; do not invent it. If names are ambiguous,
 obtain the exact app identity before dispatch. A name-only rename preserves a
 known stable app URL; choosing a different app requires its new URL explicitly.
 The binding lives in the private machine state directory, `machine/connector.json`,
-and binds `machineId + tunnelId + associationId` to the app name and optional URL.
+and binds `machineId + name + optional pluginUrl`. The tunnel id and association
+fields were dropped with the Secure Tunnel transport; the device is now
+identified by its machine id plus the app's own stable URL.
 It is shared by all workspaces on this device and survives normal setup/updates.
-Changing machine or Tunnel association makes it stale; resolve the mapping once
+Binding against a different machine id makes it stale; resolve the mapping once
 instead of guessing or copying another machine's state. Do not sync machine
 identity, credentials, connector binding, or browser ownership files across devices.
 
@@ -699,7 +701,7 @@ before opening another.
 
 One C2C connector remains sufficient for local workspaces. ChatGPT's other
 plugins are separate app transports and are not exposed or authorized by the
-C2C tunnel. Select only task-needed installed plugins that are callable in the
+C2C endpoint. Select only task-needed installed plugins that are callable in the
 owned Project Chat. Catalog installation and Work-mode trial links are not
 evidence of Chat-mode availability. Do not switch modes, reconnect, install apps,
 or authorize external writes automatically.

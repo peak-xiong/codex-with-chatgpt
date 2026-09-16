@@ -3,9 +3,9 @@
 ## Trust boundaries
 
 The machine is the trust boundary. ChatGPT is an advisory client; Codex is the
-executor. The official OpenAI Secure MCP Tunnel transports MCP to the one
-machine gateway, whose connector is configured as `Codex with ChatGPT` with
-`Authentication: None`.
+executor. A third-party public tunnel (ngrok) forwards HTTPS traffic to the one
+machine gateway's fixed loopback port, and the connector is configured with the
+public `Server URL` plus an `Authorization: Bearer <token>` header.
 
 The gateway trusts only:
 
@@ -16,6 +16,30 @@ The gateway trusts only:
 
 ChatGPT Project names, Project URLs, chat URLs, tab titles, model text and file
 contents are untrusted. They are never authorization principals.
+
+## Public endpoint and bearer token
+
+The official OpenAI Secure MCP Tunnel used to authenticate the transport, which
+is why the connector could be configured with `Authentication: None`. A public
+URL carries no such guarantee, so the endpoint authenticates itself:
+
+- `POST /mcp` requires a bearer token. A missing, malformed, or wrong token
+  returns `401`, and the value is compared in constant time.
+- `c2c serve-http` refuses to start when no token exists, so the gateway never
+  serves an unauthenticated endpoint to the internet, even transiently.
+- The token is created on first use by `c2c machine auth show --reveal`, rotated
+  by `c2c machine auth rotate`, and stored 0600 at `<state>/http/auth.json`.
+  Normal CLI output shows only a hint such as `c2c_mcp_xxxx…yyyy`; the full value
+  is printed only on an explicit `--reveal`.
+- Anyone who can reach the public URL can attempt this check, so a leaked token
+  must be rotated immediately, and the tunnel must stay dedicated to this
+  machine.
+
+The bearer token is a **transport gate, not an authority**. It proves only that
+the caller reached this gateway. It does not replace C2C's turn capabilities: a
+caller that passes the bearer check still needs a valid `context_id` issued by
+`control open`, and every tool additionally enforces its own scope. A public URL
+therefore widens who can reach the transport, not who can act on a workspace.
 
 ## MCP data policy
 
@@ -134,39 +158,43 @@ sessions. Only one session's own turns are ordered.
 
 ## Machine runtime security
 
-The tunnel-owned `serve-machine --stdio` process is the single MCP gateway.
-The gateway's admin API binds to loopback and requires its per-lifetime admin
-token. The token is never returned by normal status output.
+The gateway process started as hidden `c2c serve-http` is the single MCP
+gateway. It binds loopback only (`127.0.0.1`, port `48765` by default) and its
+admin API requires its per-lifetime admin token. The admin token is never
+returned by normal status output.
 
 The machine runtime record is protected and owner-checked using machine id,
 boot epoch, pid and exact port/runtime data. A process only clears its own
 record. A second process cannot adopt or publish over a healthy runtime.
 
-The runtime key is installed from a user-selected file into protected state.
-Commands use a file reference rather than printing the key. Status, errors,
-tests and documentation redact keys, admin tokens and raw capabilities.
+The bearer token is generated locally and stored 0600 in protected state; it is
+never read from a file the user supplies, and normal status output exposes only
+a short hint of it. Status, errors, tests and documentation redact bearer tokens,
+admin tokens and raw capabilities.
 
 Mutable project data is kept inside the repository boundary: Git checkouts use
 `<git-common-dir>/codex-with-chatgpt`, while non-Git workspaces use
 `<workspace-root>/.codex-with-chatgpt`. Shared project metadata is separated
 from checkout-specific session routes and execution records under
 `workspaces/<workspaceId>/`. The authoritative mailbox, runtime installations,
-Tunnel configuration and keys, surface ownership index, gateway ownership
-records, machine identity, lifecycle locks and logs remain in protected machine state. The
+the recorded public endpoint and bearer token, the machine association id,
+surface ownership index, gateway ownership records, machine identity, lifecycle
+locks and logs remain in protected machine state. The
 `sandbox-clean` command removes obsolete global write grants; it does not grant
 a global machine-state directory.
 
-## Browser and tunnel failure handling
+## Browser and gateway failure handling
 
-`machine doctor` verifies the official client, the 0.0.14 status-backed tunnel
-target (`tunnel_id`, profile path and child command), health response, loopback
-admin port and owner record. When the status payload includes a child PID, it
-must match the gateway runtime record. The pinned client may omit that field,
-so exact target, association and health checks remain the primary proof. This
+`machine doctor` verifies the gateway health response, the loopback admin port,
+the owner record, the recorded public endpoint and whether a bearer token
+exists; it reports `gateway`, `endpoint` and `auth` as separate checks, so a
+missing endpoint or token is distinguishable from a stopped gateway. This
 remains a local configuration and liveness check, not a cryptographic
-process-identity proof.
-`machine stop` first verifies the same ownership identity, then stops the tunnel
-supervisor; it does not race the child with an unrelated shutdown.
+process-identity proof, and it does not prove that ChatGPT can reach the public
+URL.
+`machine stop` first verifies the same ownership identity, then sends SIGTERM to
+the gateway it owns; it never kills a process whose live health payload does not
+match this machine's record, and it does not touch the third-party tunnel.
 
 After a gateway restart, all old contexts are invalid because `bootEpoch`
 changes. The local harness re-registers affected workspaces, claims or renews
@@ -174,7 +202,12 @@ their surfaces, and issues new contexts. It never retries an old token.
 
 ## User responsibilities
 
-Keep the runtime-key source private and do not commit machine-state files. In
-ChatGPT create only the named connector with `Authentication: None`, and keep
-each workspace in its intended Project. Do not paste runtime keys, admin
-tokens, context tokens, or full repository contents into ChatGPT manually.
+Keep the bearer token and machine-state files private and do not commit them.
+Keep the tunnel dedicated to this machine: the public URL is reachable by
+anyone, and the token is the only transport gate. Rotate the token with
+`c2c machine auth rotate` if it is exposed, and record a new public URL with
+`c2c machine endpoint set` whenever the tunnel's address changes.
+In ChatGPT create only the named connector with the public URL and the bearer
+token, and keep each workspace in its intended Project. Do not paste bearer
+tokens, admin tokens, context tokens, or full repository contents into ChatGPT
+manually.

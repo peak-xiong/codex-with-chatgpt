@@ -37,10 +37,12 @@
 
 - 每台设备各绑定一个连接器；同一个 ChatGPT 账号可以有多台设备的 C2C 插件。
   插件完整名称与稳定链接记录在机器级配置中，本机所有项目和会话复用。
-- 连接器的 **Authentication 必须是 `None`**。官方 OpenAI Secure MCP Tunnel
-  提供连接认证，连接器不保存某个项目的凭据。
-- Tunnel 独占并托管一个 `serve-machine --stdio` 子进程。这个子进程是机器上
-  唯一的 MCP 网关，可以服务所有已注册工作区。
+- 连接器指向**公网 HTTPS 地址**：由第三方隧道（ngrok）转发到本机，并在
+  Authorization 头携带 bearer 令牌。该令牌只是传输层门禁，不是项目凭据，
+  不能替代 C2C 的轮次能力授权。
+- C2C 守护进程启动唯一的 `c2c serve-http` 网关，绑定回环端口 `48765`
+  （可用 `C2C_HTTP_PORT` 覆盖）。这个网关是机器上唯一的 MCP 网关，
+  可以服务所有已注册工作区。
 - 一个工作区对应一个 ChatGPT Project；一个本地 Codex 会话对应该 Project
   内一个持久 ChatGPT 对话/页面。
 - 浏览器操作始终使用已认领的精确 `tabId`，不会因为某个页面恰好在前台就误发
@@ -57,14 +59,16 @@
 
 ## 安装与配置
 
-这是供用户自行部署的开源项目。每位用户在自己的电脑上安装，并使用自己的 OpenAI
-账号、Tunnel 和密钥；公开 Git 仓库不代表共享维护者的电脑、Tunnel 或凭据。
+这是供用户自行部署的开源项目。每位用户在自己的电脑上安装，并使用自己的隧道和
+凭据；公开 Git 仓库不代表共享维护者的电脑、公网地址或令牌。
 
-当前使用 **OpenAI Secure MCP Tunnel**，不再部署本地 OAuth 服务或公网 MCP URL。
-本地客户端主动通过 HTTPS 连接 OpenAI，不需要开放入站端口、配置公网域名或为
-每个项目配置 OAuth。`Authentication: None` 只是不用连接器级 OAuth，不代表取消
-Tunnel 认证或 C2C 的短期任务授权。本项目不调用模型 API，但仍需要用于认证传输的
-**Tunnel runtime API key（运行密钥）**。
+当前传输方式是**公网 HTTPS 地址**：由第三方隧道（ngrok）转发到网关固定的回环
+端口，ChatGPT 连接器使用 `<公网基地址>/mcp`，并在 Authorization 头携带 bearer
+令牌。本项目不使用官方 OpenAI Secure MCP Tunnel，因为本网络在 TLS SNI 层重置该
+端点：TCP 能连到 `api.openai.com` 的真实地址，但只有 SNI 为 `api.openai.com`
+时握手被中断。更换 DNS 或代理都无法绕过。bearer 令牌只认证传输层；C2C 的短期
+任务级 `context_id` 授权是另一层，仍然必需。缺少有效令牌时 `POST /mcp` 返回
+`401`；令牌由 C2C 生成并保存，不是 ChatGPT 侧的凭据。
 
 ### 让 Codex 执行安装
 
@@ -76,17 +80,14 @@ Tunnel 认证或 C2C 的短期任务授权。本项目不调用模型 API，但�
 先阅读 README.zh-CN.md 的安装说明，检查操作系统、Git、Node.js、Corepack、
 当前任务的内置浏览器能力，以及已有的 C2C 安装。
 确认源码目录后再克隆和构建；保留已有修改、安装配置和会话，不覆盖或清理它们。
-如果已有健康的 C2C 安装正在使用官方 Secure MCP Tunnel，通过
-`machine setup --reuse-existing` 复用已安装的 Tunnel ID 和受保护运行密钥，不重建
-Tunnel，也不再次索要密钥。复用已有有效的设备/插件绑定；若缺失或失效，询问当前
-电脑对应的插件完整名称及实际可用的稳定链接，用 `machine connector set` 记录一次，
-之后所有本机项目复用，不要按相似名称选择另一台电脑的插件。
-如果没有健康的已有连接，完成前置检查和干净源码构建后暂停，指导我
-创建自己的官方 Secure MCP Tunnel，并等待我提供 Tunnel ID 和私有运行密钥文件的
-绝对路径。
-不要猜测账号、组织、工作区、Tunnel ID 或凭据，不要查看、回显或上传密钥内容。
+复用已有有效的设备/插件绑定；若缺失或失效，询问当前电脑对应的插件完整名称及
+实际可用的稳定链接，用 `machine connector set` 记录一次，之后所有本机项目复用，
+不要按相似名称选择另一台电脑的插件。
+否则在前置检查和干净源码构建完成后运行 `machine setup --json`，把输出的 MCP 地址
+和令牌提示告诉我，并指导我启动 ngrok 隧道、用 `machine endpoint set` 记录公网地址。
+不要猜测账号、组织、工作区、地址或凭据，除非我明确要求，不要输出完整 bearer 令牌。
 缺少权限或遇到登录、授权步骤时，说明需要我完成的操作；不要自行切换账号、
-扩大权限，或改用公网 URL、OAuth、其他隧道方案。
+扩大权限，或改用其他隧道方案或 OAuth。
 ```
 
 下面第 1–6 步也是 Codex 应遵循的安装顺序。**Codex 已完成的本地命令不需要用户
@@ -94,10 +95,10 @@ Tunnel，也不再次索要密钥。复用已有有效的设备/插件绑定；�
 
 | 操作 | 谁来完成 |
 | --- | --- |
-| 选择账号/组织/工作区，创建或选择云端 Tunnel，关联工作区 | 首次安装时由用户在 OpenAI 官方页面确认；缺少权限时联系管理员 |
-| 获取运行密钥并存入私有文件，完成登录和授权 | 首次安装或轮换密钥时由用户操作；只把文件路径交给 Codex |
+| 登录隧道服务并启动一条转发到网关回环端口的隧道 | 用户启动并保持隧道运行；ngrok 免费版需要注册账号 |
+| 记录公网地址并避免在聊天中泄露 bearer 令牌 | Codex 用 `machine endpoint set` 记录地址；令牌可见范围由用户控制 |
 | 检查环境、构建源码、全局安装、诊断 | Codex 在本地执行，不在 ChatGPT 对话中执行 |
-| 创建/复用 ChatGPT 连接器 | 用户在已确认的 ChatGPT 工作区中完成，随后由 Codex 验证 |
+| 使用公网地址和 Authorization 头创建/复用 ChatGPT 连接器 | 用户在已确认的 ChatGPT 工作区中完成，随后由 Codex 验证 |
 
 ### 1. 检查前置条件
 
@@ -106,19 +107,20 @@ Tunnel，也不再次索要密钥。复用已有有效的设备/插件绑定；�
   时，先安装适合当前 Node.js 版本的 Corepack；仓库的 `package.json` 已固定 pnpm 版本。
 - Codex 桌面端，当前会话能够使用内置浏览器和 Computer Use。只安装命令行工具
   不会自动获得网页操作能力。
-- ChatGPT 账号/工作区能够使用开发者模式的自定义应用和 Secure Tunnel。
-  请在自己的账号中确认入口和管理员授权，不能仅凭订阅名称认定功能可用。
-- 在目标 Platform 组织中创建/使用 Tunnel，并将其关联到目标 ChatGPT 工作区的权限。
-- 电脑能够出站访问 `api.openai.com:443`，安装时还需访问 GitHub 和包仓库。
-  ChatGPT 调用本地工具期间，电脑必须保持唤醒、联网，相关服务持续运行。
+- ChatGPT 账号/工作区能够使用开发者模式的自定义应用。请在自己的账号中确认入口
+  和管理员授权，不能仅凭订阅名称认定功能可用。
+- 可用的第三方隧道账号与客户端（本项目使用 ngrok），能够把本机端口以 HTTPS 暴露
+  到公网。免费版的公网地址每次隧道重启都会变化，地址变化后必须重新记录。
+- 电脑能够出站访问隧道服务、GitHub 和包仓库。ChatGPT 调用本地工具期间，电脑必须
+  保持唤醒、联网，隧道和 C2C 网关必须同时运行。
 
 当前真实验证环境是 **macOS + Codex 桌面端**。代码包含其他平台目标，但 Windows/Linux
 原生安装和完整浏览器流程尚未完成验收。下面命令使用 macOS/POSIX Shell 语法，不能
 当作 PowerShell 命令直接执行。
 
-账号、权限和网络要求以 [OpenAI Secure MCP Tunnel 官方文档](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
-为准。官方 Tunnel 用于私有连接和开发者模式应用，**不满足公开插件商店的提交要求**。
-“公开源码供别人自行部署”与“发布一个所有人都能直接安装的 ChatGPT 公共插件”是两件事。
+账号、权限和网络要求以所选隧道服务的官方文档为准。公网地址用于私有连接和开发者
+模式应用，**不满足公开插件商店的提交要求**。“公开源码供别人自行部署”与“发布一个
+所有人都能直接安装的 ChatGPT 公共插件”是两件事。
 
 ### 2. 下载并构建干净的源码仓库
 
@@ -138,104 +140,75 @@ git status --short
 保留这个源码目录以便后续升级。安装前 `git status --short` 应无输出。已有修改时，
 先妥善保存，或另外克隆一份干净源码；不要为通过安装检查而重置或删除自己的工作。
 
-### 3. 创建自己的 Tunnel 并准备密钥文件（仅首次安装）
+### 3. 启动隧道并记录公网地址（仅首次安装）
 
-这一阶段在 OpenAI 官方页面完成，**不是本地 `machine setup` 的功能**。
-如果前置检查已经确认存在由官方 Secure MCP Tunnel 支撑的健康 C2C 安装，则跳过本节。
-升级时复用 C2C 已经保护保存的密钥，不重建 Tunnel，也不再次索要密钥。
+这一阶段在隧道服务自己的页面和客户端完成，**不是本地 `machine setup` 的功能**。
+如果前置检查已经确认存在健康、已记录公网地址且隧道正在运行的 C2C 安装，则跳过本节。
 
-1. 打开 [Platform 的 Tunnel 设置](https://platform.openai.com/settings/organization/tunnels)，
-   确认当前账号和左上方/组织选择器中的目标组织。页面位置可能变化，应以实际 UI 为准。
-   为这台电脑创建一个 Tunnel，名称可自行设置；已有本机专用 Tunnel 则复用。
-   不要选用另一台电脑正在使用的 Tunnel。
-2. 在该 Tunnel 的配置中关联之后使用连接器的 **ChatGPT 工作区**。不要把 Platform
-   组织、Platform API Project 与 ChatGPT 工作区混为一谈；业务代码对应的 ChatGPT
-   Project 则在后续配对时创建，不是在这里创建。
-3. 保存配置后，记录页面返回的真实 `tunnel_id`，不要用显示名称、Project ID 或 URL
-   代替。仅完成这一步还没有启动本地客户端，不能据此判断连接已经可用。
-4. 按目标组织的凭据管理流程取得用于该 Tunnel 的 **runtime API key**。官方指南要求
-   运行密钥，但没有规定所有账号都在 Tunnel 页面提供“生成运行密钥”按钮；不要假定
-   创建 Tunnel 就会返回密钥。找不到入口或无法确认权限时，先请组织管理员确认。
-5. 用可信编辑器或密钥管理器，把**密钥本身**保存到所有仓库之外的私有 UTF-8 文本文件。
-   文件中不要包含 JSON、`export`、变量名或包裹密钥的引号。macOS 上可让 Codex
-   只检查文件存在性并执行 `chmod 600 "/absolute/private/path/tunnel-runtime.key"`，
-   无需通过 `cat` 等命令查看内容。安装器会在本地读取并私密保存该文件中的密钥。
+1. 登录隧道服务，为这台电脑保留或复用它专用的一条隧道；不要复用另一台电脑的隧道
+   或公网地址。
+2. 把该隧道指到网关的回环端口 `48765`（即默认 `C2C_HTTP_PORT`）。这个端口是有意
+   固定的：隧道配置指向它，端口在两次启动之间变化会静默破坏公网地址。隧道必须与
+   网关运行在同一台机器上。
+3. 复制隧道给出的 HTTPS 基地址，例如 `https://<your-subdomain>.ngrok-free.dev`，
+   不要带 `/mcp` 后缀；`c2c machine endpoint set --url <https-url>` 会自行追加
+   `/mcp`。
+4. 保持隧道运行。ngrok 免费版的公网地址每次隧道重启都会变化，变化后必须用
+   `machine endpoint set` 重新记录。
 
-权限属于 **Platform 组织级**：创建/编辑需要 Tunnels `Read + Manage`，运行客户端
-和在 ChatGPT 选择 Tunnel 需要 `Read + Use`。只有 Platform Project 权限或 ChatGPT
-开发者模式权限并不够。详见 [官方权限说明](https://developers.openai.com/api/docs/guides/rbac)。
-缺少权限时停止安装并联系组织管理员，不要让 Codex 自动提升权限。
+**如果机器设置了代理环境变量，ngrok 免费版会拒绝启动**：它以 `ERR_NGROK_9009`
+退出，并提示 ngrok agent 不能在设置了代理环境变量的环境中运行。请在运行 ngrok
+的 Shell（或服务定义）中取消 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、
+`NO_PROXY`，让 ngrok 直连。
 
-将原始密钥安全保存，供后续升级使用。不要放入命令行参数、聊天提示词、Project
-指令、截图或 Git。不要复制维护者的密钥、Tunnel ID 或 ChatGPT Project URL。
-
-后续示例都是占位值：将 `<YOUR_TUNNEL_ID>` 替换为自己的 Tunnel ID，将示例文件路径
-替换为私有密钥文件的绝对路径。Tunnel ID 不是密钥，也不能用 ChatGPT 登录令牌替代
-运行密钥。`Authentication: None` 也不能省略这个密钥。
+不要把 bearer 令牌放进命令行参数、截图、Project 指令或 Git。令牌由 C2C 生成并保存；
+不要复用另一台电脑的地址或令牌。这套架构里没有运行密钥，也没有 Tunnel ID 需要收集——
+隧道客户端是服务商提供的普通程序，C2C 既不会安装它，也不会托管它。
 
 ### 4. 为当前系统用户全局安装一次
 
-完成第 3 步后，在**同一个 Codex 安装任务**中回复下面内容，先替换两个占位值，
-不要粘贴密钥正文：
+完成第 3 步后，在**同一个 Codex 安装任务**中回复下面内容，不要粘贴 bearer 令牌：
 
 ```text
-已确认目标账号、Platform 组织和 ChatGPT 工作区，并完成 Tunnel 的工作区关联。
-Tunnel ID：<YOUR_TUNNEL_ID>
-运行密钥文件（绝对路径）：/absolute/private/path/tunnel-runtime.key
+我已经为这台电脑启动了一条隧道，并指向网关的回环端口。它的公网 HTTPS 基地址是：
+<https://your-tunnel-public-base-url>
 请从刚才构建的干净源码目录执行 machine setup，为当前系统用户安装。
-仅将密钥文件路径传给安装器，不要输出、上传或在聊天中展示文件内容。
+然后用 machine endpoint set 记录该公网地址，并报告 MCP 地址。只显示令牌提示，
+不要在聊天中输出完整 bearer 令牌。
 然后检查全局 Skill、machine status 和 machine doctor --no-fix，报告实际结果。
 本地安装完成后，等待我在 ChatGPT 创建或确认连接器，再进行工作区配对和回传验收。
 ```
 
 Codex 应在第 2 步构建好的源码目录执行下面命令，不使用 `sudo`。首次安装时全局
-`c2c` 可能不存在，必须使用源码入口。所有占位值须先替换；路径带空格时保留引号：
+`c2c` 可能不存在，必须使用源码入口：
 
 ```sh
-node bin/c2c.js machine setup \
-  --tunnel-id "<YOUR_TUNNEL_ID>" \
-  --runtime-key-file "/absolute/private/path/tunnel-runtime.key" --json
+node bin/c2c.js machine setup --json
+node bin/c2c.js machine endpoint set --url "https://<your-tunnel-public-base-url>" --json
+node bin/c2c.js machine auth show
 ```
 
-已有健康安装时，改用更新后源码入口的显式复用模式。该模式不会把密钥读入对话，
-也不接受任意替换路径：
-
-```sh
-node bin/c2c.js machine setup --reuse-existing --json
-```
-
-没有有效机器配置时，`--reuse-existing` 会拒绝执行；它也不能和 `--tunnel-id`、
-`--runtime-key-file` 同时使用。需要更换 Tunnel 或轮换密钥时，必须使用同时提供
-两个显式参数的首次安装形式。
+`machine setup` **只接受 `--json`**；`--tunnel-id`、`--runtime-key-file` 和
+`--reuse-existing` 都已移除。后续升级同样直接重跑它：会复用已记录的地址和已有令牌，
+不需要原始凭据路径。只有隧道的公网地址真的变化时才需要重新记录。
 
 预期返回 `ok: true`、`configured: true`。安装器会部署经校验的运行时，安装全局
-Skill 和 `c2c` 命令入口，安装本项目固定版本的官方 Tunnel 客户端，并启动唯一的
-Tunnel 托管网关。首次安装形式会私密复制用户提供的密钥；复用模式保留已经保护保存的
-密钥。**安装器不会创建云端 Tunnel、关联 ChatGPT 工作区，也不会在 ChatGPT 中创建
-连接器**；首次安装时，前两项必须已在第 3 步完成。
+Skill 和 `c2c` 命令入口，通过机器守护进程启动唯一的 `c2c serve-http` 网关，并在
+首次使用时生成 bearer 令牌。`machine endpoint set` 记录公网基地址和回环端口；
+`machine auth show` 只显示令牌提示，加 `--reveal` 才输出连接器需要的完整值。
+**安装器不会启动你的隧道、创建 ChatGPT 工作区，也不会在 ChatGPT 中创建连接器**；
+隧道必须已在第 3 步启动。
 
-**如果本机只能通过代理访问 `api.openai.com`**，请在执行安装的 Shell 中先导出代理。
-托管 Tunnel 的 LaunchAgent 由 launchd 以固定环境启动，**不会**继承只在交互式 Shell
-中设置的代理；缺少代理时隧道会持续轮询控制平面直到超时，ChatGPT 侧表现为连接器
-不可用，而所有本地检查仍然报告 `ready`。安装器会把校验通过的 `http`/`https`/`socks`
-代理地址（以及 `NO_PROXY`）写入 LaunchAgent，使托管隧道与 CLI 使用同一出口。
-可用下面的命令确认运行中的进程确实拿到了它们：
+用 `c2c machine auth rotate --json` 轮换令牌。旧令牌立即失效，请在同一个操作里同步
+更新连接器的 Authorization 头，否则所有调用都会返回 `401`。
 
-```sh
-ps -E -p $(pgrep -f 'tunnel-client run' | head -1) | tr ' ' '\n' | grep -iE '^(HTTPS?_PROXY|ALL_PROXY)='
-```
+**代理说明。** C2C 网关只绑定回环地址，本身不需要代理。隧道客户端需要自己的出网，
+而 ngrok 免费版在有代理变量时拒绝运行（见第 3 步）。如果本网络按域名劫持明文 UDP/53
+查询（例如 `api.openai.com` 被解析到 `2a03:2880::/29`，即 Meta 网段），仅更换 DNS
+服务器无效，因为伪造应答出现在链路上；程序不走代理时必须使用加密 DNS（DoH/DoT）。
 
-输出为空说明服务进程没有收到代理。重新导出后再次执行安装，然后重启托管进程对。
-完整诊断见[排障文档](docs/troubleshooting.md#chatgpt-cannot-call-the-connector-but-the-machine-looks-healthy)
-（英文）。
-
-注意这类网络上的明文 UDP/53 查询可能被劫持（例如 `api.openai.com` 被解析到
-`2a03:2880::/29`，即 Meta 网段）。仅更换 DNS 服务器无效，因为伪造应答出现在链路
-上；程序不走代理时必须使用加密 DNS（DoH/DoT）。
-
-官方通用教程中的 `tunnel-client init/run` 和示例 MCP 服务用于独立接入。
-本项目由 `machine setup` 管理这些本地组件，**不要再并行执行那套示例**，也不要为
-单个项目另外启动 `tunnel-client` 或 `serve-machine`。
+不要再并行运行官方 OpenAI Secure MCP Tunnel 的客户端或示例 MCP 服务。C2C 已移除该
+传输方式，它在本网络上无法连接，运行它只会多出一条无用的路径。
 
 命令入口位于 `~/.local/bin/c2c`。若终端找不到 `c2c`，在自己的 Shell 启动配置中
 加入下面一行，再重新加载该 Shell：
@@ -256,16 +229,20 @@ Security and login，可能需管理员先授权）。打开 [ChatGPT 插件页]
 | 字段 | 值 |
 | --- | --- |
 | 名称 | 能区分设备的完整名称，例如 `Codex with ChatGPT - Laptop`；现有名称可以保留 |
-| Connection（连接方式） | `Tunnel` |
-| OpenAI Secure Tunnel | 选择第 4 步配置的同一个 Tunnel |
-| Authentication | `None` |
+| Connection（连接方式） | `Server URL`（不是 `Tunnel`） |
+| MCP Server URL | `c2c machine endpoint get` 返回的 `/mcp` 地址 |
+| Authentication | `Bearer token`（或 Authorization 头），值为 `c2c machine auth show --reveal` 的输出 |
 
-已有该连接器时直接复用，不重复创建。这里不需要公网 Server URL，运行密钥应留在
-本机，不能填进这个表单。工具发现期间保持网关运行。列表中没有 Tunnel 时，先检查
-ChatGPT 工作区关联和 Read + Use 权限。页面若支持手动输入 Tunnel ID，也必须填同一个
-已关联且有权使用的真实 ID；手动输入不能绕过权限。没有 Tunnel 连接方式时停止并确认
-账号功能/管理员设置，不改选公网 URL 或 OAuth。完成后通知 Codex“连接器已配置”，
-再继续第 6 步；看到连接器卡片不等于回传验收已通过。
+已有该连接器时直接复用，不重复创建。这里没有 Tunnel 可选，也没有运行密钥：
+公网地址加 bearer 令牌就是传输配置的全部。工具发现期间保持隧道和网关运行。
+地址被拒绝时，确认记录的是不带 `/mcp` 后缀的公网基地址（C2C 自行追加），并且隧道
+仍在转发。返回 `401` 说明连接器里的令牌与本机当前令牌不一致：用
+`c2c machine auth show --reveal` 核对，或用 `c2c machine auth rotate` 两边一起轮换。
+
+通过 bearer 校验只证明调用方到达了本机网关，并不授予工作区访问权限：ChatGPT 仍须
+在每次工具调用中携带 `c2c control open` 签发的 `context_id`，否则任何工具都不会对
+工作区生效。完成后通知 Codex“连接器已配置”，再继续第 6 步；看到连接器卡片不等于
+回传验收已通过。
 
 同时告诉 Codex 哪个插件属于当前电脑，由 Codex 在本机记录一次：
 
@@ -279,17 +256,17 @@ c2c machine connector get --json
 `--plugin-url`，但插件名称必须足以唯一识别目标。绑定只保存本机路由，不会创建或
 重命名远端插件；插件实际连接哪条通道，仍需通过真实读取验证返回的机器身份。
 
-两台电脑各使用自己的 Tunnel 和插件，路由层级为：
-**设备 → Tunnel → 指定插件 → Workspace/Project → Session/Chat/标签页**。
-不要跨设备复制机器 ID、凭据、插件绑定或页面归属状态。普通升级保留绑定；更换
-Tunnel 或连接身份后旧绑定会变为 `stale`。旧安装首次升级若尚无绑定，只需补记
-一次已有的设备/插件对应关系；`control open` 会在发出本地 MCP 请求前检查绑定。
+两台电脑各使用自己的公网地址和插件，路由层级为：
+**设备 → 公网地址 → 指定插件 → Workspace/Project → Session/Chat/标签页**。
+不要跨设备复制机器 ID、凭据、插件绑定或页面归属状态。普通升级保留绑定；绑定记录的
+machine id 与当前机器不一致时旧绑定会变为 `stale`。旧安装首次升级若尚无绑定，只需
+补记一次已有的设备/插件对应关系；`control open` 会在发出本地 MCP 请求前检查绑定。
 之后所有本机项目自动继承，无需逐项目安装或再次选定插件，也不强制要求界面显示
 插件标签。`machine connector get` 返回 `status: bound` 后再进行真实读取验收。
 
 创建应用或变更工具 schema 后，确认已有应用中的所需只读工具及输入契约。
 仅当当前界面提供 Refresh 且需要更新发现信息时使用一次，不假定固定菜单路径。
-打开 Manage 或重启 Tunnel 都不能证明 schema 已刷新；真实读取在第 6 步单独验证。
+打开 Manage 或重启隧道都不能证明 schema 已刷新；真实读取在第 6 步单独验证。
 缺少按钮时不要反复寻找或重建连接器。
 
 切换 ChatGPT 账户后，还需检查原工作区的 Project/Chat 是否可访问。插件绑定成功
@@ -331,6 +308,24 @@ Codex 桌面端；已有会话需要重新读取新版 Skill，而不是逐项�
 | 本地读取可用 | BOOT 返回预期 workspace/project ID 和真实本地证据 |
 | 回传可用 | Computer Use 校验精确 tab/chat/generation/response 和结构化结果标记 |
 
+前两层是纯本地检查：机器健康、doctor 通过、地址已记录，只证明各托管组件彼此一致，
+**不能证明 ChatGPT 能到达本机**。要单独验证 HTTP 这一跳，可以带令牌直接请求公网
+`/mcp` 地址：
+
+```sh
+MCP_URL="https://<your-tunnel-public-base-url>/mcp"
+TOKEN="$(c2c machine auth show --reveal)"
+curl -sS -i -X POST "$MCP_URL" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"manual-check","version":"0"}}}'
+```
+
+返回 `401` 说明令牌不匹配；返回完整的 `initialize` 响应只证明这条 HTTP 链路可用，
+**不等于** ChatGPT 连接器能通过隧道访问该地址——后者需要一次真实连接器调用。地址
+可达但调用失败时，优先刷新 ChatGPT 应用管理页缓存的工具 schema
+（Plugins → 该应用 → **Manage** → **Refresh**）；仅重启隧道不会刷新平台侧的元数据。
+
 mailbox 回调代码和历史真实回传记录继续保留，供后续对比；生产 MCP 当前不注册
 这些回调工具。只有经过精确页面关联和 schema 校验的结果标记才会被接受，普通页面
 文字不能替代结果。详见 [当前验收边界](docs/issue-log.md#最新回传验收修复)。
@@ -342,7 +337,7 @@ ChatGPT 账号自动共享。
 
 | 范围 | 要做什么 |
 | --- | --- |
-| 当前机器/系统用户 | 一份运行时、Skill、Tunnel 和连接器 |
+| 当前机器/系统用户 | 一份运行时、Skill、隧道和连接器 |
 | 新工作区 | 首次注册并配对自己的 ChatGPT Project |
 | 新本地会话 | 在该 Project 中绑定一个专属 Chat/页面 |
 | 同一会话的后续任务 | 复用页面，只生成新的任务授权 |
@@ -357,7 +352,8 @@ c2c workspace --json
 
 Skill 会按需执行注册，上面的命令用于检查。不要在不包含 C2C 源码的业务项目中
 运行 `node bin/c2c.js`。工作区命令按可信的当前目录确定目标，`-w` 不能选择其他路径。
-其他项目不需要新的连接器、Tunnel 或复制 Skill；换电脑/系统用户则需各自配置。
+其他项目不需要新的连接器、隧道或复制 Skill——同一个机器级地址服务所有已注册
+工作区；换电脑/系统用户则需各自配置。
 
 ### 安装位置与升级
 
@@ -368,6 +364,8 @@ macOS 默认位置如下，均属于当前系统用户：
 | 命令入口 | `~/.local/bin/c2c` |
 | 全局 Skill | `~/.codex/skills/codex-with-chatgpt/SKILL.md` |
 | 托管运行时 | `~/Library/Application Support/codex-with-chatgpt/installation/current` |
+| 公网地址记录 | `<机器状态目录>/http/endpoint.json`（0600） |
+| bearer 令牌 | `<机器状态目录>/http/auth.json`（0600） |
 | Git 项目状态 | `<git-common-dir>/codex-with-chatgpt` |
 | 非 Git 项目状态 | `<workspace-root>/.codex-with-chatgpt` |
 
@@ -385,15 +383,15 @@ git status --short
 git pull --ff-only
 corepack pnpm install --frozen-lockfile
 corepack pnpm build
-node bin/c2c.js machine setup --reuse-existing --json
+node bin/c2c.js machine setup --json
 c2c skill status --json
 c2c machine doctor --no-fix --json
 ```
 
-只有状态检查无输出时才继续。复用已安装的 Tunnel 和密钥，保留现有连接器；升级时
-不需要原始密钥文件路径，也不必逐项目升级。只有主动更换 Tunnel 或轮换密钥时才使用
-同时提供两个参数的首次安装形式。安装命令必须使用上述**更新后源码的入口**，不要改为
-旧的全局 `c2c`，否则会复用它自身的旧运行时。重启后 Skill 取得新授权，既有
+只有状态检查无输出时才继续。复用已记录的公网地址、已有 bearer 令牌和现有连接器；
+升级时不需要原始令牌、密钥文件路径，也不必逐项目升级。只有隧道公网地址真的变化时
+才需要重新执行 `machine endpoint set`。安装命令必须使用上述**更新后源码的入口**，
+不要改为旧的全局 `c2c`，否则会复用它自身的旧运行时。重启后 Skill 取得新授权，既有
 Project/Chat 映射仍保留。
 升级涉及工具契约时，按第 5 步核验已有应用的发现信息；仅在界面提供且确有需要时刷新。
 `c2c update-check --json` 只检查更新，不执行安装；`checked: false` 也不能证明已是最新版。
@@ -408,8 +406,8 @@ c2c autostart status --json
 ```
 
 LaunchAgent 会隐藏运行 `c2c autostart run --quiet`。这个命令只调用
-`ensureMachineGateway`，复用官方 Tunnel 已托管的子进程，不会为工作区创建第二个
-网关或第二个 Tunnel。关闭自动启动：
+`ensureMachineGateway`，在唯一的 `c2c serve-http` 网关停止时把它拉起，不会为工作区
+创建第二个网关。它不会启动你的隧道。关闭自动启动：
 
 ```sh
 c2c autostart disable --json
@@ -424,10 +422,12 @@ c2c autostart disable --json
 | --- | --- |
 | 找不到 `corepack` 或 `c2c` | 安装适合当前 Node.js 的 Corepack；检查第 4 步的入口和 PATH |
 | 没有 `machine setup` 命令 | 检查仓库/分支并按第 2 步重新构建；旧 OAuth 版本是另一套架构 |
-| `--reuse-existing` 提示没有配置或密钥 | 当前机器没有可复用的官方 Tunnel 配置；使用自己的 Tunnel ID 和私有密钥文件路径完成第 3–4 步 |
+| `machine setup` 拒绝 `--tunnel-id` 或 `--reuse-existing` | 这两个参数已随 Secure Tunnel 传输方式移除；只运行 `machine setup --json` |
+| `machine endpoint get` 没有地址 | 用 `c2c machine endpoint set --url <https-url>` 记录运行中隧道的 HTTPS 基地址 |
+| 连接器返回 `401` | Authorization 头的令牌与 `c2c machine auth show --reveal` 不一致；更新其中一侧或两边一起轮换 |
+| ngrok 以 `ERR_NGROK_9009` 退出 | 取消 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`；免费版在设置代理变量时拒绝运行 |
 | 安装器要求干净 Git 源码 | 使用 Git 克隆并先保存自己的修改，不能用 ZIP 代替 |
-| ChatGPT 中看不到 Tunnel | 检查账号/工作区、Tunnel 关联和 Read + Use 权限 |
-| 机器未 ready | 执行 `c2c machine doctor --no-fix --json`，检查网络、密钥权限和唯一的托管客户端 |
+| 机器未 ready | 执行 `c2c machine doctor --no-fix --json`，它会分别报告 `gateway`、`endpoint`、`auth` 三项检查 |
 | 能读文件但收不到结果 | 检查当前消息的回传工具可用性，不能宣称完整成功或绕过平台授权 |
 
 受控修复和精确会话恢复详见 [故障排查](docs/troubleshooting.md)。
@@ -440,11 +440,11 @@ ChatGPT Project A                 ChatGPT Project B
   会话 A2 -> 页面 A2                 会话 B2 -> 页面 B2
             \                         /
              \                       /
-              一个全局连接器（Authentication: None）
+              一个全局连接器（Server URL + Bearer 令牌）
                               |
-                官方 OpenAI Secure MCP Tunnel
+              第三方公网隧道（ngrok）-> <公网地址>/mcp
                               |
-               Tunnel 托管 node ... serve-machine --stdio
+           c2c serve-http 监听 127.0.0.1:48765（/mcp 需 bearer 令牌）
                               |
           机器网关：工作区注册表 + 能力令牌代理 + 结果箱
                               |
@@ -537,6 +537,11 @@ generation 不能继续写回。一次恢复只自动创建一个替代页面，
 
 ## 安全边界
 
+- 传输层是公网地址，因此 `POST /mcp` 必须携带 bearer 令牌；未携带或令牌错误都会
+  返回 `401`。缺少令牌时网关拒绝启动 `serve-http`。
+- bearer 令牌只是**传输层门禁，不是授权**。通过校验的调用方仍必须携带
+  `c2c control open` 签发的有效 `context_id`，任何工具才会对工作区生效；每个工具
+  还会单独校验自己的 scope。
 - MCP 工作区工具全部只读；Computer Use 结果受活动请求、精确页面/回复身份和 schema 约束。
 - 工作区路径会规范化并限制在注册根目录内，符号链接和目录穿越都会被拒绝。
 - 能力令牌和活动租约均短时有效，并绑定会话、任务、轮次、阶段、压缩纪元、页面
@@ -544,8 +549,10 @@ generation 不能继续写回。一次恢复只自动创建一个替代页面，
 - 保留的 mailbox 完成栅栏在当前生产传输中停用，仅继续由测试覆盖以便后续对比。
 - 机器生命周期记录同时校验 machine id、boot epoch、pid 和精确运行时数据，第二
   个进程不能悄悄成为网关。
-- 运行时密钥、管理令牌和原始能力令牌只保存在受保护的机器状态中，普通 CLI 输出
-  会隐去它们。
+- bearer 令牌、管理令牌和原始能力令牌只保存在受保护的机器状态中（0600），普通
+  CLI 输出会隐去它们；只有显式执行 `machine auth show --reveal` 才会打印完整令牌。
+- 任何能访问公网地址的人都可以尝试 bearer 校验，因此令牌泄露时应执行
+  `c2c machine auth rotate`，并保证该隧道专用于本机。
 
 详细契约见 [docs/architecture.md](docs/architecture.md)、
 [docs/protocol.md](docs/protocol.md)、[docs/security.md](docs/security.md)。
@@ -557,6 +564,10 @@ c2c machine start
 c2c machine status --json
 c2c machine doctor --no-fix --json
 c2c machine stop
+c2c machine endpoint get --json
+c2c machine endpoint set --url https://<your-tunnel-public-base-url> --json
+c2c machine auth show --json
+c2c machine auth rotate --json
 c2c workspace --json
 c2c surface get --local-session <session-id> --json
 c2c session get --local-session <session-id> --json

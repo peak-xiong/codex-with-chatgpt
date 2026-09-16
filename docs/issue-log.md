@@ -14,7 +14,10 @@
 - 已有候选页与未完成请求优先继续，避免再次创建。Skill 同步说明用户已有选择无需
   重复确认，引用的故障报告和示例链接不作为项目选择。
 
-## Tunnel 状态与账户迁移
+## Tunnel 状态（历史）与账户迁移
+
+> 说明：本节前两条针对已删除的官方隧道客户端状态快照，保留为历史记录；
+> 当前实现不再解析隧道状态，见「传输层改为公网 HTTP 端点」。
 
 - 2026-09-09：状态解析以当前结构化快照为准，历史日志、进程 ID、路径或成功命令的
   stderr 中出现 401/403，不再覆盖 healthy/ready 或抹掉进程归属信息。
@@ -26,8 +29,10 @@
 
 ## 多设备插件路由
 
-- 2026-09-08：增加机器级 `machine connector get/set`，把本机身份、Tunnel、连接身份
+- 2026-09-08：增加机器级 `machine connector get/set`，把本机身份、连接身份
   绑定到明确的 ChatGPT 插件名称与可选稳定 URL；每台设备配置一次，本机所有项目复用。
+  （2026-09-16 更新：绑定字段已去掉 `tunnelId`/`associationId`，只用 machineId、
+  名称和可选 pluginUrl。）
 - `session get`、`machine status`、安装输出及 `control open` 暴露绑定状态；生成的
   提示词指定本机插件，禁止将令牌轮流尝试到其他设备的插件。缺失/失效绑定在创建
   本地 MCP 请求之前报错；旧会话和凭据保留，升级只需补记一次已有设备对应关系。
@@ -35,7 +40,7 @@
   它们和工作区身份。其他最小权限任务不自动扩权，仍由目标网关验证其独有 capability。
 - 独立网关拒绝另一设备令牌、绑定失效、稳定 URL 保存、CLI 全局复用与提示词目标
   已有回归覆盖。两台真实电脑同时运行的跨设备网页验收仍需分别在各设备完成；本地
-  模拟不能证明另一台电脑的实际安装或 ChatGPT 插件到 Tunnel 的远端关联。
+  模拟不能证明另一台电脑的实际安装或 ChatGPT 插件到公网地址的远端关联。
 
 ## Computer Use 单通道对比模式
 
@@ -63,7 +68,7 @@
 - 确认页面已完成但没有回调时，宿主以 `callback_missing` 记录独立失败并自动收尾，不需要用户打断、追问或确认失败。真实回执仍优先保留；不自动重试拒绝请求或绕过平台限制。
 - 本地验证：38 个测试文件、528 项测试全部通过，类型检查、构建、Skill 校验通过。模拟同一任务运行九十分钟后，经 MCP SDK 成功回传 BLOCKED；另覆盖 CLI 续期、短租约提前检查、旧观察重放、过期/撤销授权拒绝续期、并发回执优先保留、续期记录完整性，以及宿主终态结果的 16 KiB/UTF-8 边界。最终全量使用单 worker 通过；首次双 worker 全量运行有一个既有 CLI 重启用例受资源竞争超过默认三十秒，单项复跑约十秒通过，该次全量不计为通过。CLI 长流程用例的测试预算仅用于容纳低并发全量运行开销，不是产品等待上限；九十分钟为本地模拟时间，不是实际 ChatGPT 网页长任务验收。
 - 这是一项本地协议、CLI 和 Skill 优化，不证明真实网页的安全拦截原因或持续回传已解决；本地模拟测试不替代真实网页验收，也不复现或绕过平台拦截。
-- 真实升级验收发现：仅重启 Tunnel/Gateway 后，ChatGPT 应用管理页仍保留旧回调 schema，页面因此只发现读工具并主动输出 schema-valid `C2C_HOST_OBSERVED_RESULT`。宿主已将其保存为 `host_observed`，请求自动取消，`result` 保持 null 且不能 ack。对同一个全局应用执行 Manage > Refresh 后，管理页显示 `submit_control_result(context_id, kind, payload)` 和 `get_control_result_status(context_id)` 新契约。刷新后的新 REVIEW 请求成功调用 context-only 状态查询、读取本地证据并通过三参数 `submit_control_result` 到达真实 mailbox；本地按精确关联先保存 resultId，再完成 acknowledged。公开安装、更新、协议、Skill 和排障说明已补充这一机器级刷新步骤。
+- 真实升级验收发现：仅重启隧道/Gateway（该隧道组件已于 2026-09-16 移除）后，ChatGPT 应用管理页仍保留旧回调 schema，页面因此只发现读工具并主动输出 schema-valid `C2C_HOST_OBSERVED_RESULT`。宿主已将其保存为 `host_observed`，请求自动取消，`result` 保持 null 且不能 ack。对同一个全局应用执行 Manage > Refresh 后，管理页显示 `submit_control_result(context_id, kind, payload)` 和 `get_control_result_status(context_id)` 新契约。刷新后的新 REVIEW 请求成功调用 context-only 状态查询、读取本地证据并通过三参数 `submit_control_result` 到达真实 mailbox；本地按精确关联先保存 resultId，再完成 acknowledged。公开安装、更新、协议、Skill 和排障说明已补充这一机器级刷新步骤。
 - 真实 REVIEW 发现宿主终态 `terminalResult` 仅做字段 schema 校验，未执行新结果的 16 KiB 聚合字节限制。现在页面观察入口和 mailbox 防御入口均复用 `parseControlResultSubmission`，超限输入会在清除活动请求、写取消标记或撤销 capability 之前失败。新增 16,384 字节接受、16,385 字节拒绝、多字节 UTF-8 超限，以及拒绝后仍可完成真实授权回写的回归测试；历史 MCP mailbox 结果继续使用独立 32 KiB 读取契约。
 
 ## 最新回传验收修复
@@ -89,7 +94,7 @@
 | C2C-022 | linked-worktree 测试未隔离机器 mailbox | 为该用例设置独立 C2C_STATE_DIR 并恢复原环境，验证两个请求实际位于临时机器目录。仅移出本轮两次全量运行产生的四组测试请求，保留可恢复副本；未清理其他历史记录或真实会话。 |
 | C2C-023 | 本地运行时更新后，ChatGPT 全局应用仍缓存旧 MCP schema | 要求在 Gateway 健康时对同一个全局应用执行 Manage > Refresh，并核对当前回调参数；真实刷新后已完成 received/acknowledged 验收，不创建或逐项目安装新 Connector。 |
 | C2C-024 | 宿主终态结果绕过新结果 16 KiB 聚合字节限制 | 页面解析与 mailbox 落盘前均复用新结果解析器；覆盖精确字节边界、UTF-8、无生命周期副作用和后续有效完成。历史结果只读上限保持 32 KiB。 |
-| C2C-025 | 安装提示把首次配置与已有安装升级混为一谈 | 新增显式 `machine setup --reuse-existing`，只在已有官方 Tunnel 配置和受保护密钥存在时复用；禁止与首次安装参数混用。中英文安装说明、协议、Skill 和排障文档区分首次安装、升级、Tunnel 更换及密钥轮换。 |
+| C2C-025 | 安装提示把首次配置与已有安装升级混为一谈 | 新增显式 `machine setup --reuse-existing`，只在已有官方 Tunnel 配置和受保护密钥存在时复用；禁止与首次安装参数混用。中英文安装说明、协议、Skill 和排障文档区分首次安装、升级、Tunnel 更换及密钥轮换。（2026-09-16：该参数与整套隧道配置已随传输层改造移除，本条为历史记录。） |
 | C2C-026 | ChatGPT-first 仅按任务类型分派，导致任意 commit/ref 审查和部署判定在已知工具缺口下仍被派发 | 增加证据闭包门禁、支持/禁止能力矩阵、最小 scope 指引及混合任务拆分；已知缺口留在 Codex，只有有效分派后才允许用 BLOCKED 报告新发现的缺口。 |
 
 ## 控制平面出网与错误归因
@@ -145,6 +150,55 @@
   `SSL_ERROR_SYSCALL` TLS 中断。回滚后全部恢复（`api.openai.com` 401、
   `chatgpt.com` 403）。系统级 DNS 仍为原状，**未解决**，且不影响已修复的隧道，
   因为隧道经代理出网时由代理远端解析。
+
+## 传输层改为公网 HTTP 端点
+
+- 2026-09-16（提交 `e7b8fdd`）：**移除官方 OpenAI Secure MCP Tunnel 传输**，
+  改为公网 HTTP 端点。上一节的控制平面长轮询问题最终定位到 TLS SNI 层拦截，
+  不是连接缺失：TCP 能连到 `api.openai.com` 的真实地址，只有 SNI 为
+  `api.openai.com` 时握手被中断（`SSL_ERROR_SYSCALL`、`read 0 bytes`），
+  同一 IP 换其他 SNI 则正常。因此更换 DNS、加代理都无法修复；隧道在本地网关
+  全程 `healthy` 的情况下累计 10997 次轮询超时。该传输路径已整体删除，
+  不提供回退分支。
+- 现在网关由隐藏命令 `c2c serve-http` 直接启动，绑定固定回环端口 `48765`
+  （`DEFAULT_MACHINE_HTTP_PORT`，仅测试可用 `C2C_HTTP_PORT` 覆盖），
+  由第三方隧道（ngrok）转发，MCP 地址为 `<公网基地址>/mcp`。
+  进程托管改由机器守护进程本身负责，`serve-machine --stdio`、`src/tunnel/`、
+  运行密钥和 pinned 客户端全部删除。
+- 公网地址没有官方隧道提供的传输认证，因此 `POST /mcp` **必须携带 bearer 令牌**：
+  缺失或错误返回 `401`，缺令牌时 `serve-http` 直接拒绝启动。令牌由
+  `c2c machine auth show --reveal` 按需生成、`c2c machine auth rotate` 轮换，
+  以 0600 存放在 `<state>/http/auth.json`；普通输出只显示 `c2c_mcp_xxxx…yyyy`
+  形式的提示，只有显式 `--reveal` 才打印完整值。公网地址记录在
+  `<state>/http/endpoint.json`。
+- **安全边界必须如实表述：** bearer 令牌只是传输层门禁，不是授权。通过校验的
+  调用方仍需 `control open` 签发的有效 `context_id`，任何工具才会对工作区生效，
+  每个工具还各自校验 scope。公网地址扩大的是「谁能到达传输层」，不是「谁能操作
+  工作区」。
+- 新增 `c2c machine endpoint get|set|clear`（`set` 只接受 `--url <https 基地址>`）
+  与 `c2c machine auth show [--reveal]|rotate`。`machine setup` 现在只接受
+  `--json`，不再接受 `--tunnel-id`、`--runtime-key-file`、`--reuse-existing`。
+  `machine status --json` 用 `transport`（含 `mcpUrl`、`localPort`、
+  `authConfigured`、`authTokenHint`）取代了原来的 `tunnel` / `config`；
+  `machine doctor` 分别报告 `gateway`、`endpoint`、`auth` 三项检查。
+  `controlPlaneDown` / `controlPlaneDetail` 与 `src/config/tunnel-env.ts`
+  随该传输一并删除；上一节保留的是当时的历史记录，不代表当前实现。
+- 连接器配置方式随之改变：不再选择 `Tunnel`、也不再用 `Authentication: None`，
+  而是填入公网 Server URL 并在 Authorization 头携带 bearer 令牌。
+  连接器绑定 schema 去掉了 `tunnelId` 与 `associationId`，改为
+  machineId + 名称 + 可选 pluginUrl；机器级 association id 改为持久化保存，
+  否则每次重启都会让已保存的绑定误报 `stale`。
+- 操作提示：ngrok 免费版在设置了代理环境变量时拒绝运行并报 `ERR_NGROK_9009`，
+  启动它的 Shell 或服务必须去掉 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` /
+  `NO_PROXY`；免费版公网地址每次重启变化，变化后必须重新执行
+  `machine endpoint set`。
+- **已验证：** 真实进程下，未带令牌的 `POST /mcp` 返回 `401`，错误令牌返回
+  `401`，正确令牌可以完成 `initialize` 并枚举全部九个工具；公网地址与回环端口
+  经真实 curl 走通。类型检查、构建与全量测试（40 个文件、555 项）通过。
+- **未验证：** ChatGPT 连接器经由 ngrok 的真实调用。本轮只验证了 HTTP 这一跳，
+  隧道的转发另外用探针确认过，**没有**用真实 ChatGPT 连接器发起过一次调用。
+  因此「本机 HTTP 链路可用」不等于「网页已能调用本机工具」，端到端仍需一次
+  真实连接器调用才能收口。
 
 ## 本机收口结果
 
@@ -204,7 +258,7 @@
 
 | ID | 项目 | 状态 |
 | --- | --- | --- |
-| C2C-101 | 一个全局连接器 | `Codex with ChatGPT`、Authentication None、一个官方 OpenAI Secure MCP Tunnel、一个机器 Gateway。 |
+| C2C-101 | 一个全局连接器 | `Codex with ChatGPT`、公网 Server URL 加 bearer 令牌、一个第三方隧道、一个机器 Gateway。 |
 | C2C-102 | 全局安装更新 | Skill 与托管 runtime 一次安装；各项目只注册和保存本项目状态，无需复制插件或逐项目维护版本。 |
 | C2C-103 | 并发 | 最多 100 个未过期的 `(projectId, localSessionId)` 页面租约；同 session 串行，不同 session 独立。101 个新 session 需等待容量释放，不抢占已有页面。 |
 | C2C-104 | ChatGPT-first | RESEARCH/PLAN/REVIEW 优先交给网页和只读 MCP；Web Search 使用 ChatGPT 自带能力。编辑、命令、测试、Git 与最终验证留在本地。 |

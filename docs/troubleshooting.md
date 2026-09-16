@@ -7,15 +7,15 @@ c2c machine status --json
 c2c machine doctor --no-fix --json
 ```
 
-When repair is appropriate, let the managed lifecycle restart the one Tunnel
-and its child:
+When repair is appropriate, let the managed lifecycle restart the one gateway:
 
 ```sh
 c2c machine doctor --json
 ```
 
-Do not start a second gateway for a workspace and do not kill the tunnel child
-directly.
+Do not start a second gateway for a workspace and do not kill the gateway process
+directly. C2C does not own or supervise your tunnel; start and stop that with the
+tunnel provider's own client.
 
 ## Workspace state and sandbox cleanup
 
@@ -43,9 +43,9 @@ c2c autostart status --json
 ```
 
 launchd runs hidden `c2c autostart run --quiet`; this only invokes
-`ensureMachineGateway` and reuses the official Tunnel-owned child. It does not
-create a per-workspace gateway, a second Tunnel, or a browser-page queue. To
-remove the LaunchAgent:
+`ensureMachineGateway` and restarts the one `c2c serve-http` gateway if it is
+down. It does not create a per-workspace gateway, a browser-page queue, or a
+second gateway. It does not start your tunnel. To remove the LaunchAgent:
 
 ```sh
 c2c autostart disable --json
@@ -54,131 +54,163 @@ c2c autostart disable --json
 This command is currently supported on macOS LaunchAgents. It is optional on
 other platforms and does not change the machine connection itself.
 
-## Updating an existing installation without the original key-file path
+## Updating an existing installation
 
-From the updated, clean source checkout, reuse the installed official Tunnel
-configuration and protected runtime key explicitly:
-
-```sh
-node bin/c2c.js machine setup --reuse-existing --json
-```
-
-Do not use the older globally installed entrypoint for this update. Reuse is
-rejected when the machine configuration or protected key is missing, and it
-cannot be combined with `--tunnel-id` or `--runtime-key-file`. In that case,
-complete first-time setup with both explicit values. A deliberate tunnel change
-or key rotation also requires both values.
-
-## `machine setup` says the runtime key is invalid
-
-Pass the path to the file containing the OpenAI Secure MCP Tunnel runtime key:
+From the updated, clean source checkout, install the current runtime and start
+the gateway again:
 
 ```sh
-c2c machine setup \
-  --tunnel-id <tunnel-id> \
-  --runtime-key-file /private/path/runtime.key
+node bin/c2c.js machine setup --json
 ```
 
-The file must be readable, small, and contain only the key. C2C copies it into
-protected machine state. Never paste the key into a prompt or commit it.
+`machine setup` takes only `--json`. The `--tunnel-id`, `--runtime-key-file` and
+`--reuse-existing` options were removed with the Secure Tunnel transport and are
+now rejected. Setup reuses the recorded public endpoint and the existing bearer
+token, so no original credential path is needed. Do not use the older globally
+installed entrypoint for this update. Re-record the endpoint with
+`c2c machine endpoint set --url <https-url>` only when the tunnel's public URL
+has actually changed.
+
+## `machine endpoint get` reports no public URL
+
+C2C does not start your tunnel, so it cannot know the address by itself. Start
+the tunnel, point it at the gateway's loopback port `48765` (the default
+`C2C_HTTP_PORT`), and record the HTTPS base address it reports:
+
+```sh
+c2c machine endpoint set --url https://<your-tunnel-public-base-url> --json
+c2c machine endpoint get --json
+```
+
+Use the base URL without `/mcp`; C2C appends that itself. On the ngrok free plan
+the address changes on every restart, so repeat this step each time.
+
+## ngrok exits with `ERR_NGROK_9009`
+
+The free plan refuses to run when proxy environment variables are set. Unset
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` in the shell or service
+definition that starts ngrok, then start it again. The C2C gateway itself binds
+loopback only and does not need a proxy.
+
+## `/mcp` returns `401`
+
+The request reached the gateway but the bearer token did not match. Compare the
+connector header with the current local token:
+
+```sh
+c2c machine auth show
+c2c machine auth show --reveal
+```
+
+If they differ, update the connector, or rotate both sides together so the old
+value is invalidated:
+
+```sh
+c2c machine auth rotate --json
+```
+
+A `401` after a rotation is expected until the connector is updated.
 
 ## The machine is not ready
 
-Inspect the JSON fields `configured`, `tunnel`, `gateway`, `ready`, and `checks`.
-Common causes are a missing pinned client, a stopped tunnel, a child that
-exited, or an owner record belonging to another process. Run:
+Inspect the JSON fields `transport`, `connector`, `ready`, `gateway` and
+`checks`. `machine doctor` reports three separate checks — `gateway`,
+`endpoint` and `auth` — so the failure is distinguishable: a stopped gateway, a
+missing public URL, or a missing bearer token. Run:
 
 ```sh
 c2c machine doctor --json
 ```
 
-If the tunnel is configured but unhealthy, `machine doctor` repairs it. If two
-processes report the same machine runtime, stop the managed owner cleanly and
-run doctor again; do not delete a runtime record belonging to an unknown
-process.
+If the gateway is unhealthy, `machine doctor` repairs it. If two processes report
+the same machine runtime, stop the managed owner cleanly and run doctor again; do
+not delete a runtime record belonging to an unknown process.
 
 ## ChatGPT cannot call the connector, but the machine looks healthy
 
-This is the most common failure and it is not a gateway problem. Read
-`controlPlaneDown` and `controlPlaneDetail` from:
+This is the most common failure and it is usually not a C2C problem. Work
+through the four layers in order; each has its own evidence.
 
-```sh
-c2c machine status --json
-```
+1. **Is the gateway listening?** `c2c machine status --json` must report
+   `ready: true` with a healthy `gateway`. A stopped gateway is repaired with
+   `c2c machine doctor --json`.
 
-When `controlPlaneDown` is true, the gateway is healthy and provably owned by
-the configured tunnel, but that tunnel cannot reach `api.openai.com` for its
-control-plane poll. ChatGPT delivers every MCP call through that long poll, so
-the page sees a dead connector — timing out or dropping tools mid-conversation —
-while every local check passes.
-
-The managed tunnel is started by launchd from a fixed environment. It does
-**not** inherit a proxy exported in an interactive shell, so `machine status`
-can report `ready` while every poll fails. Two causes are worth checking, in
-this order:
-
-1. **Proxy not visible to the service.** Verify the tunnel process actually has
-   the proxy, not just your shell:
+2. **Is the HTTP leg itself working?** Send an authenticated request to the
+   public URL C2C has recorded:
 
    ```sh
-   ps -E -p $(pgrep -f 'tunnel-client run' | head -1) | tr ' ' '\n' | grep -iE '^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY)='
+   MCP_URL="$(c2c machine endpoint get --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).mcpUrl))')"
+   curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$MCP_URL" \
+     -H "Authorization: Bearer $(c2c machine auth show --reveal)" \
+     -H 'Content-Type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"manual-check","version":"0"}}}'
    ```
 
-   An empty result means the service never received it. Re-export the proxy in
-   a shell and re-run the install step so the LaunchAgent records the validated
-   values:
+   `401` means the token is wrong; `502`/`504`/a connection failure means the
+   tunnel is not forwarding to loopback port `48765`. A successful
+   `initialize` proves only this leg. It does **not** prove that ChatGPT is
+   reaching it — that requires a real connector call.
+
+3. **Is the tunnel actually running and pointed at the right port?** C2C does
+   not own the tunnel process. Check it with the provider's own client and
+   confirm its target is `127.0.0.1:48765`. On the ngrok free plan the public
+   address changes on every restart, so an old address pasted into the
+   connector will fail even though everything local is healthy. Re-record it:
 
    ```sh
-   c2c autostart enable --json
+   c2c machine endpoint set --url https://<current-public-base-url> --json
    ```
 
-   Then restart the managed pair and confirm the poll recovers. Only validated
-   `http`, `https`, and `socks` URLs are persisted; a malformed value is dropped
-   rather than written into the machine service.
+   ngrok's free plan also refuses to start when proxy variables are set
+   (`ERR_NGROK_9009`); unset `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
+   `NO_PROXY` for the process that runs it.
 
-2. **DNS answers are not real OpenAI addresses.** Resolve and compare:
+4. **Is ChatGPT itself using current metadata?** Restarting the tunnel does not
+   refresh the platform's cached tool schema. In ChatGPT Plugins, open the
+   existing app's action menu and choose **Manage** → **Refresh**.
 
-   ```sh
-   dscacheutil -q host -a name api.openai.com
-   ```
+A previously documented failure mode is now historical: the official OpenAI
+Secure MCP Tunnel depended on a long poll of `api.openai.com`, and on this
+network that endpoint is reset at the TLS SNI layer, so the tunnel spent hours
+timing out while the local gateway reported healthy. That transport was removed
+because no DNS or proxy change could fix it. If you are looking for
+`controlPlaneDown`, `controlPlaneDetail`, or
+`/Users/<you>/Library/Application Support/tunnel-client/logs/...`, they belong
+to that removed transport and no longer exist.
 
-   `api.openai.com` does not live in `2a03:2880::/29` (Meta) or behind
-   `108.160.169.178` / `128.242.240.91`. A public resolver such as
-   `114.114.114.114` is frequently polluted for this name. If the answers are
-   wrong, pin a trusted resolver and confirm the tunnel's poll recovers.
-
-Confirm the diagnosis against the tunnel's own log before restarting anything:
-
-```sh
-tail -n 200 "/Users/<you>/Library/Application Support/tunnel-client/logs/codex-with-chatgpt.log"
-```
-
-Repeated `poll timed out; backing off` or `poll failed; backing off` with a
-`dial tcp ...: i/o timeout` error is the control-plane outage described above.
-`poller recovered; polling operational` marks the recovery. Restarting the
-tunnel does not fix a blocked egress path; it only resets the backoff.
+Note that plain UDP/53 DNS can still be hijacked on such networks (for example
+`api.openai.com` resolving into `2a03:2880::/29`, a Meta range). Changing the
+DNS server alone does not help, because the forged answer arrives on the wire;
+encrypted DNS (DoH/DoT) is required when the program does not go through a
+proxy. This no longer affects C2C's own transport — the tunnel only has to reach
+the tunnel provider, not `api.openai.com`.
 
 ## Connector cannot connect
 
 In ChatGPT connector settings verify exactly:
 
 ```text
-Name:           Codex with ChatGPT
-Secure Tunnel:  the tunnel configured by machine setup
-Authentication: None
+Name:            Codex with ChatGPT
+Connection:      Server URL
+MCP Server URL:  the /mcp URL from `c2c machine endpoint get`
+Authentication:  Bearer token / Authorization header
+                 value from `c2c machine auth show --reveal`
 ```
 
-Select the configured OpenAI Secure MCP Tunnel; do not enter a public server
-URL. Do not create a connector per workspace or alter a connector belonging to
-another purpose. After the connector reports connected, test it in the owned
-chat with `workspace_info`.
+Do not select `Tunnel` or `Authentication: None`: the official Secure MCP Tunnel
+is not part of this transport. A `401` means the header value is stale — compare
+it with `c2c machine auth show --reveal`, or rotate both sides with
+`c2c machine auth rotate`. Do not create a connector per workspace or alter a
+connector belonging to another purpose. After the connector reports connected,
+test it in the owned chat with `workspace_info`. Note that a valid bearer token
+alone grants no workspace access; the turn still needs a live `context_id`.
 
 The active comparison mode intentionally exposes no result callback tools. If
 the app still lists `get_control_result_status`, `report_control_progress`, or
 `submit_control_result`, or a read-only tool shows an older input schema, keep
 the gateway healthy, open the existing app's action menu in ChatGPT Plugins,
 choose **Manage**, and select **Refresh**. Confirm only the current read-only C2C
-tools remain before starting a fresh authorized request. Restarting the Tunnel
+tools remain before starting a fresh authorized request. Restarting the tunnel
 alone does not refresh ChatGPT's cached app metadata, and creating another
 connector is not the repair.
 
@@ -329,5 +361,7 @@ from another checkout with the current source.
 
 Prefer `machine stop`, then `machine start`. If the machine state is malformed,
 preserve the diagnostic output and remove only the C2C machine-state files after
-confirming no other C2C process is running. A fresh setup will require the
-Tunnel id and runtime-key file again; it does not affect ChatGPT ordinary chats.
+confirming no other C2C process is running. Removing the state also discards the
+recorded public endpoint and the bearer token, so a fresh `machine setup` will
+need a new `machine endpoint set` and a newly revealed token in the connector;
+it does not affect ChatGPT ordinary chats or your tunnel process.

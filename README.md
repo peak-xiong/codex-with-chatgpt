@@ -48,11 +48,13 @@ The connection is configured once per machine:
 
 - One connector per device, with an exact device-specific name recorded locally.
   One ChatGPT account can contain several devices' C2C connectors.
-- Connector authentication is **`None`**. The official OpenAI Secure MCP Tunnel
-  provides the authenticated transport; the connector does not contain a
-  project-specific credential.
-- The tunnel owns one `serve-machine --stdio` child. That child is the only
-  MCP gateway and can serve every registered workspace on the machine.
+- The connector points at a **public HTTPS URL** that a third-party tunnel
+  (ngrok) forwards to this machine, and sends an
+  `Authorization: Bearer <token>` header. The token is a transport gate only;
+  it is not a project credential and does not replace C2C's turn capabilities.
+- The C2C daemon starts one `c2c serve-http` gateway that binds loopback port
+  `48765` (override with `C2C_HTTP_PORT`). That gateway is the only MCP gateway
+  and can serve every registered workspace on the machine.
 - Each workspace maps to one ChatGPT Project. Each local Codex session maps to
   one persistent ChatGPT chat/page inside that Project.
 - Browser operations target the exact owned `tabId`; a visible or recently used
@@ -72,15 +74,19 @@ only the page recorded for a local session, and never takes over another tab.
 ## Install and setup
 
 This is a self-hosted project: each user installs it on their own computer and
-uses their own OpenAI account, tunnel, and credentials. A public Git repository
-does not give other users access to the maintainer's machine or tunnel.
+uses their own tunnel and credentials. A public Git repository does not give
+other users access to the maintainer's machine, endpoint, or token.
 
-The transport is **OpenAI Secure MCP Tunnel**, not a public MCP URL or a local
-OAuth service. The local client connects outbound to OpenAI over HTTPS; no
-inbound firewall port, public domain, or per-project OAuth setup is needed.
-`Authentication: None` disables connector-level OAuth, not tunnel authentication
-or C2C's short-lived, task-scoped authorization. C2C does not call a model API;
-the **tunnel runtime API key** authenticates the transport and is still required.
+The transport is a **public HTTPS endpoint** — a third-party tunnel (ngrok)
+forwards to the gateway's fixed loopback port, and the ChatGPT connector uses
+`<public-base-url>/mcp` with an `Authorization: Bearer <token>` header. C2C
+does not use the official OpenAI Secure MCP Tunnel, because this network resets
+that endpoint at the TLS SNI layer: TCP to the real `api.openai.com` address
+succeeds, then the handshake fails only when SNI is `api.openai.com`. No DNS or
+proxy change works around that. The bearer token authenticates the transport;
+C2C's short-lived, task-scoped `context_id` authorization is separate and still
+required. `POST /mcp` returns `401` without a valid token, and the token is
+created and stored by C2C, not by ChatGPT.
 
 ### Install through Codex
 
@@ -95,21 +101,17 @@ check the OS, Git, Node.js, Corepack, this task's in-app browser capability,
 and any existing C2C installation.
 Confirm the source directory before cloning and building. Preserve existing
 changes, installation settings, and sessions; do not overwrite or clean them.
-If a healthy C2C installation already uses an official Secure MCP Tunnel, reuse
-its installed tunnel ID and protected runtime key through
-`machine setup --reuse-existing`; do not recreate the tunnel or ask for the key
-again.
 Reuse an existing valid device-to-app binding. If it is missing or stale, ask
 which exact ChatGPT app belongs to this computer, record its confirmed name and
 observed stable plugin URL with `machine connector set`, and reuse that binding
 for all projects. Never choose another computer's app by a similar name.
-Otherwise, after preflight and a clean source build, pause and guide me through
-creating my own official Secure MCP Tunnel. Wait for my tunnel ID and the
-absolute path to a private runtime-key file.
-Do not guess accounts, organizations, workspaces, tunnel IDs, or credentials.
-Do not inspect, display, or upload the key contents. If permissions, login,
-or consent are missing, explain the user action needed. Do not switch accounts,
-expand permissions, or substitute public URLs, OAuth, or another tunnel provider.
+Otherwise, after preflight and a clean source build, run `machine setup --json`,
+tell me the exact MCP URL and bearer-token hint it reports, and guide me through
+starting the ngrok tunnel and recording its public URL.
+Do not guess accounts, organizations, workspaces, URLs, or credentials.
+Do not print the bearer token unless I explicitly ask for it. If permissions,
+login, or consent are missing, explain the user action needed. Do not switch
+accounts, expand permissions, or substitute another tunnel provider or OAuth.
 ```
 
 Steps 1–6 below are also the sequence Codex should follow. **Do not repeat local
@@ -118,10 +120,10 @@ references for Codex or users checking its work.
 
 | Operation | Responsible party |
 | --- | --- |
-| Choose the account/organization/workspace, create or select a cloud tunnel, associate the workspace | User confirms in OpenAI's official UI for first-time setup; an administrator may need to grant access |
-| Obtain the runtime key, save it privately, complete login and consent | User for first-time setup or key rotation; share only the file path with Codex |
+| Log in to a tunnel provider and start one tunnel that forwards to the gateway's loopback port | User starts and keeps the tunnel running; ngrok's free plan needs a provider account |
+| Record the public base URL and keep the bearer token out of chat | Codex records the URL with `machine endpoint set`; the user controls who sees the token |
 | Check the environment, build, install globally, run diagnostics | Codex executes locally, not in a ChatGPT conversation |
-| Create or reuse the ChatGPT connector | User in the confirmed ChatGPT workspace; Codex then verifies it |
+| Create or reuse the ChatGPT connector with the public URL and the Authorization header | User in the confirmed ChatGPT workspace; Codex then verifies it |
 
 ### 1. Check prerequisites
 
@@ -131,25 +133,27 @@ references for Codex or users checking its work.
   continuing. The repository pins its pnpm version in `package.json`.
 - Codex desktop with the in-app browser and Computer Use available to the
   session. Installing the CLI alone does not supply browser automation.
-- A ChatGPT account/workspace with developer-mode custom apps and Secure Tunnel
-  access. Availability and administrator permissions must be checked in your
-  own account; a subscription alone is not proof of access.
-- Permission to create/use a tunnel in the intended Platform organization and
-  associate it with the intended ChatGPT workspace.
-- Outbound HTTPS access to `api.openai.com:443`, plus access to GitHub and the
-  package registry for installation. The computer must remain awake and online
-  while ChatGPT uses local tools.
+- A ChatGPT account/workspace with developer-mode custom apps. Availability and
+  administrator permissions must be checked in your own account; a subscription
+  alone is not proof of access.
+- A third-party tunnel account and client (ngrok is used here) that can expose a
+  local port over HTTPS. The public URL changes on the free plan, so the recorded
+  endpoint must be updated whenever the tunnel restarts.
+- Outbound HTTPS access to the tunnel provider and to GitHub and the package
+  registry for installation. The computer must remain awake and online while
+  ChatGPT uses local tools, and the tunnel plus the C2C gateway must both keep
+  running.
 
 The current live validation environment is **macOS with Codex desktop**. The
 code includes other platform targets, but native Windows/Linux installation and
 the complete browser workflow are not yet verified. The shell examples below
 use macOS/POSIX syntax; they are not PowerShell instructions.
 
-See the [official Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
-for current account, permission, and networking requirements. Secure Tunnel is
-for private connections/developer-mode apps; it does **not** satisfy public
-plugin-store submission requirements. Publishing this source for self-hosting
-is different from distributing one public ChatGPT plugin.
+See your tunnel provider's documentation for current account, permission, and
+networking requirements. A public endpoint is for private use with a
+developer-mode app; it does **not** satisfy public plugin-store submission
+requirements. Publishing this source for self-hosting is different from
+distributing one public ChatGPT plugin.
 
 ### 2. Clone and build a clean source checkout
 
@@ -171,66 +175,50 @@ Keep this checkout for future updates. `git status --short` must be empty
 before installation. If you have changes, preserve them or use a separate clean
 clone; do not reset or delete your work just to satisfy the installer.
 
-### 3. Create your own tunnel and prepare the key (first installation only)
+### 3. Start your own tunnel and record its public URL (first installation only)
 
-This stage happens in OpenAI's official UI, **not through local `machine setup`**.
-Skip it when preflight confirms a healthy existing C2C installation backed by
-the official Secure MCP Tunnel. Existing-install updates use the protected key
-already managed by C2C and must not recreate the tunnel or request its key again.
+This stage happens in your tunnel provider's own UI and client, **not through
+local `machine setup`**. Skip it when preflight confirms a healthy existing C2C
+installation with a recorded public endpoint and a running tunnel.
 
-1. Open [Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels)
-   and confirm the account and intended organization in the organization
-   selector. UI locations may change. Create a tunnel for this computer with
-   a name of your choice, or reuse the one already dedicated to it. Do not
-   select a tunnel in use by another computer.
-2. Associate the tunnel with the **ChatGPT workspace** where you will use the
-   connector. A Platform organization, a Platform API Project, and a ChatGPT
-   workspace are different scopes. The ChatGPT Project for your code workspace
-   is created later during pairing, not here.
-3. Save the configuration and record the actual `tunnel_id` returned by the
-   page, not its display name, a Project ID, or a URL. This alone does not
-   start a local client or prove the connection works.
-4. Obtain a **runtime API key** for this tunnel through the intended
-   organization's credential-management process. The official guide requires
-   a runtime key but does not promise a "generate runtime key" button on every
-   account's Tunnel page. Do not assume creating a tunnel also returns a key.
-   Ask the organization administrator if the entry point or permissions are unclear.
-5. Save **only the key** in a private UTF-8 text file outside all repositories,
-   using a trusted editor or secret manager. Do not include JSON, `export`, a
-   variable name, or quotes around the key. On macOS, Codex can check that the
-   file exists and run `chmod 600 "/absolute/private/path/tunnel-runtime.key"`
-   without inspecting it with commands such as `cat`. The installer reads
-   the key file locally and stores a protected copy.
+1. Log in to your tunnel provider and reserve or reuse one tunnel dedicated to
+   this computer. Do not reuse another computer's tunnel or its public URL.
+2. Point that tunnel at the gateway's loopback port, `48765` (the default
+   `C2C_HTTP_PORT`). This value is fixed on purpose: the tunnel configuration
+   points at it, so a port that changes between starts silently breaks the
+   endpoint. Run the tunnel on the same machine as the gateway.
+3. Copy the HTTPS base URL the tunnel reports, for example
+   `https://<your-subdomain>.ngrok-free.dev`, without the `/mcp` suffix.
+   `c2c machine endpoint set --url <https-url>` appends `/mcp` itself.
+4. Keep the tunnel running. On the ngrok free plan the public URL changes each
+   time the tunnel restarts, and the recorded endpoint must then be updated
+   again with `machine endpoint set`.
 
-Permissions are **Platform organization-level**: creating/editing requires
-Tunnels `Read + Manage`; running the client and selecting a tunnel in ChatGPT
-require `Read + Use`. Platform Project access or ChatGPT developer-mode access
-alone is insufficient. See the [official permissions guide](https://developers.openai.com/api/docs/guides/rbac).
-If access is missing, stop and contact the organization administrator; do not
-ask Codex to elevate permissions automatically.
+**If the machine uses proxy environment variables, ngrok's free plan refuses to
+start**: it exits with `ERR_NGROK_9009` and the message that the ngrok agent
+cannot be run with proxy environment variables set. Unset `HTTP_PROXY`,
+`HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` in the shell (or the service
+definition) that runs ngrok, and let ngrok connect directly.
 
-Keep the original key in secure storage for updates. Do not put it in shell
-command arguments, chat prompts, Project instructions, screenshots, or Git.
-Never reuse a maintainer's key, tunnel ID, or ChatGPT Project URL.
-
-The examples use placeholders. Replace `<YOUR_TUNNEL_ID>` with your real ID and
-the example file path with your private file's absolute path. A tunnel ID is
-not the runtime key, and a ChatGPT login/session token is not a substitute.
-`Authentication: None` does not remove the need for this key.
+Do not put the bearer token in a shell argument, a screenshot, a Project
+instruction, or Git. The token is generated and stored by C2C; never reuse
+another machine's endpoint or token. There is no runtime key and no tunnel ID
+to collect in this architecture — the tunnel client is an ordinary
+provider-supplied binary that C2C neither installs nor supervises.
 
 ### 4. Install once for your local user
 
-After step 3, reply in the **same Codex installation task** with the following,
-replacing both placeholders. Do not paste the key contents:
+After step 3, reply in the **same Codex installation task** with the following.
+Do not paste the bearer token:
 
 ```text
-I have confirmed the account, Platform organization, and ChatGPT workspace,
-and associated the tunnel with that workspace.
-Tunnel ID: <YOUR_TUNNEL_ID>
-Runtime-key file (absolute path): /absolute/private/path/tunnel-runtime.key
+I have started one tunnel for this computer and pointed it at the gateway's
+loopback port. Its public HTTPS base URL is:
+<https://your-tunnel-public-base-url>
 Run machine setup from the clean source checkout you just built, installing
-for the current OS user. Pass only the key-file path to the installer; do not
-print, upload, or display the file contents in chat.
+for the current OS user. Then record the public URL with machine endpoint set
+and report the MCP URL. Show only the token hint; do not print the full bearer
+token in chat.
 Check the global Skill, machine status, and machine doctor --no-fix, and report
 the actual results. Then wait for me to create or confirm the ChatGPT connector
 before workspace pairing and round-trip acceptance.
@@ -238,63 +226,44 @@ before workspace pairing and round-trip acceptance.
 
 Codex should run the following from the source checkout built in step 2,
 without `sudo`. The global `c2c` may not exist on first install, so use the
-source entrypoint. Replace all placeholders first; retain quotes for paths
-containing spaces:
+source entrypoint:
 
 ```sh
-node bin/c2c.js machine setup \
-  --tunnel-id "<YOUR_TUNNEL_ID>" \
-  --runtime-key-file "/absolute/private/path/tunnel-runtime.key" --json
+node bin/c2c.js machine setup --json
+node bin/c2c.js machine endpoint set --url "https://<your-tunnel-public-base-url>" --json
+node bin/c2c.js machine auth show
 ```
 
-For a healthy existing installation, use the updated source entrypoint and the
-explicit reuse mode instead. It does not read the key into the conversation or
-accept an arbitrary replacement path:
-
-```sh
-node bin/c2c.js machine setup --reuse-existing --json
-```
-
-`--reuse-existing` is rejected when no valid machine configuration exists and
-cannot be combined with `--tunnel-id` or `--runtime-key-file`. To change the
-tunnel or rotate its key, use the first-time form with both explicit values.
+`machine setup` takes **only** `--json`; it no longer accepts `--tunnel-id`,
+`--runtime-key-file`, or `--reuse-existing`. Re-run it for any later update; it
+reuses the recorded endpoint and the existing bearer token, so no original
+credential path is needed. Record the endpoint again only when the tunnel's
+public URL actually changes.
 
 Expect `ok: true` and `configured: true`. Setup deploys the verified runtime,
-installs the global Skill and `c2c` launcher, installs the project's pinned
-official tunnel client, and starts the one tunnel-owned gateway. The first-time
-form privately copies the supplied runtime key; reuse mode leaves the protected
-installed key in place. **Setup does not create a cloud tunnel, associate a
-ChatGPT workspace, or create the ChatGPT connector**; for first-time setup, the
-first two must already be completed in step 3.
+installs the global Skill and `c2c` launcher, starts the one `c2c serve-http`
+gateway through the machine daemon, and creates the bearer token on first use.
+`machine endpoint set` records the public base URL and the loopback port;
+`machine auth show` prints a token hint, and `--reveal` prints the full token
+that the ChatGPT connector needs. **Setup does not start your tunnel, create a
+ChatGPT workspace, or create the ChatGPT connector**; the tunnel must already be
+running from step 3.
 
-**If this machine reaches `api.openai.com` only through a proxy**, export the
-proxy in the shell that runs setup. The LaunchAgent that supervises the tunnel
-is started by launchd from a fixed environment and does **not** inherit a proxy
-set only in an interactive shell; a tunnel without it polls the control plane
-until it times out, and ChatGPT sees a dead connector while every local check
-still reports `ready`. Setup records validated `http`/`https`/`socks` proxy URLs
-(and `NO_PROXY`) into the LaunchAgent so the managed tunnel uses the same egress
-as the CLI. Verify the running process actually received them:
+Rotate the token with `c2c machine auth rotate --json`. The old token stops
+working immediately, so update the connector header in the same session or
+every call returns `401`.
 
-```sh
-ps -E -p $(pgrep -f 'tunnel-client run' | head -1) | tr ' ' '\n' | grep -iE '^(HTTPS?_PROXY|ALL_PROXY)='
-```
+**Proxy note.** The C2C gateway itself binds loopback only and needs no proxy.
+Your tunnel client does need its own egress, and ngrok's free plan will not run
+with proxy variables set (see step 3). If your network hijacks plain UDP/53 DNS
+(for example `api.openai.com` resolving into `2a03:2880::/29`, a Meta range),
+changing the DNS server alone does not help, because the forged answer arrives
+on the wire; encrypted DNS (DoH/DoT) is required when the program does not go
+through a proxy.
 
-An empty result means the service never received the proxy. Re-export it and
-re-run setup, then restart the managed pair. See
-[ChatGPT cannot call the connector](docs/troubleshooting.md#chatgpt-cannot-call-the-connector-but-the-machine-looks-healthy)
-for the full diagnosis.
-
-Note that plain UDP/53 DNS can be hijacked on such networks (for example
-`api.openai.com` resolving into `2a03:2880::/29`, a Meta range). Changing the
-DNS server alone does not help, because the forged answer arrives on the wire;
-encrypted DNS (DoH/DoT) is required when the program does not go through the
-proxy.
-
-The official generic tutorial's `tunnel-client init/run` commands and sample
-MCP server are for standalone integrations. Here, `machine setup` manages
-those local components. **Do not also run that sample setup**, or start another
-`tunnel-client` or `serve-machine` for an individual project.
+Do not run the official OpenAI Secure MCP Tunnel client or its sample MCP
+server alongside this setup. That transport was removed from C2C, cannot connect
+on this network, and running it would only create a second, unused path.
 
 The launcher is `~/.local/bin/c2c`. If your shell cannot find it, add this to
 your shell's startup configuration and reload that shell:
@@ -317,20 +286,24 @@ UI version, the entry may be called an app, plugin, or connector.
 | Field | Value |
 | --- | --- |
 | Name | A distinct device name, e.g. `Codex with ChatGPT - Laptop`; existing single-device names can be kept |
-| Connection | `Tunnel` |
-| OpenAI Secure Tunnel | Select the same tunnel configured in step 4 |
-| Authentication | `None` |
+| Connection | `Server URL` (not `Tunnel`) |
+| MCP Server URL | The `/mcp` URL from `c2c machine endpoint get` |
+| Authentication | `Bearer token` (or an Authorization header) with the value from `c2c machine auth show --reveal` |
 
-Reuse this connector if it already exists. There is no public Server URL to
-paste, and the runtime key belongs on the local machine, not in this form.
-Keep the gateway running during tool discovery. If the tunnel is missing from
-the list, check its workspace association and your Read + Use permissions first.
-If the UI allows entering a tunnel ID manually, use the same real, associated
-ID you have permission to use; manual entry does not bypass authorization.
-If Tunnel is not an available connection type, stop and check account access
-or administrator settings, rather than selecting a public URL or OAuth.
-Tell Codex the connector is configured before proceeding to step 6. A connector
-card alone is not proof of result delivery.
+Reuse this connector if it already exists. There is no tunnel to select and no
+runtime key: the public URL plus the bearer token are the whole transport
+configuration. Keep the tunnel and the gateway running during tool discovery.
+If the URL field is rejected, confirm the base URL was recorded without a
+trailing `/mcp` (C2C appends it) and that the tunnel is still forwarding.
+A `401` response means the token in the connector does not match the machine's
+current token — recheck with `c2c machine auth show --reveal`, or rotate both
+sides together with `c2c machine auth rotate`.
+
+A valid bearer token only proves the caller reached this gateway. It does not
+grant workspace access: ChatGPT must still supply a `context_id` issued by
+`c2c control open` before any tool acts on a workspace. Tell Codex the connector
+is configured before proceeding to step 6. A connector card alone is not proof
+of result delivery.
 
 Tell Codex which exact app belongs to this computer. Codex records it locally:
 
@@ -343,22 +316,24 @@ c2c machine connector get --json
 Use the real app URL observed in ChatGPT, not the placeholder. Omit `--plugin-url`
 if no stable app URL is exposed; names must then identify the app unambiguously.
 The binding is shared by this device's workspaces and sessions, and is preserved
-by normal upgrades. It does not create or rename a remote app or verify its
-Tunnel selection by itself; a real read validates the serving machine.
+by normal upgrades. It binds `machineId + name + optional pluginUrl`; it does
+not create or rename a remote app or verify which URL that app calls by itself.
+A real read validates the serving machine.
 
-For two computers, install on each and bind each computer's own Tunnel/app.
-Both apps may live in the same ChatGPT account. The route is **device → Tunnel
-→ bound app → workspace/Project → session/Chat/tab**. Do not copy machine state,
-credentials or browser ownership files between devices. A missing binding after
-upgrade needs this one-time step; changing the Tunnel association marks the old
-binding stale. Codex must resolve it before local-MCP dispatch, without changing
-existing sessions or requiring per-project app installation. See
+For two computers, install on each and bind each computer's own app and
+endpoint. Both apps may live in the same ChatGPT account. The route is
+**device → public endpoint → bound app → workspace/Project → session/Chat/tab**.
+Do not copy machine state, credentials or browser ownership files between
+devices. A missing binding after upgrade needs this one-time step; binding
+against a different machine id marks the old binding `stale`. Codex must resolve
+it before local-MCP dispatch, without changing existing sessions or requiring
+per-project app installation. See
 [Device connector binding](docs/protocol.md#device-connector-binding).
 
 After creating the app or changing its tool schemas, verify the task-needed
 read tools and input contracts in the existing app while the gateway is healthy.
 Use **Refresh** once if the current UI offers it and discovery needs updating;
-do not assume a fixed menu path exists. Opening Manage or restarting the Tunnel
+do not assume a fixed menu path exists. Opening Manage or restarting the tunnel
 does not prove that schemas were refreshed. A real scoped read is verified
 separately in step 6. Keep the same global app; do not recreate it per project.
 
@@ -408,14 +383,26 @@ Acceptance has three separate levels:
 | Result delivery | Computer Use validates the exact tab/chat/generation/response and its schema-bound result marker |
 
 Levels one and two are strictly local: a healthy machine, a passing doctor, and a
-`ready` tunnel only prove the managed components are consistent with each other.
-They do **not** prove that ChatGPT can reach this machine. The first signal that
-a real call arrived is the tunnel log line
-`forwarded command to MCP server`; if no call has been made, it will not appear
-regardless of how healthy everything looks locally. If calls fail while the
-tunnel log is clean, refresh the ChatGPT app's cached tool schema first
-(Plugins → the app → **Manage** → **Refresh**); restarting the tunnel does not
-refresh platform-side metadata.
+recorded endpoint only prove the managed components are consistent with each
+other. They do **not** prove that ChatGPT can reach this machine. A direct check
+that the HTTP transport leg works is an authenticated request against the public
+`/mcp` URL from `c2c machine endpoint get --json`:
+
+```sh
+MCP_URL="https://<your-tunnel-public-base-url>/mcp"
+TOKEN="$(c2c machine auth show --reveal)"
+curl -sS -i -X POST "$MCP_URL" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"manual-check","version":"0"}}}'
+```
+
+A `401` means the token does not match; a completed `initialize` response proves
+only that this HTTP leg works. It does not prove that a ChatGPT connector can
+reach the URL through the tunnel — that requires a real connector call. If calls
+fail while the endpoint is reachable, refresh the ChatGPT app's cached tool
+schema (Plugins → the app → **Manage** → **Refresh**); restarting the tunnel does
+not refresh platform-side metadata.
 
 Mailbox callback code and historical live-return records are retained for a
 later comparison. Production currently does not register those callback tools.
@@ -447,7 +434,8 @@ The Skill performs registration when needed; the commands above are useful for
 verification. Do not run `node bin/c2c.js` from a business project that does not
 contain the C2C source. Workspace commands use the trusted current directory;
 `-w` cannot select a different directory. No extra connector, tunnel, or copied
-Skill is needed for another project. New computers/users need their own setup.
+Skill is needed for another project — the one machine endpoint serves every
+registered workspace. New computers/users need their own setup.
 
 ### Installation locations and updates
 
@@ -458,6 +446,8 @@ Default locations on macOS (all belong to the current OS user):
 | CLI launcher | `~/.local/bin/c2c` |
 | Global Skill | `~/.codex/skills/codex-with-chatgpt/SKILL.md` |
 | Managed runtime | `~/Library/Application Support/codex-with-chatgpt/installation/current` |
+| Public endpoint record | `<machine state>/http/endpoint.json` (0600) |
+| Bearer token | `<machine state>/http/auth.json` (0600) |
 | Git project state | `<git-common-dir>/codex-with-chatgpt` |
 | Non-Git project state | `<workspace-root>/.codex-with-chatgpt` |
 
@@ -476,15 +466,15 @@ git status --short
 git pull --ff-only
 corepack pnpm install --frozen-lockfile
 corepack pnpm build
-node bin/c2c.js machine setup --reuse-existing --json
+node bin/c2c.js machine setup --json
 c2c skill status --json
 c2c machine doctor --no-fix --json
 ```
 
-Proceed past the status check only when it is empty. Reuse the installed
-tunnel/key and keep the existing connector; updates do not require the original
-key-file path or per-project installs. Use the two-argument first-time form only
-for a deliberate tunnel change or key rotation.
+Proceed past the status check only when it is empty. Reuse the recorded public
+endpoint, the existing bearer token, and the existing connector; updates do not
+require the original token, a key-file path, or per-project installs. Re-run
+`machine endpoint set` only if the tunnel's public URL changed.
 Run setup with the **updated source entrypoint** shown above, not the old
 installed `c2c`, which would reuse its own runtime. The Skill obtains fresh
 authorizations after restart and preserves established Project/chat mappings.
@@ -505,9 +495,9 @@ c2c autostart status --json
 ```
 
 The LaunchAgent runs hidden `c2c autostart run --quiet` at its wake interval.
-That command only calls `ensureMachineGateway`; it reuses the official Tunnel's
-existing child and never creates a workspace-specific gateway or a second
-Tunnel. To disable it:
+That command only calls `ensureMachineGateway`; it restarts the one `c2c
+serve-http` gateway if it is down and never creates a workspace-specific gateway
+or a second gateway. It does not start your tunnel. To disable it:
 
 ```sh
 c2c autostart disable --json
@@ -522,10 +512,12 @@ the machine-wide capacity of 100 active session/page leases.
 | --- | --- |
 | `corepack` or `c2c` not found | Install Corepack for your Node version; check the launcher and PATH from step 4 |
 | `machine setup` is an unknown command | Check the repository/branch and rebuild step 2; older OAuth releases use a different architecture |
-| `--reuse-existing` reports no configuration or key | This machine has no reusable official Tunnel setup; complete steps 3–4 with your own tunnel ID and private key-file path |
+| `machine setup` rejects `--tunnel-id` or `--reuse-existing` | Those options were removed with the Secure Tunnel transport; run `machine setup --json` alone |
+| `machine endpoint get` shows no URL | Record the running tunnel's HTTPS base URL with `c2c machine endpoint set --url <https-url>` |
+| Connector returns `401` | The header token does not match `c2c machine auth show --reveal`; update one side or rotate both |
+| ngrok exits with `ERR_NGROK_9009` | Unset `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`; the free plan refuses to run with proxy variables set |
 | Installer requires clean Git source | Use a Git clone and preserve your changes before installing; a ZIP download is insufficient |
-| Tunnel absent in ChatGPT | Verify the selected account/workspace, tunnel association, and Read + Use permissions |
-| Machine not ready | Run `c2c machine doctor --no-fix --json`; check network/key permissions and the one managed client |
+| Machine not ready | Run `c2c machine doctor --no-fix --json`; it reports `gateway`, `endpoint`, and `auth` checks separately |
 | Final response is not detected | Verify the exact owned tab, chat, generation, response id, request id, and `C2C_HOST_OBSERVED_RESULT` marker; do not inspect another page or resend while generation is active |
 
 For controlled repair and exact-session recovery, see [Troubleshooting](docs/troubleshooting.md).
@@ -538,11 +530,11 @@ ChatGPT Project A                 ChatGPT Project B
   session A2 -> owned tab A2        session B2 -> owned tab B2
             \                         /
              \                       /
-              one global Connector (Authentication: None)
+              one global Connector (Server URL + Bearer token)
                               |
-             official OpenAI Secure MCP Tunnel
+             third-party public tunnel (ngrok) -> <public-url>/mcp
                               |
-               tunnel-owned node ... serve-machine --stdio
+               c2c serve-http on 127.0.0.1:48765 (bearer-gated /mcp)
                               |
        machine gateway: registry + capability broker + mailbox
                               |
@@ -664,6 +656,12 @@ require selection and verification in the page.
 
 ## Security properties
 
+- The transport is a public URL, so `POST /mcp` requires a bearer token; an
+  unauthenticated or wrongly authenticated request gets `401`. The gateway
+  refuses to start `serve-http` without a token.
+- The bearer token is a **transport gate, not an authority**. A caller that
+  passes it still needs a valid `context_id` issued by `c2c control open` before
+  any tool acts on a workspace, and every tool keeps its own scope check.
 - MCP workspace tools are read-only. Computer Use results are bounded by a live,
   schema-checked request and exact page/response identity.
 - Workspace paths are resolved and contained under the registered root. Symlink
@@ -674,8 +672,12 @@ require selection and verification in the page.
   transport and remains covered by tests for later comparison.
 - The machine lifetime record is owner-checked by machine id, boot epoch, pid,
   and exact runtime data. A second process cannot silently become the broker.
-- Secrets (runtime key, admin token, raw capability) stay in protected machine
-  state and are omitted from normal CLI views.
+- Secrets (bearer token, admin token, raw capability) stay in protected machine
+  state (mode 0600) and are omitted from normal CLI views; the token is printed
+  only by an explicit `machine auth show --reveal`.
+- Anyone who can reach the public URL can attempt the bearer check, so rotate
+  with `c2c machine auth rotate` if the token leaks and keep the tunnel
+  dedicated to this machine.
 
 See [docs/architecture.md](docs/architecture.md),
 [docs/protocol.md](docs/protocol.md), and
@@ -688,6 +690,10 @@ c2c machine start
 c2c machine status --json
 c2c machine doctor --no-fix --json
 c2c machine stop
+c2c machine endpoint get --json
+c2c machine endpoint set --url https://<your-tunnel-public-base-url> --json
+c2c machine auth show --json
+c2c machine auth rotate --json
 c2c workspace --json
 c2c surface get --local-session <session-id> --json
 c2c session get --local-session <session-id> --json
