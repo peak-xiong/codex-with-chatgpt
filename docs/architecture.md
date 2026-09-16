@@ -70,6 +70,13 @@ is created lazily by `c2c machine auth show --reveal` (rotated with
 `c2c machine auth rotate`) and stored 0600 at `<state>/http/auth.json`; the
 public URL is recorded at `<state>/http/endpoint.json`.
 
+Responses are JSON, not an event stream: every tool is a short read that returns
+one structured payload, large sets are paginated, and nothing pushes progress or
+logs, so a stream would carry nothing. `GET`/`DELETE /mcp` return `405` because
+there is no session to open or end. Streaming stays a deliberate option — see
+`docs/issue-log.md` — but it only pays for itself once a tool runs long enough
+to risk a client timeout or needs to emit partial results.
+
 This network resets the OpenAI endpoint at the TLS SNI layer — TCP to the real
 `api.openai.com` address succeeds, and the handshake dies only when SNI is
 `api.openai.com` — so the tunnel transport cannot connect here at all and was

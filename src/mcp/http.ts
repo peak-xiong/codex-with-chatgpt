@@ -7,6 +7,14 @@ import type { Logger } from "../logger/index.js";
  * Stateless Streamable HTTP handler: a fresh McpServer + transport per POST.
  * This maximizes compatibility with remote MCP clients (including ChatGPT)
  * and avoids cross-request session state on a public endpoint.
+ *
+ * Responses are plain JSON, not `text/event-stream`. Every tool is a short
+ * read-only call that returns one structured payload, large sets are paginated
+ * with limit/offset, and nothing here pushes progress, logs, or notifications,
+ * so a stream would have nothing to carry — while the sessions a real
+ * server-push stream needs are exactly what this handler refuses to keep on a
+ * public endpoint. Revisit only if a tool starts running long enough to risk a
+ * client timeout, or has to emit partial results before it finishes.
  */
 export function createMcpHttpHandler(makeServer: () => McpServer, logger: Logger) {
   return async (req: Request, res: Response): Promise<void> => {
