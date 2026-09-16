@@ -64,6 +64,12 @@ export interface AutostartStatus {
   config: AutostartConfig;
   enabled: boolean;
   loaded: boolean | null;
+  /**
+   * The on-disk plist differs from what this build would generate. A hand-edited
+   * plist still runs, so drift is otherwise invisible until the service
+   * misbehaves; this makes it reportable.
+   */
+  drifted: boolean;
   detail?: string;
 }
 
@@ -498,20 +504,41 @@ export function disableAutostart(
   return { config, commands };
 }
 
+/**
+ * Compare the installed plist against what this build would write.
+ *
+ * A plist edited by hand — or left behind by an older release — still loads and
+ * still runs, so nothing complains until the service behaves unexpectedly. The
+ * comparison makes that state visible instead of silent.
+ */
+export function autostartPlistDrifted(config: AutostartConfig): boolean {
+  const stat = lstatIfExists(config.plistPath);
+  if (!stat) return false;
+  assertSecureLaunchAgentTarget(config.plistPath);
+  const installed = fs.readFileSync(config.plistPath, "utf8");
+  return installed !== renderLaunchAgentPlist(config);
+}
+
 export function autostartStatus(
   config: AutostartConfig,
   opts: LaunchctlOptions = {},
 ): AutostartStatus {
   assertSecureLaunchAgentTarget(config.plistPath);
   const enabled = lstatIfExists(config.plistPath) !== null;
+  const drifted = autostartPlistDrifted(config);
   if ((opts.platform ?? process.platform) !== "darwin") {
-    return { config, enabled, loaded: null, detail: "unsupported platform" };
+    return { config, enabled, loaded: null, drifted, detail: "unsupported platform" };
   }
   const loaded = runLaunchctl(["print", `${launchdDomain(opts.uid)}/${config.label}`], opts);
   return {
     config,
     enabled,
     loaded: loaded.status === 0,
-    detail: loaded.status === 0 ? undefined : (loaded.stderr || loaded.stdout || "").trim() || undefined,
+    drifted,
+    detail: loaded.status === 0
+      ? undefined
+      : drifted
+        ? "installed LaunchAgent differs from this build; re-run `c2c autostart enable`"
+        : (loaded.stderr || loaded.stdout || "").trim() || undefined,
   };
 }

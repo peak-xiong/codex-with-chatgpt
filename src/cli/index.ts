@@ -27,6 +27,7 @@ import {
   installRuntime,
   restoreRuntimeInstallation,
   runtimeCurrentPath,
+  runtimeEntryPath,
   snapshotRuntimeInstallation,
   type RuntimeInstallResult,
 } from "../config/runtime-install.js";
@@ -469,6 +470,17 @@ machine
   .option("--json", "machine-readable output", false)
   .action(async (opts: { json: boolean }) => {
     try {
+      // Check what can be checked before the transactional part begins. Every
+      // condition caught here is a rollback path that never has to run, and the
+      // rollback paths are the riskiest code in this command.
+      if (!fs.existsSync(path.join(repoRoot, "package.json"))) {
+        throw new Error(`the source checkout at ${repoRoot} has no package.json`);
+      }
+      if (!fs.existsSync(runtimeEntryPath())) {
+        throw new Error(
+          "the installed runtime entrypoint is missing; build first with `corepack pnpm build` and re-run from the source checkout"
+        );
+      }
       const payload = await withMachineSetupLock(async () => {
         const previousGateway = await observeMachineRuntime();
         const runtimeHomeDir = path.resolve(process.env.HOME ?? os.homedir());
@@ -806,35 +818,53 @@ machine
           : null;
       const auth = httpAuthStatus();
       const transport = transportView();
-      const checks = [
+      // Three levels rather than a boolean: "not yet configured" is work the
+      // operator still owes, while "configured but exposed" is a fault.
+      // Collapsing both into `ok: false` hides which one it is.
+      const autostart = autostartStatus(buildAutostartConfig());
+      const checks: Array<{ id: string; status: "ok" | "warning" | "error"; detail: string }> = [
         {
           id: "gateway",
-          ok: before.gateway.state === "healthy",
+          status: before.gateway.state === "healthy" ? "ok" : "error",
           detail: before.gateway.state === "healthy"
             ? `listening on ${MACHINE_HTTP_HOST}:${machineHttpPort()}`
-            : `gateway state is ${before.gateway.state}`,
+            : `gateway state is ${before.gateway.state}; run \`c2c machine start\``,
         },
         {
           id: "endpoint",
-          ok: before.endpoint !== null,
+          status: before.endpoint !== null ? "ok" : "warning",
           detail: before.endpoint
             ? `${publicMcpUrl(before.endpoint)}`
             : "no public URL recorded; run `c2c machine endpoint set --url <https://...>`",
         },
         {
           id: "auth",
-          ok: auth.configured,
-          detail: auth.configured
-            ? `bearer token ${auth.tokenHint}`
-            : "no bearer token yet; run `c2c machine auth rotate`",
+          status: auth.configured ? (auth.permissionsSafe ? "ok" : "error") : "warning",
+          detail: !auth.configured
+            ? "no bearer token yet; run `c2c machine auth rotate`"
+            : auth.permissionsSafe
+              ? `bearer token ${auth.tokenHint} (mode ${auth.fileMode})`
+              : `token file mode ${auth.fileMode} is readable beyond the owner; run \`c2c machine auth rotate\``,
+        },
+        {
+          id: "autostart",
+          status: autostart.loaded === null ? "warning" : autostart.drifted || !autostart.loaded ? "error" : "ok",
+          detail: autostart.loaded === null
+            ? "autostart is unsupported on this platform"
+            : autostart.drifted
+              ? "installed LaunchAgent differs from this build; run `c2c autostart enable`"
+              : autostart.loaded
+                ? `LaunchAgent ${autostart.config.label} is loaded`
+                : "LaunchAgent is not loaded; run `c2c autostart enable`",
         },
       ];
-      const ok = before.gateway.state === "healthy" && checks.every((entry) => entry.ok) && info !== null;
+      const ok = checks.every((entry) => entry.status !== "error") && info !== null;
       const payload = {
         ok,
         repaired,
         transport,
         checks,
+        autostart: { enabled: autostart.enabled, loaded: autostart.loaded, drifted: autostart.drifted },
         gateway: {
           ...machineRuntimeObservationView(before.gateway),
           ...(info ? { info } : {}),
@@ -847,8 +877,11 @@ machine
       } else if (ok) {
         check(repaired ? "机器级 MCP 网关已修复" : "机器级 MCP 网关健康");
         say(`MCP 地址：${transport.mcpUrl}`);
+        for (const entry of checks.filter((candidate) => candidate.status === "warning")) {
+          say(`提示 ${entry.id}：${entry.detail}`);
+        }
       } else {
-        for (const entry of checks.filter((candidate) => !candidate.ok)) {
+        for (const entry of checks.filter((candidate) => candidate.status !== "ok")) {
           cross(`${entry.id}: ${entry.detail}`);
         }
         process.exitCode = 1;

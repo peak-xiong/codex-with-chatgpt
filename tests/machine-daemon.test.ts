@@ -59,7 +59,10 @@ function healthFor(machine: MachineRuntimeState): Response {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
-  clearMachineRuntime();
+  // Only clear a runtime this suite actually isolated. With no C2C_STATE_DIR
+  // these helpers resolve to the operator's real machine state, and an
+  // unconditional clear deleted the live gateway's ownership record.
+  if (process.env.C2C_STATE_DIR) clearMachineRuntime();
   for (const dir of cleanupDirs.splice(0)) cleanup(dir);
   delete process.env.C2C_STATE_DIR;
 });
@@ -229,6 +232,9 @@ describe("machine gateway lifecycle", () => {
   });
 
   it("resolves the tunnel port from the environment, defaulting in production", () => {
+    // Isolate even though this only exercises a pure function: the afterEach
+    // hook acts on whatever state dir is current.
+    cleanupDirs.push(isolateStateDir());
     // Production must use the port the tunnel was configured against.
     expect(machineHttpPort({})).toBe(DEFAULT_MACHINE_HTTP_PORT);
     // Tests isolate themselves on their own port.

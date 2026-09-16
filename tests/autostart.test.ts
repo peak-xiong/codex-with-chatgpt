@@ -9,6 +9,7 @@ import {
   enableAutostart,
   normalizeAutostartIntervalSeconds,
   renderLaunchAgentPlist,
+  autostartPlistDrifted,
   autostartStatus,
 } from "../src/config/autostart.js";
 import { runtimeEntryPath } from "../src/config/runtime-install.js";
@@ -417,6 +418,47 @@ describe("machine autostart LaunchAgent", () => {
     expect(fs.existsSync(config.plistPath)).toBe(false);
   });
 
+  // A hand-edited plist still loads and still runs, so drift is invisible
+  // until the service misbehaves. These keep it reportable.
+  it("reports no drift when the installed plist matches this build", () => {
+    const stateDir = makeTmpDir("autostart-drift-clean-state");
+    const home = makeTmpDir("autostart-drift-clean-home");
+    dirs.push(stateDir, home);
+    const config = machineConfig(stateDir, home);
+    fs.mkdirSync(path.dirname(config.plistPath), { recursive: true });
+    fs.writeFileSync(config.plistPath, renderLaunchAgentPlist(config));
+
+    expect(autostartPlistDrifted(config)).toBe(false);
+    expect(autostartStatus(config, { platform: "linux" }).drifted).toBe(false);
+  });
+
+  it("reports drift when the installed plist was edited by hand", () => {
+    const stateDir = makeTmpDir("autostart-drift-edited-state");
+    const home = makeTmpDir("autostart-drift-edited-home");
+    dirs.push(stateDir, home);
+    const config = machineConfig(stateDir, home);
+    fs.mkdirSync(path.dirname(config.plistPath), { recursive: true });
+    // Someone hand-edited the interval without re-running enable. The plist
+    // still loads, so only a content comparison can catch it.
+    fs.writeFileSync(
+      config.plistPath,
+      renderLaunchAgentPlist(config).replace("<integer>60</integer>", "<integer>30</integer>"),
+    );
+
+    expect(autostartPlistDrifted(config)).toBe(true);
+    const status = autostartStatus(config, { platform: "linux" });
+    expect(status.drifted).toBe(true);
+  });
+
+  it("reports no drift when no plist is installed", () => {
+    const stateDir = makeTmpDir("autostart-drift-absent-state");
+    const home = makeTmpDir("autostart-drift-absent-home");
+    dirs.push(stateDir, home);
+    const config = machineConfig(stateDir, home);
+
+    expect(autostartPlistDrifted(config)).toBe(false);
+  });
+
   it("reports unsupported platforms without invoking launchctl", () => {
     const stateDir = makeTmpDir("autostart-status-state");
     const home = makeTmpDir("autostart-status-home");
@@ -430,6 +472,9 @@ describe("machine autostart LaunchAgent", () => {
       config,
       enabled: true,
       loaded: null,
+      // The fixture wrote a literal "plist", which is not what this build
+      // would generate, so drift is reported even on an unsupported platform.
+      drifted: true,
       detail: "unsupported platform",
     });
     expect(spawnSyncImpl).not.toHaveBeenCalled();

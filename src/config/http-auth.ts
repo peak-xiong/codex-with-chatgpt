@@ -98,17 +98,40 @@ export interface HttpAuthStatus {
   createdAt: string | null;
   rotatedAt: string | null;
   tokenHint: string | null;
+  /**
+   * True when the token file is readable by anyone other than the owner. The
+   * token is the only thing in front of a public endpoint, so a widened mode is
+   * a real exposure rather than a style nit.
+   */
+  permissionsSafe: boolean;
+  fileMode: string | null;
 }
 
 export function httpAuthStatus(): HttpAuthStatus {
+  const file = httpAuthFile();
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
   const state = readAuthFile();
-  if (!state) return { configured: false, createdAt: null, rotatedAt: null, tokenHint: null };
+  const fileMode = stat && stat.isFile() ? (stat.mode & 0o777).toString(8).padStart(3, "0") : null;
+  // Group/other bits must all be clear.
+  const permissionsSafe = stat !== undefined && stat.isFile() ? (stat.mode & 0o077) === 0 : false;
+  if (!state) {
+    return {
+      configured: false,
+      createdAt: null,
+      rotatedAt: null,
+      tokenHint: null,
+      permissionsSafe,
+      fileMode,
+    };
+  }
   return {
     configured: true,
     createdAt: state.createdAt,
     rotatedAt: state.rotatedAt ?? null,
     // Enough to distinguish two tokens, not enough to use one.
     tokenHint: `${state.token.slice(0, TOKEN_PREFIX.length + 4)}…${state.token.slice(-4)}`,
+    permissionsSafe,
+    fileMode,
   };
 }
 
