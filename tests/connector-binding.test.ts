@@ -4,8 +4,12 @@ import { bindMachineConnector, machineConnectorFile, machineConnectorStatus, req
 import { controlDeliveryPrompt, controlResultContract } from "../src/control/result-contract.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
 
-const machineA = { machineId: `machine-${"a".repeat(32)}`, tunnelId: `tunnel_${"a".repeat(32)}`, associationId: `assoc-${"a".repeat(32)}` };
-const machineB = { machineId: `machine-${"b".repeat(32)}`, tunnelId: `tunnel_${"b".repeat(32)}`, associationId: `assoc-${"b".repeat(32)}` };
+// A device is identified by its machine id plus the app's stable URL. The old
+// tunnel and association fields are gone: the public HTTP endpoint no longer
+// has a tunnel id, and the association id is machine-wide rather than part of
+// which app to use.
+const machineA = { machineId: `machine-${"a".repeat(32)}` };
+const machineB = { machineId: `machine-${"b".repeat(32)}` };
 const dirs: string[] = [];
 afterEach(() => { dirs.splice(0).forEach(cleanup); delete process.env.C2C_STATE_DIR; });
 
@@ -16,6 +20,7 @@ describe("per-device ChatGPT connector binding", () => {
     expect(() => requireMachineConnector(machineA)).toThrow(/unconfigured/);
     expect(fs.existsSync(machineConnectorFile())).toBe(false);
   });
+
   it("persists the same global binding across reads and preserves app identity on rename", () => {
     dirs.push(isolateStateDir());
     const pluginUrl = "https://chatgpt.com/plugins/plugin_asdk_app_test";
@@ -25,21 +30,24 @@ describe("per-device ChatGPT connector binding", () => {
     expect(requireMachineConnector(machineA).pluginUrl).toBe(pluginUrl);
     if (process.platform !== "win32") expect(fs.statSync(machineConnectorFile()).mode & 0o777).toBe(0o600);
   });
-  it.each(["machineId", "tunnelId", "associationId"] as const)("invalidates copied or changed %s without deleting the old mapping", key => {
+
+  it("invalidates a copied or changed machineId without deleting the old mapping", () => {
     dirs.push(isolateStateDir());
     bindMachineConnector(machineA, { name: "Codex with ChatGPT", pluginUrl: "https://chatgpt.com/plugins/plugin_device_a" });
-    const changed = { ...machineA, [key]: machineB[key] };
-    expect(machineConnectorStatus(changed).status).toBe("stale");
-    expect(() => requireMachineConnector(changed)).toThrow(/stale/);
-    bindMachineConnector(changed, { name: "Codex with ChatGPT - Gala Mac" });
-    expect(requireMachineConnector(changed).pluginUrl).toBeUndefined();
+    expect(machineConnectorStatus(machineB).status).toBe("stale");
+    expect(() => requireMachineConnector(machineB)).toThrow(/stale/);
+    bindMachineConnector(machineB, { name: "Codex with ChatGPT - Gala Mac" });
+    // Rebinding drops the previous device's app URL rather than inheriting it.
+    expect(requireMachineConnector(machineB).pluginUrl).toBeUndefined();
     expect(() => requireMachineConnector(machineA)).toThrow(/stale/);
   });
+
   it.each(["https://evil.example/plugins/plugin_a", "https://chatgpt.com/plugins/plugin_a?token=secret", "https://chatgpt.com/plugins/plugin_a\n"])("rejects an invalid stable app URL %j", pluginUrl => {
     dirs.push(isolateStateDir());
     expect(() => bindMachineConnector(machineA, { name: "C2C", pluginUrl })).toThrow();
     expect(fs.existsSync(machineConnectorFile())).toBe(false);
   });
+
   it("keeps two devices' prompts and identity expectations separate", () => {
     const a = isolateStateDir(); dirs.push(a);
     bindMachineConnector(machineA, { name: "Codex with ChatGPT" });

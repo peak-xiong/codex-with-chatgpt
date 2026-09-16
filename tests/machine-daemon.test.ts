@@ -9,36 +9,20 @@ import {
   type MachineRuntimeState,
 } from "../src/gateway/runtime.js";
 import {
-  controlPlaneDownDetail,
   ensureMachineGateway,
-  machineMcpCommand,
+  DEFAULT_MACHINE_HTTP_PORT,
+  machineHttpCommand,
+  machineHttpPort,
   observeManagedMachine,
-  restoreMachineGateway,
   stopMachineGateway,
   withMachineSetupLock,
   withMachineStartLock,
-  type ManagedTunnelFunctions,
 } from "../src/process/machine-daemon.js";
 import { runtimeEntryPath } from "../src/config/runtime-install.js";
-import { createOpenAiTunnelConfig, type OpenAiTunnelRuntimeStatus } from "../src/tunnel/openai-secure.js";
 import { SERVICE_NAME, VERSION } from "../src/version.js";
 import { cleanup, isolateStateDir } from "./helpers.js";
 
 const cleanupDirs: string[] = [];
-const READY: OpenAiTunnelRuntimeStatus = {
-  ok: true,
-  processRunning: true,
-  healthy: true,
-  ready: true,
-  detail: "ready",
-};
-const STOPPED: OpenAiTunnelRuntimeStatus = {
-  ok: false,
-  processRunning: false,
-  healthy: false,
-  ready: false,
-  detail: "stopped",
-};
 const ASSOCIATION_ID = `assoc-${"c".repeat(32)}`;
 const ASSOCIATION_NONCE = "n".repeat(43);
 
@@ -51,7 +35,7 @@ function runtime(overrides: Partial<MachineRuntimeState> = {}): MachineRuntimeSt
     associationNonce: ASSOCIATION_NONCE,
     bootEpoch: "b".repeat(32),
     pid: process.pid,
-    port: 48_765,
+    port: DEFAULT_MACHINE_HTTP_PORT,
     adminToken: `c2c_admin_${"x".repeat(32)}`,
     startedAt: new Date().toISOString(),
     ...overrides,
@@ -72,39 +56,6 @@ function healthFor(machine: MachineRuntimeState): Response {
   );
 }
 
-function config() {
-  return createOpenAiTunnelConfig({
-    tunnelId: `tunnel_${"1".repeat(32)}`,
-    stateRoot: process.env.C2C_STATE_DIR,
-    associationId: ASSOCIATION_ID,
-    associationNonce: ASSOCIATION_NONCE,
-  });
-}
-
-function statusFor(configured: ReturnType<typeof config>, status: OpenAiTunnelRuntimeStatus): OpenAiTunnelRuntimeStatus {
-  return {
-    ...status,
-    alias: status.alias ?? configured.alias,
-    tunnelId: status.tunnelId ?? configured.tunnelId,
-    processTunnelId: status.processTunnelId ?? configured.tunnelId,
-    profilePath: status.profilePath ?? path.join(configured.profileDir, `${configured.profileName}.yaml`),
-    processProfilePath: status.processProfilePath ?? path.join(configured.profileDir, `${configured.profileName}.yaml`),
-    targetKind: status.targetKind ?? "command",
-    targetValue: status.targetValue ?? machineMcpCommand(configured),
-    pid: status.pid ?? process.pid,
-  };
-}
-
-function functions(overrides: Partial<ManagedTunnelFunctions> = {}): ManagedTunnelFunctions {
-  const status = overrides.status ?? vi.fn(() => STOPPED);
-  const connect = overrides.connect ?? vi.fn(() => READY);
-  return {
-    status: vi.fn((configured, dependencies) => statusFor(configured, status(configured, dependencies))),
-    connect: vi.fn((configured, command, dependencies) => statusFor(configured, connect(configured, command, dependencies))),
-    stop: overrides.stop ?? vi.fn(() => ({ stopped: true, detail: "stopped" })),
-  };
-}
-
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -113,559 +64,184 @@ afterEach(() => {
   delete process.env.C2C_STATE_DIR;
 });
 
-describe("tunnel-owned machine gateway lifecycle", () => {
-  it("uses the tunnel config state root for the supervised runtime command", () => {
-    const configuredState = isolateStateDir();
-    const ambientState = isolateStateDir();
-    const command = machineMcpCommand(
-      createOpenAiTunnelConfig({
-        tunnelId: `tunnel_${"1".repeat(32)}`,
-        stateRoot: configuredState,
-        associationId: ASSOCIATION_ID,
-        associationNonce: ASSOCIATION_NONCE,
-      }),
-    );
+describe("machine gateway lifecycle", () => {
+  it("supervises serve-http on the fixed port a tunnel forwards to", () => {
+    const stateRoot = isolateStateDir();
+    cleanupDirs.push(stateRoot);
+    const command = machineHttpCommand();
 
-    expect(command).toContain(runtimeEntryPath(configuredState));
-    expect(command).not.toContain(runtimeEntryPath(ambientState));
+    expect(command.command).toBe(process.execPath);
+    expect(command.args).toContain("serve-http");
+    expect(command.args).toContain(runtimeEntryPath(stateRoot));
+    // The port must be the recorded one: an ephemeral port would silently
+    // break the tunnel that forwards to it.
+    expect(command.args).toContain(String(DEFAULT_MACHINE_HTTP_PORT));
+    expect(command.args[command.args.indexOf("--port") + 1]).toBe(String(DEFAULT_MACHINE_HTTP_PORT));
   });
 
-  it("reuses a healthy gateway only when the official tunnel is ready", async () => {
+  it("reuses a healthy gateway instead of starting a second one", async () => {
     cleanupDirs.push(isolateStateDir());
     const machine = runtime();
     writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const managed = functions({ status: vi.fn(() => READY) });
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(healthFor(machine))));
+    const spawnImpl = vi.fn();
 
-    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).resolves.toMatchObject({
-      runtime: machine,
-      spawned: false,
-      tunnel: READY,
-    });
-    expect(managed.connect).not.toHaveBeenCalled();
+    const result = await ensureMachineGateway({ spawnImpl: spawnImpl as never });
+
+    expect(result.spawned).toBe(false);
+    expect(result.runtime.pid).toBe(machine.pid);
+    expect(spawnImpl).not.toHaveBeenCalled();
   });
 
-  it("refuses a healthy standalone gateway instead of creating a split broker", async () => {
+  it("spawns the gateway when no healthy runtime exists", async () => {
     cleanupDirs.push(isolateStateDir());
     const machine = runtime();
-    writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const managed = functions();
-
-    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.toThrow(
-      /outside the configured OpenAI tunnel/
-    );
-    expect(managed.connect).not.toHaveBeenCalled();
-  });
-
-  // A tunnel that cannot reach its control plane still owns the exact stdio
-  // child. Reporting that as a second broker sent operators after a process
-  // that does not exist instead of the egress failure that broke ChatGPT.
-  it("reports a control-plane outage instead of a split broker when the tunnel identity is exact", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const machine = runtime();
-    writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const degraded: OpenAiTunnelRuntimeStatus = {
-      ...READY,
-      ok: false,
-      healthy: false,
-      ready: false,
-      detail: "process_running=true healthy=false ready=false",
-      controlPlanePoll: "degraded",
-      controlPlanePollReason: "poll timed out; backing off",
-    };
-    const managed = functions({ status: vi.fn(() => degraded) });
-
-    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.toThrow(
-      /control-plane poll/
-    );
-    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.not.toThrow(
-      /split broker/
-    );
-    expect(managed.connect).not.toHaveBeenCalled();
-  });
-
-  it("still refuses a non-ready tunnel whose stdio command is not ours", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const machine = runtime();
-    writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const managed = functions({
-      status: vi.fn(() => ({ ...READY, ok: false, ready: false, targetValue: "\"/tmp/other-gateway\"" })),
-    });
-
-    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.toThrow(
-      /outside the configured OpenAI tunnel/
-    );
-  });
-
-  it("marks the observation as a control-plane outage without claiming readiness", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const machine = runtime();
-    writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const degraded: OpenAiTunnelRuntimeStatus = {
-      ...READY,
-      ok: false,
-      ready: false,
-      controlPlanePoll: "degraded",
-    };
-    const managed = functions({ status: vi.fn(() => degraded) });
-
-    const observation = await observeManagedMachine({ config: config(), tunnelFunctions: managed });
-
-    expect(observation.ready).toBe(false);
-    expect(observation.controlPlaneDown).toBe(true);
-    expect(controlPlaneDownDetail(observation.tunnel)).toContain("api.openai.com");
-    expect(controlPlaneDownDetail(observation.tunnel)).toContain("degraded poll");
-  });
-
-  it("does not report a control-plane outage when the tunnel is simply stopped", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const machine = runtime();
-    writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const managed = functions({ status: vi.fn(() => STOPPED) });
-
-    const observation = await observeManagedMachine({ config: config(), tunnelFunctions: managed });
-
-    expect(observation.ready).toBe(false);
-    expect(observation.controlPlaneDown).toBe(false);
-  });
-
-  it("starts only through tunnel-client with the stdio machine command", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const machine = runtime();
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    let running = false;
-    const connect = vi.fn((_config, command: string) => {
-      expect(command).toContain("serve-machine");
-      expect(command).toContain("--stdio");
+    const spawnImpl = vi.fn(() => {
       writeMachineRuntime(machine);
-      running = true;
-      return READY;
+      return { pid: machine.pid, unref: () => undefined } as never;
     });
-    const managed = functions({
-      connect,
-      status: vi.fn(() => (running ? READY : STOPPED)),
-    });
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(healthFor(machine))));
 
-    await expect(
-      ensureMachineGateway({
-        config: config(),
-        tunnelFunctions: managed,
-        pollIntervalMs: 1,
-        startTimeoutMs: 500,
-      })
-    ).resolves.toMatchObject({ runtime: machine, spawned: true });
-    expect(connect).toHaveBeenCalledTimes(1);
-    expect(machineMcpCommand(config())).toMatch(/serve-machine.*--stdio.*--port.*0/);
-    expect(machineMcpCommand(config())).not.toContain(ASSOCIATION_NONCE);
-    expect(machineMcpCommand(config())).not.toContain(ASSOCIATION_ID);
+    const result = await ensureMachineGateway({ spawnImpl: spawnImpl as never, pollIntervalMs: 1 });
+
+    expect(result.spawned).toBe(true);
+    expect(spawnImpl).toHaveBeenCalledTimes(1);
+    const [command, args] = spawnImpl.mock.calls[0] as unknown as [string, string[]];
+    expect(command).toBe(process.execPath);
+    expect(args).toContain("serve-http");
   });
 
-  it("stops the supervisor rather than calling the child admin shutdown", async () => {
+  it("refuses to reuse a healthy gateway when a fresh transport epoch is required", async () => {
     cleanupDirs.push(isolateStateDir());
     const machine = runtime();
     writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const stop = vi.fn(() => {
-      clearMachineRuntime();
-      return { stopped: true, detail: "stopped" };
-    });
-    const managed = functions({ status: vi.fn(() => READY), stop });
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(healthFor(machine))));
 
     await expect(
-      stopMachineGateway({ config: config(), tunnelFunctions: managed, pollIntervalMs: 1, stopTimeoutMs: 500 })
-    ).resolves.toBe(true);
-    expect(stop).toHaveBeenCalledTimes(1);
+      ensureMachineGateway({ requireFreshRuntime: true, spawnImpl: vi.fn() as never })
+    ).rejects.toThrow(/already healthy/);
   });
 
-  it("stops a degraded but exactly owned tunnel runtime", async () => {
+  it("fails when the spawned gateway never becomes healthy", async () => {
+    cleanupDirs.push(isolateStateDir());
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response("nope", { status: 503 }))));
+    const kill = vi.fn();
+    const spawnImpl = vi.fn(() => ({ pid: 999_999, unref: () => undefined, kill }) as never);
+
+    await expect(
+      ensureMachineGateway({ spawnImpl: spawnImpl as never, startTimeoutMs: 40, pollIntervalMs: 5 })
+    ).rejects.toThrow(/did not become healthy/);
+  });
+
+  it("refuses to stop a gateway whose ownership record does not match the live process", async () => {
     cleanupDirs.push(isolateStateDir());
     const machine = runtime();
     writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const stop = vi.fn(() => {
-      clearMachineRuntime();
-      return { stopped: true, detail: "stopped" };
-    });
-    const managed = functions({
-      status: vi.fn(() => ({
-        ...READY,
-        ok: false,
-        healthy: false,
-        ready: false,
-        detail: "degraded",
-      })),
-      stop,
-    });
+    // The record is ours, but the live process answers with a different identity.
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() =>
+      Promise.resolve(new Response(JSON.stringify({ service: SERVICE_NAME, status: "ok" }), { status: 200 }))
+    ));
 
-    await expect(
-      stopMachineGateway({ config: config(), tunnelFunctions: managed, pollIntervalMs: 1, stopTimeoutMs: 500 })
-    ).resolves.toBe(true);
-    expect(stop).toHaveBeenCalledTimes(1);
+    await expect(stopMachineGateway({ pollIntervalMs: 1, stopTimeoutMs: 30 })).rejects.toThrow(
+      /does not match this machine's ownership record/
+    );
   });
 
-  it("is idempotent when the configured tunnel alias is already stopped", async () => {
+  it("is idempotent when no gateway is running", async () => {
     cleanupDirs.push(isolateStateDir());
-    const stop = vi.fn(() => ({ stopped: true, detail: "unexpected" }));
-    const managed = functions({ status: vi.fn(() => STOPPED), stop });
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response("stopped", { status: 503 }))));
 
-    await expect(stopMachineGateway({ config: config(), tunnelFunctions: managed })).resolves.toBe(false);
-    expect(stop).not.toHaveBeenCalled();
+    await expect(stopMachineGateway()).resolves.toBe(false);
   });
 
-  it("clears only the exact stale runtime record when the tunnel alias is gone", async () => {
+  it("clears a stale runtime record whose process is gone", async () => {
     cleanupDirs.push(isolateStateDir());
-    const machine = runtime({ pid: 999_999_999 });
+    const machine = runtime({ pid: 999_999 });
     writeMachineRuntime(machine);
-    const stop = vi.fn(() => ({ stopped: true, detail: "unexpected" }));
-    const managed = functions({ status: vi.fn(() => STOPPED), stop });
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response("stopped", { status: 503 }))));
 
-    await expect(stopMachineGateway({ config: config(), tunnelFunctions: managed })).resolves.toBe(false);
-    expect(stop).not.toHaveBeenCalled();
+    await expect(stopMachineGateway()).resolves.toBe(false);
     expect(readMachineRuntime()).toBeNull();
-  });
-
-  it("refuses to stop a tunnel runtime with a mismatched identity", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const machine = runtime();
-    writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const stop = vi.fn(() => ({ stopped: true, detail: "stopped" }));
-    const managed = functions({
-      status: vi.fn(() => ({ ...READY, targetValue: "\"/tmp/other-gateway\"" })),
-      stop,
-    });
-
-    await expect(
-      stopMachineGateway({ config: config(), tunnelFunctions: managed, pollIntervalMs: 1, stopTimeoutMs: 500 })
-    ).rejects.toThrow(/refusing to stop/i);
-    expect(stop).not.toHaveBeenCalled();
-    expect(readMachineRuntime()).toEqual(machine);
-  });
-
-  it("refuses to stop a running alias when its gateway record is missing", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const stop = vi.fn(() => ({ stopped: true, detail: "unexpected" }));
-    const managed = functions({ status: vi.fn(() => READY), stop });
-
-    await expect(
-      stopMachineGateway({ config: config(), tunnelFunctions: managed, pollIntervalMs: 1, stopTimeoutMs: 500 }),
-    ).rejects.toThrow(/ownership record is missing.*refusing to stop/i);
-    expect(stop).not.toHaveBeenCalled();
   });
 
   it("serializes machine startup attempts with one machine-wide lock", async () => {
-    cleanupDirs.push(isolateStateDir());
-    let active = 0;
-    let maximum = 0;
-    let releaseFirst!: () => void;
-    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const stateDir = isolateStateDir();
+    cleanupDirs.push(stateDir);
+    const order: string[] = [];
+    let release: (() => void) | null = null;
     const first = withMachineStartLock(async () => {
-      active += 1;
-      maximum = Math.max(maximum, active);
-      await gate;
-      active -= 1;
-      return "first";
+      order.push("first-enter");
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      order.push("first-exit");
     });
-    await new Promise((resolve) => setImmediate(resolve));
     const second = withMachineStartLock(async () => {
-      active += 1;
-      maximum = Math.max(maximum, active);
-      active -= 1;
-      return "second";
+      order.push("second-enter");
     });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(maximum).toBe(1);
-    releaseFirst();
-    await expect(Promise.all([first, second])).resolves.toEqual(["first", "second"]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(order).toEqual(["first-enter"]);
+    release?.();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first-enter", "first-exit", "second-enter"]);
   });
 
   it("serializes complete setup transactions with a machine-wide lock", async () => {
-    cleanupDirs.push(isolateStateDir());
-    let active = 0;
-    let maximum = 0;
-    let releaseFirst!: () => void;
-    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const stateDir = isolateStateDir();
+    cleanupDirs.push(stateDir);
+    const order: string[] = [];
+    let release: (() => void) | null = null;
     const first = withMachineSetupLock(async () => {
-      active += 1;
-      maximum = Math.max(maximum, active);
-      await gate;
-      active -= 1;
-      return "first";
+      order.push("first-enter");
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      order.push("first-exit");
     });
-    await new Promise((resolve) => setImmediate(resolve));
     const second = withMachineSetupLock(async () => {
-      active += 1;
-      maximum = Math.max(maximum, active);
-      active -= 1;
-      return "second";
+      order.push("second-enter");
     });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(maximum).toBe(1);
-    releaseFirst();
-    await expect(Promise.all([first, second])).resolves.toEqual(["first", "second"]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(order).toEqual(["first-enter"]);
+    release?.();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first-enter", "first-exit", "second-enter"]);
   });
 
-  it("requires a fresh ownership epoch when replacing a tunnel", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const previous = runtime({ bootEpoch: "1".repeat(32), pid: process.pid });
-    const next = runtime({ bootEpoch: "2".repeat(32), pid: process.pid });
-    vi.stubGlobal("fetch", vi.fn(async () => {
-      const current = readMachineRuntime();
-      return current ? healthFor(current) : new Response("stopped", { status: 503 });
-    }));
-    let running = false;
-    const managed = functions({
-      status: vi.fn(() => (running ? READY : STOPPED)),
-      connect: vi.fn(() => {
-        writeMachineRuntime(next);
-        running = true;
-        return READY;
-      }),
-    });
+  it("reports readiness only when the gateway is healthy and an endpoint is recorded", async () => {
+    const stateDir = isolateStateDir();
+    cleanupDirs.push(stateDir);
+    const machine = runtime();
+    writeMachineRuntime(machine);
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(healthFor(machine))));
 
-    await expect(ensureMachineGateway({
-      config: config(),
-      tunnelFunctions: managed,
-      requireFreshRuntime: true,
-      previousRuntime: previous,
-      pollIntervalMs: 1,
-      startTimeoutMs: 500,
-    })).resolves.toMatchObject({ runtime: next, spawned: true });
+    const observation = await observeManagedMachine();
+    expect(observation.gateway.state).toBe("healthy");
+    // A healthy gateway alone is not reachable: the public URL must exist too.
+    expect(observation.ready).toBe(false);
+    expect(observation.endpoint).toBeNull();
   });
 
-  it("rejects a replacement that reuses the previous ownership epoch", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const previous = runtime({ bootEpoch: "1".repeat(32), pid: process.pid });
-    vi.stubGlobal("fetch", vi.fn(async () => {
-      const current = readMachineRuntime();
-      return current ? healthFor(current) : new Response("stopped", { status: 503 });
-    }));
-    let running = false;
-    const stop = vi.fn(() => {
-      clearMachineRuntime();
-      running = false;
-      return { stopped: true, detail: "stopped" };
-    });
-    const managed = functions({
-      status: vi.fn(() => (running ? READY : STOPPED)),
-      connect: vi.fn(() => {
-        writeMachineRuntime(previous);
-        running = true;
-        return READY;
-      }),
-      stop,
-    });
-
-    await expect(ensureMachineGateway({
-      config: config(),
-      tunnelFunctions: managed,
-      requireFreshRuntime: true,
-      previousRuntime: previous,
-      pollIntervalMs: 1,
-      startTimeoutMs: 500,
-    })).rejects.toThrow(/ownership epoch did not change/);
-    expect(stop).toHaveBeenCalledTimes(1);
-    expect(readMachineRuntime()).toBeNull();
+  it("keeps the runtime file inside the isolated state dir", () => {
+    const stateDir = isolateStateDir();
+    cleanupDirs.push(stateDir);
+    expect(machineRuntimeFile().startsWith(path.resolve(stateDir))).toBe(true);
   });
 
-  it("stops a supervisor whose gateway never becomes healthy", async () => {
-    cleanupDirs.push(isolateStateDir());
-    let running = false;
-    const stop = vi.fn(() => {
-      running = false;
-      return { stopped: true, detail: "stopped" };
-    });
-    const managed = functions({
-      status: vi.fn(() => (running ? READY : STOPPED)),
-      connect: vi.fn(() => {
-        running = true;
-        return READY;
-      }),
-      stop,
-    });
-
-    await expect(ensureMachineGateway({
-      config: config(),
-      tunnelFunctions: managed,
-      pollIntervalMs: 1,
-      startTimeoutMs: 10,
-    })).rejects.toThrow(/did not become healthy/);
-    expect(stop).toHaveBeenCalledTimes(1);
-    expect(running).toBe(false);
+  it("resolves the tunnel port from the environment, defaulting in production", () => {
+    // Production must use the port the tunnel was configured against.
+    expect(machineHttpPort({})).toBe(DEFAULT_MACHINE_HTTP_PORT);
+    // Tests isolate themselves on their own port.
+    expect(machineHttpPort({ C2C_HTTP_PORT: "23456" })).toBe(23_456);
+    expect(() => machineHttpPort({ C2C_HTTP_PORT: "0" })).toThrow(/valid TCP port/);
+    expect(() => machineHttpPort({ C2C_HTTP_PORT: "abc" })).toThrow(/valid TCP port/);
   });
 
-  it("rechecks and stops a newly started exact runtime when connect throws after its side effect", async () => {
-    cleanupDirs.push(isolateStateDir());
-    let running = false;
-    const connect = vi.fn(() => {
-      running = true;
-      throw new Error("connect failed after starting the runtime");
-    });
-    const stop = vi.fn(() => {
-      running = false;
-      return { stopped: true, detail: "stopped" };
-    });
-    const managed = functions({
-      status: vi.fn(() => (running ? READY : STOPPED)),
-      connect,
-      stop,
-    });
-
-    await expect(ensureMachineGateway({
-      config: config(),
-      tunnelFunctions: managed,
-      pollIntervalMs: 1,
-      startTimeoutMs: 500,
-    })).rejects.toThrow(/connect failed after starting/i);
-    expect(connect).toHaveBeenCalledTimes(1);
-    expect(managed.status).toHaveBeenCalledTimes(3);
-    expect(stop).toHaveBeenCalledTimes(1);
-    expect(running).toBe(false);
-    expect(readMachineRuntime()).toBeNull();
-  });
-
-  it("does not stop a runtime created after connect throws when its target identity changed", async () => {
-    cleanupDirs.push(isolateStateDir());
-    let running = false;
-    const connect = vi.fn(() => {
-      running = true;
-      throw new Error("connect failed after starting the runtime");
-    });
-    const stop = vi.fn(() => ({ stopped: true, detail: "unexpected" }));
-    const managed = functions({
-      status: vi.fn(() => running ? { ...READY, targetValue: '"/tmp/unmanaged"' } : STOPPED),
-      connect,
-      stop,
-    });
-
-    await expect(ensureMachineGateway({
-      config: config(),
-      tunnelFunctions: managed,
-      pollIntervalMs: 1,
-      startTimeoutMs: 500,
-    })).rejects.toThrow(/startup cleanup failed/i);
-    expect(stop).not.toHaveBeenCalled();
-    expect(running).toBe(true);
-  });
-
-  it("refuses to replace a running alias when its gateway record is missing and identity mismatches", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const connect = vi.fn(() => READY);
-    const stop = vi.fn(() => ({ stopped: true, detail: "unexpected" }));
-    const managed = functions({
-      status: vi.fn(() => ({ ...READY, tunnelId: `tunnel_${"2".repeat(32)}` })),
-      connect,
-      stop,
-    });
-
-    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.toThrow(
-      /already running.*refusing to replace/i,
-    );
-    expect(connect).not.toHaveBeenCalled();
-    expect(stop).not.toHaveBeenCalled();
-    expect(readMachineRuntime()).toBeNull();
-  });
-
-  it("observes an already healthy previous gateway before restoring it", async () => {
+  it("exposes the runtime record a tunnel forwards to", () => {
     cleanupDirs.push(isolateStateDir());
     const machine = runtime();
     writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const connect = vi.fn(() => READY);
-    const managed = functions({ status: vi.fn(() => READY), connect });
-
-    await expect(restoreMachineGateway({ config: config(), tunnelFunctions: managed })).resolves.toMatchObject({
-      runtime: machine,
-      spawned: false,
-    });
-    expect(connect).not.toHaveBeenCalled();
-  });
-
-  it("ensures a stopped previous gateway after rollback observation", async () => {
-    cleanupDirs.push(isolateStateDir());
-    let running = false;
-    const machine = runtime({ bootEpoch: "e".repeat(32) });
-    vi.stubGlobal("fetch", vi.fn(async () => {
-      const current = readMachineRuntime();
-      return current && running ? healthFor(current) : new Response("stopped", { status: 503 });
-    }));
-    const managed = functions({
-      status: vi.fn(() => (running ? READY : STOPPED)),
-      connect: vi.fn(() => {
-        running = true;
-        writeMachineRuntime(machine);
-        return READY;
-      }),
-    });
-
-    await expect(restoreMachineGateway({
-      config: config(),
-      tunnelFunctions: managed,
-      pollIntervalMs: 1,
-      startTimeoutMs: 500,
-    })).resolves.toMatchObject({ runtime: machine, spawned: true });
-    expect(managed.connect).toHaveBeenCalledTimes(1);
-  });
-
-  it("does not reuse a healthy gateway with a different tunnel association", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const machine = runtime({ associationId: `assoc-${"d".repeat(32)}` });
-    writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const managed = functions({ status: vi.fn(() => READY) });
-
-    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.toThrow(
-      /not the exact child/
-    );
-    expect(managed.connect).not.toHaveBeenCalled();
-  });
-
-  it("does not reuse a healthy gateway with a different association nonce", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const machine = runtime({ associationNonce: "o".repeat(43) });
-    writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const managed = functions({ status: vi.fn(() => READY) });
-
-    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.toThrow(
-      /not the exact child/
-    );
-    expect(managed.connect).not.toHaveBeenCalled();
-  });
-
-  it("does not reuse a healthy gateway when tunnel status points at another stdio command", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const machine = runtime();
-    writeMachineRuntime(machine);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const managed = functions({
-      status: vi.fn(() => ({ ...READY, targetValue: "\"/tmp/other-gateway\"" })),
-    });
-
-    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.toThrow(
-      /tunnel, profile, or stdio command does not match/
-    );
-    expect(managed.connect).not.toHaveBeenCalled();
-  });
-
-  it("does not accept a pre-association runtime record from an older release", async () => {
-    cleanupDirs.push(isolateStateDir());
-    const machine = runtime();
-    const oldRuntime = { ...machine } as Record<string, unknown>;
-    delete oldRuntime.associationId;
-    delete oldRuntime.associationNonce;
-    fs.writeFileSync(machineRuntimeFile(), JSON.stringify(oldRuntime));
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(healthFor(machine)));
-    const managed = functions({ status: vi.fn(() => READY) });
-
-    await expect(ensureMachineGateway({ config: config(), tunnelFunctions: managed })).rejects.toThrow(
-      /state is uncertain/
-    );
-    expect(managed.connect).not.toHaveBeenCalled();
+    expect(fs.existsSync(machineRuntimeFile())).toBe(true);
+    expect(readMachineRuntime()?.port).toBe(DEFAULT_MACHINE_HTTP_PORT);
   });
 });

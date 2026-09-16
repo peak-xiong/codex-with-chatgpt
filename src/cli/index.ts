@@ -94,10 +94,12 @@ import {
 } from "../gateway/runtime.js";
 import { Logger } from "../logger/index.js";
 import {
-  controlPlaneDownDetail,
   ensureMachineGateway,
+  MACHINE_HTTP_HOST,
+  machineHttpCommand,
+  machineHttpPort,
   observeManagedMachine,
-  restoreMachineGateway,
+  restartMachineGateway,
   stopMachineGateway,
   withMachineSetupLock,
 } from "../process/machine-daemon.js";
@@ -115,20 +117,16 @@ import {
   type WaitingFor,
 } from "../session/state.js";
 import {
-  createOpenAiTunnelConfig,
-  doctorOpenAiTunnel,
-  installOpenAiRuntimeKey,
-  installOpenAiTunnelClient,
-  OPENAI_CONNECTOR_NAME,
-  openAiTunnelConfigFile,
-  openAiTunnelRuntimeStatusView,
-  openAiTunnelRuntimeKeyPath,
-  readOpenAiTunnelConfig,
-  statusOpenAiTunnel,
-  stopOpenAiTunnel,
-  writeOpenAiTunnelConfig,
-  type OpenAiTunnelConfig,
-} from "../tunnel/openai-secure.js";
+  httpAuthStatus,
+  requireHttpAuthToken,
+  rotateHttpAuthToken,
+} from "../config/http-auth.js";
+import {
+  clearPublicEndpoint,
+  publicEndpointStatus,
+  publicMcpUrl,
+  setPublicEndpoint,
+} from "../config/public-endpoint.js";
 import { checkGitUpdate } from "../update/check.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 import { Workspace } from "../workspace/manager.js";
@@ -300,32 +298,34 @@ async function machineInfo(runtime: MachineRuntimeState): Promise<MachineAdminIn
   return machineAdminFetch<MachineAdminInfo>(runtime, "GET", "/admin/info");
 }
 
-function tunnelConfigView(config: OpenAiTunnelConfig | null): Record<string, unknown> | null {
-  if (!config) return null;
+/** Public transport view. The token itself is never included. */
+function transportView(): Record<string, unknown> {
+  const endpoint = publicEndpointStatus();
+  const auth = httpAuthStatus();
   return {
-    tunnelId: config.tunnelId,
-    associationId: config.associationId,
-    alias: config.alias,
-    profileName: config.profileName,
-    binaryPath: config.binaryPath,
-    runtimeKeyInstalled: fs.existsSync(config.runtimeKeyFile),
+    transport: "public-http",
+    localPort: machineHttpPort(),
+    mcpUrl: publicMcpUrl(endpoint),
+    endpointConfigured: endpoint !== null,
+    endpointUpdatedAt: endpoint?.updatedAt ?? null,
+    authConfigured: auth.configured,
+    authTokenHint: auth.tokenHint,
+    authRotatedAt: auth.rotatedAt,
   };
 }
 
-function localConnectorMachine(config: OpenAiTunnelConfig, runtime?: MachineRuntimeState): ConnectorMachine {
+function localConnectorMachine(runtime?: MachineRuntimeState): ConnectorMachine {
   const identity = runtime ?? readMachineIdentity();
   if (!identity) throw new Error("Machine identity is unavailable; finish machine setup first.");
-  if (runtime && runtime.associationId !== config.associationId) throw new Error("Machine runtime and configured Tunnel association do not match.");
-  return { machineId: identity.machineId, tunnelId: config.tunnelId, associationId: config.associationId };
+  return { machineId: identity.machineId };
 }
 
-function localConnectorStatus(config = readOpenAiTunnelConfig(), runtime?: MachineRuntimeState) {
-  if (!config) return { status: "unconfigured" as const, binding: null };
-  return machineConnectorStatus(localConnectorMachine(config, runtime));
+function localConnectorStatus(runtime?: MachineRuntimeState) {
+  return machineConnectorStatus(localConnectorMachine(runtime));
 }
 
 function boundConnectorName(runtime: MachineRuntimeState): string | undefined {
-  const result = localConnectorStatus(undefined, runtime);
+  const result = localConnectorStatus(runtime);
   return result.status === "bound" ? result.binding?.name : undefined;
 }
 
@@ -398,29 +398,28 @@ program
   .version(VERSION, "-v, --version")
   .configureHelp({ sortSubcommands: true });
 
-// The official tunnel-client owns this process and its stdio transport.
+// Started by the machine daemon and reached through a public tunnel.
 program
-  .command("serve-machine", { hidden: true })
-  .description("Run the machine-scoped stdio MCP gateway (internal)")
-  .requiredOption("--stdio", "serve MCP over stdio")
-  .option("--port <port>", "loopback control port", "0")
-  .action(async (opts: { stdio: boolean; port: string }) => {
+  .command("serve-http", { hidden: true })
+  .description("Run the machine-scoped MCP gateway over HTTP (internal)")
+  .option("--port <port>", "loopback port the tunnel forwards to", String(machineHttpPort()))
+  .action(async (opts: { port: string }) => {
     try {
-      if (!opts.stdio) throw new Error("serve-machine requires --stdio");
-      const associationId = process.env.C2C_ASSOCIATION_ID;
-      const associationNonce = process.env.C2C_ASSOCIATION_NONCE;
-      if (!associationId || !/^assoc-[a-f0-9]{32}$/.test(associationId)) {
-        throw new Error("serve-machine requires C2C_ASSOCIATION_ID from the managed tunnel runtime");
+      const port = parseIntegerOption(opts.port, "port", 1, 65_535);
+      const expected = machineHttpPort();
+      if (port !== expected) {
+        throw new Error(
+          `serve-http must bind the port this machine is configured for (${expected}); ` +
+            `run \`c2c machine endpoint set\` instead of overriding it.`
+        );
       }
-      if (!associationNonce || !/^[A-Za-z0-9_-]{43}$/.test(associationNonce)) {
-        throw new Error("serve-machine requires C2C_ASSOCIATION_NONCE from the managed tunnel runtime");
-      }
+      // Refuse to expose an unauthenticated endpoint: a tunnel forwards every
+      // path, so /mcp would otherwise be open to the internet.
+      requireHttpAuthToken();
       const gateway = await startMachineGatewayServer({
-        port: parseIntegerOption(opts.port, "port", 0, 65_535),
-        connectStdio: true,
+        port,
+        connectHttp: true,
         exitOnShutdown: true,
-        associationId,
-        associationNonce,
         logger: new Logger({ name: "machine-gateway", console: false }),
       });
       const shutdown = (): void => {
@@ -456,11 +455,9 @@ machineConnector.command("set")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { name: string; pluginUrl?: string; json: boolean }) => {
     try {
-      const binding = await withMachineSetupLock(async () => {
-        const config = readOpenAiTunnelConfig();
-        if (!config) throw new Error("Configure this device's official Tunnel before binding its ChatGPT app.");
-        return bindMachineConnector(connectorMachine(config), { name: opts.name, pluginUrl: opts.pluginUrl });
-      });
+      const binding = await withMachineSetupLock(async () =>
+        bindMachineConnector(connectorMachine(), { name: opts.name, pluginUrl: opts.pluginUrl })
+      );
       if (opts.json) say(JSON.stringify({ ok: true, status: "bound", binding }));
       else check(`本机插件已绑定：${binding.name}。所有本机项目的新请求自动复用此绑定。`);
     } catch (error) { handleCliError(error, opts.json); }
@@ -468,31 +465,11 @@ machineConnector.command("set")
 
 machine
   .command("setup")
-  .description("Install and configure the official OpenAI Secure MCP Tunnel")
-  .option("--tunnel-id <id>", "OpenAI tunnel id for first-time setup")
-  .option("--runtime-key-file <path>", "private runtime-key file for first-time setup")
-  .option("--reuse-existing", "reuse the installed tunnel id and protected runtime key", false)
+  .description("Install the runtime and start the machine-wide MCP gateway")
   .option("--json", "machine-readable output", false)
-  .action(async (opts: {
-    tunnelId?: string;
-    runtimeKeyFile?: string;
-    reuseExisting: boolean;
-    json: boolean;
-  }) => {
+  .action(async (opts: { json: boolean }) => {
     try {
       const payload = await withMachineSetupLock(async () => {
-        const previousConfig = readOpenAiTunnelConfig();
-        const setup = resolveMachineSetupOptions(opts, previousConfig);
-        if (setup.reuseExisting) {
-          const runtimeKey = fs.lstatSync(previousConfig!.runtimeKeyFile, { throwIfNoEntry: false });
-          if (!runtimeKey || runtimeKey.isSymbolicLink() || !runtimeKey.isFile()) {
-            throw new Error(
-              "The installed OpenAI tunnel runtime key is unavailable; provide a private key file explicitly",
-            );
-          }
-        }
-        const previousConfigFile = snapshotPrivateFile(openAiTunnelConfigFile());
-        const previousRuntimeKeyFile = snapshotPrivateFile(openAiTunnelRuntimeKeyPath());
         const previousGateway = await observeMachineRuntime();
         const runtimeHomeDir = path.resolve(process.env.HOME ?? os.homedir());
         const previousRuntime = snapshotRuntimeInstallation({ homeDir: runtimeHomeDir });
@@ -500,100 +477,53 @@ machine
         const previousCodexConfig = snapshotCodexConfig();
         let installedRuntime: RuntimeInstallResult | null = null;
         let skill: SkillInstallResult | null = null;
-        let draft: OpenAiTunnelConfig | null = null;
         let requiresFreshRuntime = false;
-        let oldSupervisorStopped = false;
-        let newSupervisorStarted = false;
-        let replacementStartAttempted = false;
+        let gatewayStopped = false;
+        let startAttempted = false;
         try {
           const nextRuntime = installRuntime({ checkoutRoot: repoRoot, homeDir: runtimeHomeDir });
           installedRuntime = nextRuntime;
           const nextSkill = installGlobalSkill({ checkoutRoot: nextRuntime.path });
           skill = nextSkill;
-          const binaryPath = await installOpenAiTunnelClient();
-          const nextDraft = createOpenAiTunnelConfig({
-            tunnelId: setup.tunnelId,
-            binaryPath,
-            runtimeKeyFile: setup.reuseExisting ? previousConfig!.runtimeKeyFile : undefined,
-            associationId:
-              previousConfig?.tunnelId === setup.tunnelId ? previousConfig.associationId : undefined,
-            associationNonce:
-              previousConfig?.tunnelId === setup.tunnelId ? previousConfig.associationNonce : undefined,
-          });
-          draft = nextDraft;
-          const configChanged =
-            previousConfig === null ||
-            previousConfig.tunnelId !== nextDraft.tunnelId ||
-            previousConfig.runtimeKeyFile !== nextDraft.runtimeKeyFile ||
-            previousConfig.binaryPath !== nextDraft.binaryPath ||
-            previousConfig.alias !== nextDraft.alias ||
-            previousConfig.profileName !== nextDraft.profileName ||
-            previousConfig.profileDir !== nextDraft.profileDir;
-          requiresFreshRuntime = configChanged || nextRuntime.changed;
-          if (setup.runtimeKeySourceFile !== null) {
-            installOpenAiRuntimeKey(path.resolve(setup.runtimeKeySourceFile), nextDraft.runtimeKeyFile);
-            const installedRuntimeKey = fs.readFileSync(nextDraft.runtimeKeyFile);
-            const runtimeKeyChanged =
-              previousRuntimeKeyFile === null ||
-              !previousRuntimeKeyFile.bytes.equals(installedRuntimeKey);
-            requiresFreshRuntime ||= runtimeKeyChanged;
+          // A rebuilt runtime must not keep serving from the previous bytes.
+          requiresFreshRuntime = nextRuntime.changed;
+          if (requiresFreshRuntime && previousGateway.state === "healthy") {
+            gatewayStopped = await stopMachineGateway({ machineLockHeld: true });
           }
-          if (requiresFreshRuntime && previousConfig) {
-            oldSupervisorStopped = await stopMachineGateway({
-              config: previousConfig,
-              machineLockHeld: true,
-            });
-          }
-          writeOpenAiTunnelConfig(nextDraft);
           const sandbox = ensureSandboxIsolation();
-          replacementStartAttempted = requiresFreshRuntime || previousGateway.state !== "healthy";
+          startAttempted = true;
           const result = await ensureMachineGateway({
-            config: nextDraft,
             requireFreshRuntime: requiresFreshRuntime,
-            previousRuntime: previousGateway.state === "healthy" ? previousGateway.runtime : null,
             machineLockHeld: true,
           });
-          newSupervisorStarted = result.spawned;
           const info = await machineInfo(result.runtime);
-          const connectorStatus = localConnectorStatus(nextDraft, result.runtime);
+          const connectorStatus = localConnectorStatus(result.runtime);
+          const auth = requireHttpAuthToken();
           return {
             ok: true,
             configured: true,
             connector: {
               name: connectorStatus.status === "bound" ? connectorStatus.binding?.name : null,
               ...connectorStatus,
-              authentication: "none",
-              tunnelId: nextDraft.tunnelId,
             },
             installation: runtimeInstallView(nextRuntime),
             skill: skillInstallView(nextSkill),
-            tunnel: openAiTunnelRuntimeStatusView(result.tunnel),
+            transport: transportView(),
             runtime: machineRuntimeView(result.runtime),
             info,
             sandbox,
+            authTokenHint: httpAuthStatus().tokenHint,
+            authCreatedAt: auth.createdAt,
           };
         } catch (error) {
-          const replacementMayBeRunning =
-            newSupervisorStarted ||
-            oldSupervisorStopped ||
-            replacementStartAttempted;
           const rollbackSteps: RollbackStep[] = [];
-          const replacementConfig = draft;
-          if (replacementMayBeRunning && replacementConfig) {
+          if (startAttempted) {
             rollbackSteps.push({
               label: "stop replacement gateway",
-              run: () => stopMachineGateway({ config: replacementConfig, machineLockHeld: true }).then(() => undefined),
+              run: () => stopMachineGateway({ machineLockHeld: true }).then(() => undefined),
             });
           }
           rollbackSteps.push(
-            {
-              label: "restore tunnel config",
-              run: () => restorePrivateFile(openAiTunnelConfigFile(), previousConfigFile),
-            },
-            {
-              label: "restore tunnel runtime key",
-              run: () => restorePrivateFile(openAiTunnelRuntimeKeyPath(), previousRuntimeKeyFile),
-            },
             {
               label: "restore runtime installation",
               run: () => restoreRuntimeInstallation(previousRuntime),
@@ -607,11 +537,11 @@ machine
               run: () => restoreCodexConfig(previousCodexConfig),
             },
           );
-          if (previousConfig && shouldRestorePreviousGateway(previousGateway.state, oldSupervisorStopped)) {
+          if (gatewayStopped || previousGateway.state === "healthy") {
             rollbackSteps.push({
               label: "restore previous gateway",
               run: async () => {
-                await restoreMachineGateway({ config: previousConfig, machineLockHeld: true });
+                await ensureMachineGateway({ machineLockHeld: true });
               },
             });
           }
@@ -625,9 +555,110 @@ machine
       });
       if (opts.json) say(JSON.stringify(payload));
       else {
-        check("官方 OpenAI Secure MCP Tunnel 已配置");
-        check("机器网关已启动");
-        say(`Connector：${payload.connector.name ?? "尚未绑定：运行 c2c machine connector set --name <本机插件完整名称>"}（Authentication: None）`);
+        check("机器级 MCP 网关已安装并启动");
+        say(`Connector：${payload.connector.name ?? "尚未绑定：运行 c2c machine connector set --name <本机插件完整名称>"}`);
+        const url = (payload.transport as { mcpUrl?: string | null }).mcpUrl;
+        say(url ? `MCP 地址：${url}` : "公网地址尚未配置：运行 c2c machine endpoint set --url <https://...>");
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+const machineEndpoint = machine
+  .command("endpoint")
+  .description("Record the public URL a tunnel forwards to this machine");
+
+machineEndpoint
+  .command("get", { isDefault: true })
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    try {
+      const view = transportView();
+      if (opts.json) say(JSON.stringify({ ok: true, ...view }));
+      else {
+        say(`本地端口：${view.localPort}`);
+        say(`MCP 地址：${view.mcpUrl ?? "尚未配置"}`);
+        say(`Bearer 认证：${view.authConfigured ? `已启用（${view.authTokenHint}）` : "未生成"}`);
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+machineEndpoint
+  .command("set")
+  .requiredOption("--url <url>", "public https base URL the tunnel exposes, without /mcp")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { url: string; json: boolean }) => {
+    try {
+      const endpoint = await withMachineSetupLock(async () => setPublicEndpoint({
+        baseUrl: opts.url,
+        localPort: machineHttpPort(),
+      }));
+      const payload = { ok: true, ...transportView(), endpoint };
+      if (opts.json) say(JSON.stringify(payload));
+      else {
+        check(`公网地址已记录：${publicMcpUrl(endpoint)}`);
+        say("在 ChatGPT 连接器中填入该地址，并在 Authorization 头使用 `c2c machine auth show` 显示的令牌。");
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+machineEndpoint
+  .command("clear")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { json: boolean }) => {
+    try {
+      clearPublicEndpoint();
+      if (opts.json) say(JSON.stringify({ ok: true, ...transportView() }));
+      else check("公网地址已清除");
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+const machineAuth = machine
+  .command("auth")
+  .description("Manage the bearer token that guards the public MCP endpoint");
+
+machineAuth
+  .command("show")
+  .option("--json", "machine-readable output", false)
+  .option("--reveal", "print the full token instead of a hint", false)
+  .action((opts: { json: boolean; reveal: boolean }) => {
+    try {
+      const state = requireHttpAuthToken();
+      const status = httpAuthStatus();
+      if (opts.json) {
+        say(JSON.stringify({ ok: true, ...status, ...(opts.reveal ? { token: state.token } : {}) }));
+      } else if (opts.reveal) {
+        // Printed only on an explicit request: the token grants transport access.
+        say(state.token);
+      } else {
+        say(`令牌：${status.tokenHint}（加 --reveal 显示完整值）`);
+        say(`创建于：${status.createdAt}`);
+        if (status.rotatedAt) say(`轮换于：${status.rotatedAt}`);
+      }
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+machineAuth
+  .command("rotate")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { json: boolean }) => {
+    try {
+      const state = await withMachineSetupLock(async () => rotateHttpAuthToken());
+      const status = httpAuthStatus();
+      if (opts.json) say(JSON.stringify({ ok: true, ...status }));
+      else {
+        check("Bearer 令牌已轮换，旧令牌立即失效");
+        say(`新令牌：${status.tokenHint}（c2c machine auth show --reveal 显示完整值）`);
+        say("请在 ChatGPT 连接器中同步更新，否则调用会返回 401。");
       }
     } catch (error) {
       handleCliError(error, opts.json);
@@ -678,7 +709,7 @@ skill
 
 machine
   .command("start")
-  .description("Start or reuse the tunnel-owned machine gateway")
+  .description("Start or reuse the machine gateway")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { json: boolean }) => {
     try {
@@ -687,12 +718,12 @@ machine
       const payload = {
         ok: true,
         started: result.spawned,
-        tunnel: openAiTunnelRuntimeStatusView(result.tunnel),
+        transport: transportView(),
         runtime: machineRuntimeView(result.runtime),
         info,
       };
       if (opts.json) say(JSON.stringify(payload));
-      else check(result.spawned ? "机器级安全连接已启动" : "机器级安全连接已在运行");
+      else check(result.spawned ? "机器级 MCP 网关已启动" : "机器级 MCP 网关已在运行");
     } catch (error) {
       handleCliError(error, opts.json);
     }
@@ -700,7 +731,7 @@ machine
 
 machine
   .command("status")
-  .description("Inspect the managed tunnel and its exact gateway child")
+  .description("Inspect the machine gateway and its public endpoint")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { json: boolean }) => {
     try {
@@ -709,17 +740,14 @@ machine
         observation.gateway.state === "healthy"
           ? await machineInfo(observation.gateway.runtime)
           : null;
+      const transport = transportView();
       const payload = {
         ok: observation.ready,
-        configured: observation.config !== null,
         ready: observation.ready,
-        controlPlaneDown: observation.controlPlaneDown,
-        ...(observation.controlPlaneDown
-          ? { controlPlaneDetail: controlPlaneDownDetail(observation.tunnel) }
-          : {}),
-        config: tunnelConfigView(observation.config),
-        connector: localConnectorStatus(observation.config, observation.gateway.state === "healthy" ? observation.gateway.runtime : undefined),
-        tunnel: openAiTunnelRuntimeStatusView(observation.tunnel),
+        transport,
+        connector: localConnectorStatus(
+          observation.gateway.state === "healthy" ? observation.gateway.runtime : undefined
+        ),
         gateway: {
           ...machineRuntimeObservationView(observation.gateway),
           ...(info ? { info } : {}),
@@ -729,12 +757,13 @@ machine
         say(JSON.stringify(payload));
         if (!observation.ready) process.exitCode = 1;
       } else if (observation.ready && info) {
-        check(`机器级安全连接正常（${info.workspaceCount} 个已注册 workspace）`);
-      } else if (observation.controlPlaneDown) {
-        cross(controlPlaneDownDetail(observation.tunnel));
+        check(`机器级 MCP 网关正常（${info.workspaceCount} 个已注册 workspace）`);
+        say(`MCP 地址：${transport.mcpUrl}`);
+      } else if (observation.gateway.state !== "healthy") {
+        cross("机器级 MCP 网关未运行：运行 c2c machine start");
         process.exitCode = 1;
       } else {
-        cross(observation.config ? "机器级安全连接未就绪" : "机器级安全连接尚未配置");
+        cross("公网地址尚未配置：运行 c2c machine endpoint set --url <https://...>");
         process.exitCode = 1;
       }
     } catch (error) {
@@ -744,14 +773,14 @@ machine
 
 machine
   .command("stop")
-  .description("Stop the official tunnel supervisor and its gateway child")
+  .description("Stop the machine gateway")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { json: boolean }) => {
     try {
       const stopped = await stopMachineGateway();
       if (opts.json) say(JSON.stringify({ ok: true, stopped }));
-      else if (stopped) check("机器级安全连接已停止");
-      else say("机器级安全连接未运行。");
+      else if (stopped) check("机器级 MCP 网关已停止");
+      else say("机器级 MCP 网关未运行。");
     } catch (error) {
       handleCliError(error, opts.json);
     }
@@ -759,64 +788,69 @@ machine
 
 machine
   .command("doctor")
-  .description("Diagnose and optionally repair the machine-wide connection")
+  .description("Diagnose and optionally repair the machine-wide MCP gateway")
   .option("--no-fix", "diagnose only")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { fix: boolean; json: boolean }) => {
     try {
-      const config = readOpenAiTunnelConfig();
-      if (!config) {
-        const payload = {
-          ok: false,
-          configured: false,
-          setupRequired: true,
-          connector: { name: OPENAI_CONNECTOR_NAME, authentication: "none" },
-        };
-        if (opts.json) say(JSON.stringify(payload));
-        else cross("尚未配置 OpenAI Secure MCP Tunnel");
-        process.exitCode = 1;
-        return;
-      }
       let repaired = false;
-      let before = await observeManagedMachine({ config });
-      if (opts.fix && !before.ready) {
-        await ensureMachineGateway({ config });
+      let before = await observeManagedMachine();
+      if (opts.fix && before.gateway.state !== "healthy") {
+        await ensureMachineGateway();
         repaired = true;
-        before = await observeManagedMachine({ config });
+        before = await observeManagedMachine();
       }
-      const tunnelDoctor = doctorOpenAiTunnel(config);
       const info =
         before.gateway.state === "healthy"
           ? await machineInfo(before.gateway.runtime)
           : null;
-      const ok = before.ready && tunnelDoctor.ok && info !== null;
+      const auth = httpAuthStatus();
+      const transport = transportView();
+      const checks = [
+        {
+          id: "gateway",
+          ok: before.gateway.state === "healthy",
+          detail: before.gateway.state === "healthy"
+            ? `listening on ${MACHINE_HTTP_HOST}:${machineHttpPort()}`
+            : `gateway state is ${before.gateway.state}`,
+        },
+        {
+          id: "endpoint",
+          ok: before.endpoint !== null,
+          detail: before.endpoint
+            ? `${publicMcpUrl(before.endpoint)}`
+            : "no public URL recorded; run `c2c machine endpoint set --url <https://...>`",
+        },
+        {
+          id: "auth",
+          ok: auth.configured,
+          detail: auth.configured
+            ? `bearer token ${auth.tokenHint}`
+            : "no bearer token yet; run `c2c machine auth rotate`",
+        },
+      ];
+      const ok = before.gateway.state === "healthy" && checks.every((entry) => entry.ok) && info !== null;
       const payload = {
         ok,
-        configured: true,
         repaired,
-        controlPlaneDown: before.controlPlaneDown,
-        ...(before.controlPlaneDown
-          ? { controlPlaneDetail: controlPlaneDownDetail(before.tunnel) }
-          : {}),
-        config: tunnelConfigView(config),
-        tunnel: openAiTunnelRuntimeStatusView(before.tunnel),
+        transport,
+        checks,
         gateway: {
           ...machineRuntimeObservationView(before.gateway),
           ...(info ? { info } : {}),
         },
         info,
-        checks: tunnelDoctor.checks,
       };
       if (opts.json) {
         say(JSON.stringify(payload));
         if (!ok) process.exitCode = 1;
       } else if (ok) {
-        check(repaired ? "机器级安全连接已修复" : "机器级安全连接健康");
-      } else if (before.controlPlaneDown) {
-        cross(controlPlaneDownDetail(before.tunnel));
-        process.exitCode = 1;
+        check(repaired ? "机器级 MCP 网关已修复" : "机器级 MCP 网关健康");
+        say(`MCP 地址：${transport.mcpUrl}`);
       } else {
-        cross("机器级安全连接仍未就绪");
+        for (const entry of checks.filter((candidate) => !candidate.ok)) {
+          cross(`${entry.id}: ${entry.detail}`);
+        }
         process.exitCode = 1;
       }
     } catch (error) {
@@ -1414,7 +1448,7 @@ session
       const payload = {
         ok: true,
         connectorName: boundConnectorName(machine.runtime) ?? null,
-        connector: localConnectorStatus(undefined, machine.runtime),
+        connector: localConnectorStatus(machine.runtime),
         sessionIdentity,
         session: saved,
         conversation,
@@ -1617,10 +1651,8 @@ control
       if (ACTIVE_CONTROL_RESULT_TRANSPORT === "computer_use" && scopes.includes("c2c.result.write")) {
         throw new Error("c2c.result.write is temporarily disabled while Computer Use is the active result transport");
       }
-      const connectorConfig = readOpenAiTunnelConfig();
-      if (!connectorConfig) throw new Error("Machine Tunnel configuration is unavailable.");
       const connector = scopes.length > 0 || correlation.phase === "BOOT"
-        ? requireMachineConnector(localConnectorMachine(connectorConfig, machine.runtime))
+        ? requireMachineConnector(localConnectorMachine(machine.runtime))
         : undefined;
       const pluginPreflight = opts.pluginPreflight === undefined ? undefined : pluginPreflightSchema.parse(JSON.parse(opts.pluginPreflight));
       if (pluginIntent === "task" && pluginPreflight?.plugins.some((plugin) => plugin.usesGitHub || /github/i.test(plugin.id))) {

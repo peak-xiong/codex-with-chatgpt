@@ -11,20 +11,19 @@ const projectUrl = "https://chatgpt.com/g/g-p-storage/project";
 const chatUrl = "https://chatgpt.com/g/g-p-storage/c/one";
 
 describe("cross-process repository session storage", () => {
-  it("merges CLI checkpoints and tunnel-child routes into the same repository file", () => {
+  it("merges CLI checkpoints and gateway routes into the same repository file", () => {
     const root = makeTmpDir("session-storage-repo");
     const stateRoot = makeTmpDir("session-storage-machine");
     try {
       makeGitRepo(root);
-      const run = (tunnel: boolean, action: string) => {
+      const run = (machineScoped: boolean, action: string) => {
         const env = { ...process.env };
         delete env.C2C_STATE_DIR;
         const result = spawnSync(process.execPath, ["--import", "tsx/esm", "--input-type=module", "-e", `
           import { Workspace } from ${JSON.stringify(sourceUrl("workspace/manager.ts"))};
           import { getWorkspaceDataDir, getProjectDataDir } from ${JSON.stringify(sourceUrl("config/paths.ts"))};
           import { updateSession, commitSessionRoute, readSession, threadSessionFile } from ${JSON.stringify(sourceUrl("session/state.ts"))};
-          import { minimalTunnelEnvironment } from ${JSON.stringify(sourceUrl("tunnel/openai-secure.ts"))};
-          ${tunnel ? `process.env.C2C_STATE_DIR = minimalTunnelEnvironment(${JSON.stringify(stateRoot)}).C2C_STATE_DIR;` : ""}
+            ${machineScoped ? `process.env.C2C_STATE_DIR = ${JSON.stringify(stateRoot)};` : ""}
           const ws = new Workspace(${JSON.stringify(root)});
           ${action}
           console.log(JSON.stringify({ file: threadSessionFile(ws.id, "local-one"),

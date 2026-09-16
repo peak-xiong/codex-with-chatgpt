@@ -90,13 +90,21 @@ describe("machine CLI lifecycle", () => {
     delete process.env.C2C_STATE_DIR;
   });
 
-  it("reuses one tunnel-owned machine gateway and routes an exact workspace turn", () => {
+  it("reuses one machine gateway and routes an exact workspace turn", () => {
     const started = runJson(stateDir, ["machine", "start"]);
     expect(started.command.status, JSON.stringify(started)).toBe(0);
     expect(started.body).toMatchObject({ ok: true, started: false });
     expect(started.body.runtime).not.toHaveProperty("adminToken");
     expect(JSON.stringify(started.body)).not.toContain("associationNonce");
     expect((started.body.info as Record<string, unknown>).workspaceCount).toBe(0);
+
+      // A healthy gateway is not "ready" until the public URL a tunnel
+      // forwards to has been recorded, so record it first.
+      const endpoint = runJson(stateDir, [
+        "machine", "endpoint", "set", "--url", "https://c2c-test.ngrok-free.dev",
+      ]);
+      expect(endpoint.command.status, JSON.stringify(endpoint)).toBe(0);
+      expect(endpoint.body).toMatchObject({ mcpUrl: "https://c2c-test.ngrok-free.dev/mcp" });
 
     const status = runJson(stateDir, ["machine", "status"]);
     expect(status.command.status).toBe(0);

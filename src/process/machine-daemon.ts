@@ -1,40 +1,27 @@
+import { spawn, type ChildProcess } from "node:child_process";
 import path from "node:path";
 import { ensureDir, getStateDir, withFileLockAsync } from "../config/paths.js";
 import { runtimeEntryPath } from "../config/runtime-install.js";
 import {
   clearMachineRuntime,
   observeMachineRuntime,
+  probeMachineRuntime,
   readMachineRuntime,
   type MachineRuntimeObservation,
   type MachineRuntimeState,
 } from "../gateway/runtime.js";
-import {
-  connectOpenAiTunnel,
-  openAiTunnelIdentityMatchesConfig,
-  openAiTunnelStatusMatchesConfig,
-  readOpenAiTunnelConfig,
-  statusOpenAiTunnel,
-  stopOpenAiTunnel,
-  type OpenAiTunnelConfig,
-  type OpenAiTunnelDependencies,
-  type OpenAiTunnelRuntimeStatus,
-  type OpenAiTunnelStopResult,
-} from "../tunnel/openai-secure.js";
+import { publicEndpointStatus, type PublicEndpoint } from "../config/public-endpoint.js";
 
-/** Turns a control-plane outage into one plain sentence for logs and status. */
-export function controlPlaneDownDetail(tunnel: OpenAiTunnelRuntimeStatus | null): string {
-  const poll = tunnel?.controlPlanePoll;
-  const reason = tunnel?.controlPlanePollReason;
-  const suffix = poll === "degraded" ? " (tunnel reports a degraded poll)"
-    : poll === "unknown" ? " (tunnel reports no live poll snapshot)"
-    : "";
-  return [
-    "The managed OpenAI tunnel cannot reach api.openai.com for its control-plane poll,",
-    "so ChatGPT cannot deliver MCP calls to this machine.",
-    "The local gateway is healthy and the tunnel still owns it; this is a network egress problem,",
-    "not a second gateway. Check the proxy or DNS path to api.openai.com before restarting.",
-  ].join(" ") + suffix + (reason ? ` Reported reason: ${reason}` : "");
-}
+/**
+ * Supervises the one machine-wide MCP gateway.
+ *
+ * Previously the official OpenAI Secure MCP Tunnel owned this process as its
+ * stdio child, and the tunnel runtime key authenticated the transport. That
+ * transport cannot connect on a network that resets the OpenAI endpoint at the
+ * TLS SNI layer, so the gateway is now started directly and reached through a
+ * public tunnel that forwards to a fixed loopback port. Because the transport
+ * no longer authenticates anything, `POST /mcp` requires a bearer token.
+ */
 
 const MACHINE_START_LOCK_TIMEOUT_MS = 25_000;
 const MACHINE_START_LOCK_STALE_MS = 3 * 60_000;
@@ -45,61 +32,56 @@ const DEFAULT_STOP_TIMEOUT_MS = 20_000;
 const DEFAULT_POLL_INTERVAL_MS = 250;
 const MACHINE_OPERATION_LOCK_FILE = "machine-gateway.lock";
 
-export interface ManagedTunnelFunctions {
-  connect: (
-    config: OpenAiTunnelConfig,
-    mcpCommand: string,
-    dependencies?: OpenAiTunnelDependencies
-  ) => OpenAiTunnelRuntimeStatus;
-  status: (
-    config: OpenAiTunnelConfig,
-    dependencies?: OpenAiTunnelDependencies
-  ) => OpenAiTunnelRuntimeStatus;
-  stop: (
-    config: OpenAiTunnelConfig,
-    dependencies?: OpenAiTunnelDependencies
-  ) => OpenAiTunnelStopResult;
+/**
+ * The loopback port a tunnel forwards to. It is a recorded value rather than
+ * an ephemeral one: the tunnel configuration points at it, so a port that
+ * changes between starts would silently break the public endpoint.
+ */
+export const DEFAULT_MACHINE_HTTP_PORT = 48_765;
+export const MACHINE_HTTP_HOST = "127.0.0.1";
+
+/**
+ * Resolve the port. `C2C_HTTP_PORT` exists so parallel tests can each own a
+ * distinct port; production always uses the default, which is the value the
+ * tunnel is configured against.
+ */
+export function machineHttpPort(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.C2C_HTTP_PORT?.trim();
+  if (!raw) return DEFAULT_MACHINE_HTTP_PORT;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65_535) {
+    throw new Error("C2C_HTTP_PORT must be a valid TCP port");
+  }
+  return parsed;
 }
 
 export interface EnsureMachineGatewayOptions {
   startTimeoutMs?: number;
   pollIntervalMs?: number;
-  config?: OpenAiTunnelConfig;
-  tunnelDependencies?: OpenAiTunnelDependencies;
-  tunnelFunctions?: Partial<ManagedTunnelFunctions>;
-  /** Require connect() to produce a gateway with a new ownership epoch. */
+  /** Require a gateway with a new ownership epoch. */
   requireFreshRuntime?: boolean;
-  previousRuntime?: MachineRuntimeState | null;
   /** Internal setup path: the caller already owns the machine operation lock. */
   machineLockHeld?: boolean;
+  /** Test seam: launch the gateway in-process instead of spawning a child. */
+  spawnImpl?: typeof spawn;
 }
 
 export interface EnsureMachineGatewayResult {
   runtime: MachineRuntimeState;
   spawned: boolean;
-  tunnel: OpenAiTunnelRuntimeStatus;
+  endpoint: PublicEndpoint | null;
 }
 
 export interface StopMachineGatewayOptions {
   stopTimeoutMs?: number;
   pollIntervalMs?: number;
-  config?: OpenAiTunnelConfig;
-  tunnelDependencies?: OpenAiTunnelDependencies;
-  tunnelFunctions?: Partial<ManagedTunnelFunctions>;
-  /** Internal setup path: the caller already owns the machine operation lock. */
   machineLockHeld?: boolean;
 }
 
 export interface ManagedMachineObservation {
-  config: OpenAiTunnelConfig | null;
-  tunnel: OpenAiTunnelRuntimeStatus | null;
-  gateway: MachineRuntimeObservation;
+  endpoint: PublicEndpoint | null;
   ready: boolean;
-  /**
-   * The gateway is healthy and provably owned by this machine's managed
-   * tunnel, but that tunnel cannot reach its control plane.
-   */
-  controlPlaneDown: boolean;
+  gateway: MachineRuntimeObservation;
 }
 
 /** One startup lock for the whole machine, independent of any workspace. */
@@ -111,7 +93,7 @@ export function withMachineStartLock<T>(action: () => Promise<T>): Promise<T> {
   });
 }
 
-/** Serialize the complete machine setup transaction, including tunnel replacement. */
+/** Serialize the complete machine setup transaction. */
 export function withMachineSetupLock<T>(action: () => Promise<T>): Promise<T> {
   const lockFile = path.join(ensureDir(path.join(getStateDir(), "locks")), MACHINE_OPERATION_LOCK_FILE);
   return withFileLockAsync(lockFile, action, {
@@ -124,47 +106,6 @@ function positiveInteger(value: number | undefined, fallback: number, label: str
   const result = value ?? fallback;
   if (!Number.isSafeInteger(result) || result < 1) throw new Error(`${label} must be a positive integer`);
   return result;
-}
-
-function requireConfig(config?: OpenAiTunnelConfig): OpenAiTunnelConfig {
-  const resolved = config ?? readOpenAiTunnelConfig();
-  if (!resolved) {
-    throw new Error(
-      "OpenAI Secure MCP Tunnel is not configured. Run `c2c machine setup --tunnel-id ... --runtime-key-file ...` first."
-    );
-  }
-  return resolved;
-}
-
-function tunnelFunctions(overrides: Partial<ManagedTunnelFunctions> = {}): ManagedTunnelFunctions {
-  return {
-    connect: overrides.connect ?? connectOpenAiTunnel,
-    status: overrides.status ?? statusOpenAiTunnel,
-    stop: overrides.stop ?? stopOpenAiTunnel,
-  };
-}
-
-function quoteCommandArgument(value: string): string {
-  if (!value || /[\r\n\0]/.test(value)) throw new Error("machine MCP command argument is invalid");
-  return `"${value.replace(/(["\\$`])/g, "\\$1")}"`;
-}
-
-/** Exact stdio command supervised by the official tunnel runtime. */
-export function machineMcpCommand(config: OpenAiTunnelConfig): string {
-  // The tunnel config is persisted under this state root. Do not resolve the
-  // runtime through the caller's ambient C2C_STATE_DIR: setup may be invoked
-  // by a process whose environment differs from the machine service.
-  const stateRoot = path.dirname(path.dirname(path.resolve(config.profileDir)));
-  return [
-    process.execPath,
-    runtimeEntryPath(stateRoot),
-    "serve-machine",
-    "--stdio",
-    "--port",
-    "0",
-  ]
-    .map(quoteCommandArgument)
-    .join(" ");
 }
 
 function sameRuntimeIdentity(left: MachineRuntimeState, right: MachineRuntimeState): boolean {
@@ -185,318 +126,110 @@ function uncertain(observation: Extract<MachineRuntimeObservation, { state: "unk
 }
 
 /**
- * True when the running tunnel is provably this machine's managed runtime and
- * only its readiness flag is down. That distinction matters: a tunnel whose
- * control-plane poll cannot reach OpenAI still owns the exact stdio child, so
- * the local gateway is not an unauthorized second broker. Reporting it as one
- * sends the operator after a nonexistent split process instead of the egress
- * failure that actually broke the connection.
+ * The exact command a spawned gateway runs. Resolved from the installed
+ * runtime rather than the caller's checkout so a CLI run from a source tree
+ * still supervises the deployed gateway.
  */
-function tunnelIdentityIntact(
-  config: OpenAiTunnelConfig,
-  tunnel: OpenAiTunnelRuntimeStatus,
-  gateway: MachineRuntimeObservation
-): boolean {
-  if (tunnel.ok || !gateway.runtime) return false;
-  if (!tunnel.processRunning) return false;
-  return openAiTunnelIdentityMatchesConfig(
-    config,
-    tunnel,
-    machineMcpCommand(config),
-    gateway.runtime.pid
-  );
+export function machineHttpCommand(stateRoot: string = getStateDir()): {
+  command: string;
+  args: string[];
+} {
+  return {
+    command: process.execPath,
+    args: [runtimeEntryPath(stateRoot), "serve-http", "--port", String(machineHttpPort())],
+  };
 }
 
-function assertManagedPair(
-  config: OpenAiTunnelConfig,
-  tunnel: OpenAiTunnelRuntimeStatus,
-  gateway: MachineRuntimeObservation
-): MachineRuntimeState | null {
-  if (tunnel.ok && gateway.state === "healthy") {
-    if (
-      gateway.runtime.associationId !== config.associationId ||
-      gateway.runtime.associationNonce !== config.associationNonce
-    ) {
-      throw new Error(
-        "The machine gateway is healthy, but it is not the exact child of the configured OpenAI tunnel runtime."
-      );
-    }
-    if (!openAiTunnelStatusMatchesConfig(config, tunnel, machineMcpCommand(config), gateway.runtime.pid)) {
-      throw new Error(
-        "The OpenAI tunnel runtime is healthy, but its tunnel, profile, or stdio command does not match the configured machine gateway."
-      );
-    }
-    return gateway.runtime;
-  }
-  if (gateway.state === "healthy" && !tunnel.ok) {
-    if (tunnelIdentityIntact(config, tunnel, gateway)) {
-      throw new Error(controlPlaneDownDetail(tunnel));
-    }
-    throw new Error(
-      "A machine gateway is running outside the configured OpenAI tunnel runtime; refusing to create a split broker."
-    );
-  }
-  if (gateway.state === "unknown") throw uncertain(gateway);
-  return null;
-}
-
-function assertManagedIdentity(
-  config: OpenAiTunnelConfig,
-  tunnel: OpenAiTunnelRuntimeStatus,
-  gateway: MachineRuntimeObservation,
-): void {
-  const runtime = gateway.runtime;
-  if (tunnel.processRunning && !runtime) {
-    throw new Error(
-      "The configured OpenAI tunnel alias is running, but the machine gateway ownership record is missing; refusing to stop it."
-    );
-  }
-  const expectedPid = runtime?.pid;
-  if (runtime && (
-    runtime.associationId !== config.associationId ||
-    runtime.associationNonce !== config.associationNonce
-  )) {
-    throw new Error(
-      "The machine gateway is not the exact child of the configured OpenAI tunnel runtime."
-    );
-  }
-  if (!openAiTunnelIdentityMatchesConfig(config, tunnel, machineMcpCommand(config), expectedPid)) {
-    throw new Error(
-      "The OpenAI tunnel runtime is not the exact configured machine gateway; refusing to stop it."
-    );
-  }
-}
-
-/**
- * A tunnel alias is mutable, so an already-running process must be proven to
- * be ours before connect() is allowed to operate on it. A missing gateway
- * record cannot prove the association that the tunnel-owned child inherited;
- * reject that case instead of replacing an unknown process by alias.
- */
-function assertExistingTunnelIdentity(
-  config: OpenAiTunnelConfig,
-  tunnel: OpenAiTunnelRuntimeStatus,
-  gateway: MachineRuntimeObservation,
-): void {
-  if (!tunnel.processRunning) return;
-  if (!gateway.runtime) {
-    throw new Error(
-      "The configured OpenAI tunnel alias is already running, but its machine gateway ownership record is missing; refusing to replace it."
-    );
-  }
-  if (
-    gateway.runtime.associationId !== config.associationId ||
-    gateway.runtime.associationNonce !== config.associationNonce
-  ) {
-    throw new Error(
-      "The configured OpenAI tunnel alias is already running, but its machine gateway association does not match; refusing to replace it."
-    );
-  }
-  const expectedPid = gateway.runtime.pid;
-  if (!openAiTunnelIdentityMatchesConfig(config, tunnel, machineMcpCommand(config), expectedPid)) {
-    throw new Error(
-      "The configured OpenAI tunnel alias is already running, but its tunnel, profile, stdio command, or process identity does not match; refusing to replace it."
-    );
-  }
-}
-
-function gatewayAssociationMatchesConfig(
-  config: OpenAiTunnelConfig,
-  gateway: MachineRuntimeObservation,
-): boolean {
-  return gateway.runtime !== null &&
-    gateway.runtime.associationId === config.associationId &&
-    gateway.runtime.associationNonce === config.associationNonce;
-}
-
-export async function observeManagedMachine(
-  options: Pick<EnsureMachineGatewayOptions, "config" | "tunnelDependencies" | "tunnelFunctions"> = {}
-): Promise<ManagedMachineObservation> {
-  const config = options.config ?? readOpenAiTunnelConfig();
+/** Observe the gateway and the recorded public endpoint without starting anything. */
+export async function observeManagedMachine(): Promise<ManagedMachineObservation> {
   const gateway = await observeMachineRuntime();
-  if (!config) return { config: null, tunnel: null, gateway, ready: false, controlPlaneDown: false };
-  const tunnel = tunnelFunctions(options.tunnelFunctions).status(config, options.tunnelDependencies);
-  const ready = (() => {
-    try {
-      return assertManagedPair(config, tunnel, gateway) !== null;
-    } catch {
-      return false;
-    }
-  })();
-  const controlPlaneDown =
-    gateway.state === "healthy" && !ready && tunnelIdentityIntact(config, tunnel, gateway);
-  return { config, tunnel, gateway, ready, controlPlaneDown };
-}
-
-/** Observe the restored configuration before starting anything in rollback. */
-export async function restoreMachineGateway(
-  options: EnsureMachineGatewayOptions = {},
-): Promise<EnsureMachineGatewayResult> {
-  const observation = await observeManagedMachine(options);
-  if (observation.ready && observation.gateway.state === "healthy" && observation.tunnel) {
-    return {
-      runtime: observation.gateway.runtime,
-      spawned: false,
-      tunnel: observation.tunnel,
-    };
-  }
-  return ensureMachineGateway(options);
+  const endpoint = publicEndpointStatus();
+  return { endpoint, ready: gateway.state === "healthy" && endpoint !== null, gateway };
 }
 
 /**
- * Reuse the tunnel-owned stdio gateway or ask tunnel-client to start it. This
- * function never spawns a standalone gateway process.
+ * Reuse a healthy gateway or start one. The gateway is spawned directly, so
+ * this no longer depends on a third-party supervisor being reachable.
  */
 export async function ensureMachineGateway(
   options: EnsureMachineGatewayOptions = {}
 ): Promise<EnsureMachineGatewayResult> {
-  const config = requireConfig(options.config);
-  const functions = tunnelFunctions(options.tunnelFunctions);
-  const requireFreshRuntime = options.requireFreshRuntime === true;
   const startTimeoutMs = positiveInteger(options.startTimeoutMs, DEFAULT_START_TIMEOUT_MS, "machine start timeout");
   const pollIntervalMs = positiveInteger(options.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS, "machine poll interval");
-  const initialTunnel = functions.status(config, options.tunnelDependencies);
-  const initialGateway = await observeMachineRuntime();
-  if (!requireFreshRuntime) {
-    const existing = assertManagedPair(config, initialTunnel, initialGateway);
-    if (existing) return { runtime: existing, spawned: false, tunnel: initialTunnel };
-  }
 
   const start = async (): Promise<EnsureMachineGatewayResult> => {
-    const currentTunnel = functions.status(config, options.tunnelDependencies);
-    const currentGateway = await observeMachineRuntime();
-    assertExistingTunnelIdentity(config, currentTunnel, currentGateway);
-    if (requireFreshRuntime) {
-      if (currentGateway.state === "healthy") {
-        throw new Error("A gateway is already healthy; refusing to reuse it while replacing the tunnel.");
+    const current = await observeMachineRuntime();
+    if (current.state === "unknown" && current.reason !== "probe_failed") throw uncertain(current);
+    if (options.requireFreshRuntime) {
+      if (current.state === "healthy") {
+        throw new Error("A gateway is already healthy; refusing to reuse it while replacing the transport.");
       }
-      if (currentGateway.state === "unknown" && currentGateway.reason !== "probe_failed") {
-        throw uncertain(currentGateway);
-      }
-    } else {
-      const current = assertManagedPair(config, currentTunnel, currentGateway);
-      if (current) return { runtime: current, spawned: false, tunnel: currentTunnel };
+    } else if (current.state === "healthy") {
+      return { runtime: current.runtime, spawned: false, endpoint: publicEndpointStatus() };
     }
-    if (currentGateway.state === "stopped" && currentGateway.runtime) {
-      if (gatewayAssociationMatchesConfig(config, currentGateway)) {
-        clearRuntimeIfMatches(currentGateway.runtime);
-      }
-    }
+    if (current.state === "stopped" && current.runtime) clearRuntimeIfMatches(current.runtime);
 
-    let connected: OpenAiTunnelRuntimeStatus | null = null;
-    const tunnelWasRunning = currentTunnel.processRunning;
-    let connectAttempted = false;
-    try {
-      connectAttempted = true;
-      connected = functions.connect(
-        config,
-      machineMcpCommand(config),
-        options.tunnelDependencies
-      );
-      const deadline = Date.now() + startTimeoutMs;
-      for (;;) {
-        const gateway = await observeMachineRuntime();
-        if (gateway.state === "healthy") {
-          const tunnel = functions.status(config, options.tunnelDependencies);
-        const runtime = assertManagedPair(config, tunnel, gateway);
-          if (runtime) {
-            const previous = options.previousRuntime;
-            if (requireFreshRuntime && previous && sameRuntimeIdentity(runtime, previous)) {
-              throw new Error("OpenAI tunnel connected, but the machine gateway ownership epoch did not change.");
-            }
-            return { runtime, spawned: true, tunnel };
-          }
-        } else if (gateway.state === "unknown" && gateway.reason !== "probe_failed") {
-          throw uncertain(gateway);
-        }
-        if (Date.now() >= deadline) break;
-        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    const { command, args } = machineHttpCommand();
+    const spawnImpl = options.spawnImpl ?? spawn;
+    const child: ChildProcess = spawnImpl(command, args, {
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, C2C_STATE_DIR: getStateDir() },
+    });
+    const childPid = child.pid;
+    if (!childPid) throw new Error("The machine gateway process could not be started");
+    child.unref();
+
+    const deadline = Date.now() + startTimeoutMs;
+    for (;;) {
+      const gateway = await observeMachineRuntime();
+      if (gateway.state === "healthy") {
+        return { runtime: gateway.runtime, spawned: true, endpoint: publicEndpointStatus() };
       }
-      throw new Error(
-        `OpenAI tunnel reported ready but its machine gateway did not become healthy within ${startTimeoutMs}ms (${connected.detail}).`
-      );
-    } catch (error) {
-      let cleanupError: unknown;
-      try {
-        if (!connectAttempted || tunnelWasRunning) {
-          throw new Error("startup cleanup skipped because this call did not establish a new tunnel runtime");
+      if (gateway.state === "unknown" && gateway.reason !== "probe_failed") throw uncertain(gateway);
+      if (Date.now() >= deadline) {
+        try {
+          process.kill(childPid, "SIGTERM");
+        } catch {
+          // The child may already be gone.
         }
-        const cleanupTunnel = functions.status(config, options.tunnelDependencies);
-        if (
-          !cleanupTunnel.processRunning ||
-          !openAiTunnelIdentityMatchesConfig(config, cleanupTunnel, machineMcpCommand(config))
-        ) {
-          throw new Error("startup cleanup skipped because the tunnel runtime was not observed as a new exact match");
-        }
-        const cleanupGatewayBefore = await observeMachineRuntime();
-        if (
-          cleanupGatewayBefore.runtime &&
-          !gatewayAssociationMatchesConfig(config, cleanupGatewayBefore)
-        ) {
-          throw new Error("startup cleanup skipped because the machine gateway association is not an exact match");
-        }
-        functions.stop(config, options.tunnelDependencies);
-        const cleanupDeadline = Date.now() + Math.min(DEFAULT_STOP_TIMEOUT_MS, startTimeoutMs);
-        for (;;) {
-          const gateway = await observeMachineRuntime();
-          if (gateway.state === "stopped") {
-            if (gateway.runtime && gatewayAssociationMatchesConfig(config, gateway)) {
-              clearRuntimeIfMatches(gateway.runtime);
-            }
-            break;
-          }
-          if (Date.now() >= cleanupDeadline) {
-            throw new Error("the partially started machine gateway did not stop before the cleanup deadline");
-          }
-          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-        }
-      } catch (failure) {
-        cleanupError = failure;
+        throw new Error("The machine gateway did not become healthy before the startup deadline.");
       }
-      if (cleanupError) {
-        const original = error instanceof Error ? error.message : String(error);
-        const cleanup = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-        throw new Error(`${original}; startup cleanup failed: ${cleanup}`, { cause: error });
-      }
-      throw error;
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
   };
+
+  const initial = await observeMachineRuntime();
+  if (!options.requireFreshRuntime && initial.state === "healthy") {
+    return { runtime: initial.runtime, spawned: false, endpoint: publicEndpointStatus() };
+  }
   return options.machineLockHeld ? start() : withMachineStartLock(start);
 }
 
-/** Stop the supervisor first; never ask its child to shut down and be restarted. */
+/** Stop the gateway this machine owns. */
 export async function stopMachineGateway(options: StopMachineGatewayOptions = {}): Promise<boolean> {
   const stop = async (): Promise<boolean> => {
-    const config = options.config ?? readOpenAiTunnelConfig();
-    if (!config) {
-      const gateway = await observeMachineRuntime();
-      if (gateway.state === "stopped" && gateway.runtime) clearRuntimeIfMatches(gateway.runtime);
-      if (gateway.state === "healthy" || gateway.state === "unknown") {
-        throw new Error("Machine gateway exists without OpenAI tunnel ownership; refusing an unauthenticated shutdown.");
-      }
+    const before = await observeMachineRuntime();
+    if (before.state === "unknown" && before.reason !== "probe_failed") throw uncertain(before);
+    if (before.state === "stopped") {
+      if (before.runtime) clearRuntimeIfMatches(before.runtime);
       return false;
     }
-    const functions = tunnelFunctions(options.tunnelFunctions);
-    const before = functions.status(config, options.tunnelDependencies);
-    const gatewayBefore = await observeMachineRuntime();
-    if (gatewayBefore.state === "unknown" && gatewayBefore.reason !== "probe_failed") {
-      throw uncertain(gatewayBefore);
+    const runtime = before.runtime;
+    if (!runtime) {
+      throw new Error("The machine gateway is healthy but has no ownership record; refusing to stop it.");
     }
-    if (!before.processRunning && gatewayBefore.state === "stopped") {
-      if (
-        gatewayBefore.runtime &&
-        gatewayBefore.runtime.associationId === config.associationId &&
-        gatewayBefore.runtime.associationNonce === config.associationNonce
-      ) {
-        clearRuntimeIfMatches(gatewayBefore.runtime);
-      }
-      return false;
+    // A runtime record outlives a crash, and a recycled PID would otherwise be
+    // killed. The gateway's own health payload is the only proof the live
+    // process is ours.
+    if ((await probeMachineRuntime(runtime)) === null) {
+      throw new Error("The running machine gateway does not match this machine's ownership record; refusing to stop it.");
     }
-    if (!before.processRunning) {
-      throw new Error("The configured OpenAI tunnel is not running; refusing to stop a live gateway outside its supervisor.");
+    try {
+      process.kill(runtime.pid, "SIGTERM");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
     }
-    assertManagedIdentity(config, before, gatewayBefore);
-    functions.stop(config, options.tunnelDependencies);
     const stopTimeoutMs = positiveInteger(options.stopTimeoutMs, DEFAULT_STOP_TIMEOUT_MS, "machine stop timeout");
     const pollIntervalMs = positiveInteger(options.pollIntervalMs, DEFAULT_POLL_INTERVAL_MS, "machine poll interval");
     const deadline = Date.now() + stopTimeoutMs;
@@ -504,14 +237,22 @@ export async function stopMachineGateway(options: StopMachineGatewayOptions = {}
       const gateway = await observeMachineRuntime();
       if (gateway.state === "stopped") {
         if (gateway.runtime) clearRuntimeIfMatches(gateway.runtime);
-        return before.processRunning || gatewayBefore.state !== "stopped";
+        return true;
       }
       if (gateway.state === "unknown" && gateway.reason !== "probe_failed") throw uncertain(gateway);
       if (Date.now() >= deadline) {
-        throw new Error("OpenAI tunnel stopped, but its machine gateway did not exit before the shutdown deadline.");
+        throw new Error("The machine gateway did not exit before the shutdown deadline.");
       }
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
   };
   return options.machineLockHeld ? stop() : withMachineStartLock(stop);
+}
+
+/** Restart the gateway so a transport change takes effect on a fresh epoch. */
+export async function restartMachineGateway(
+  options: EnsureMachineGatewayOptions = {}
+): Promise<EnsureMachineGatewayResult> {
+  await stopMachineGateway({ machineLockHeld: options.machineLockHeld }).catch(() => undefined);
+  return ensureMachineGateway({ ...options, requireFreshRuntime: true });
 }

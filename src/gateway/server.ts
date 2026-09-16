@@ -13,6 +13,9 @@ import { browserTabIdSchema } from "../session/browser-tab-id.js";
 import { parseControlPageObservation } from "../control/wait-policy.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { createMcpServer } from "../mcp/server.js";
+import { createMcpHttpHandler } from "../mcp/http.js";
+import { verifyHttpAuthToken } from "../config/http-auth.js";
+import { newAssociationNonce, resolveMachineAssociation } from "./association.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
 import { requireCurrentTurnSurface } from "./machine-gateway.js";
 import { resolveMachineIdentity, type MachineIdentity } from "./identity.js";
@@ -170,6 +173,12 @@ export interface MachineGatewayServerOptions extends MachineGatewayOptions {
   logger?: Logger;
   persistRuntime?: boolean;
   connectStdio?: boolean;
+  /**
+   * Serve MCP over HTTP at `POST /mcp`, guarded by a bearer token. Used when
+   * the machine is exposed through a public tunnel instead of the official
+   * Secure MCP Tunnel, which authenticated the transport for us.
+   */
+  connectHttp?: boolean;
   exitOnShutdown?: boolean;
   associationId?: string;
   associationNonce?: string;
@@ -251,9 +260,10 @@ export async function startMachineGatewayServer(
     logger = nullLogger,
     persistRuntime = true,
     connectStdio = false,
+    connectHttp = false,
     exitOnShutdown = false,
-    associationId = `assoc-${randomBytes(16).toString("hex")}`,
-    associationNonce = randomBytes(32).toString("base64url"),
+    associationId = resolveMachineAssociation().associationId,
+    associationNonce = newAssociationNonce(),
   } = options;
   if (host !== "127.0.0.1" && host !== "::1" && host !== "localhost") {
     throw new Error("The machine control server only binds to a loopback address.");
@@ -663,6 +673,31 @@ export async function startMachineGatewayServer(
       });
     }, 20);
   });
+
+  if (connectHttp) {
+    // A public tunnel forwards the whole path, so /mcp is reachable from the
+    // internet. The bearer check below is the only thing separating it from an
+    // anonymous client; it is not optional. Inside the handler the normal turn
+    // capability rules still apply, so this token alone grants no workspace
+    // access.
+    app.all("/mcp", express.json({ limit: "8mb" }), (req, res, next) => {
+      const header = req.headers.authorization ?? "";
+      const presented = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : null;
+      if (!verifyHttpAuthToken(presented)) {
+        res
+          .status(401)
+          .set("WWW-Authenticate", 'Bearer realm="c2c"')
+          .json({ error: "unauthorized", error_description: "A valid bearer token is required" });
+        return;
+      }
+      next();
+    }, (req, res) => {
+      void createMcpHttpHandler(
+        () => createMcpServer({ gateway, logger, machine: { machineId: identity.machineId, associationId } }),
+        logger
+      )(req, res);
+    });
+  }
 
   if (connectStdio) {
     try {
