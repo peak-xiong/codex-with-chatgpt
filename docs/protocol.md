@@ -373,8 +373,13 @@ phase that may use a candidate lease without a chat URL:
 c2c control open \
   --local-session <local-session-id> --task <boot-task-id> \
   --iteration 0 --phase BOOT \
-  --scopes workspace.read --ttl-ms 300000 --json
+  --scopes workspace.read --json
 ```
+
+Keep the request TTL at the 30-minute default. A BOOT round trip includes
+human-paced steps (typing the boot prompt, waiting for the ChatGPT reply,
+posting the observation), so a short TTL such as `--ttl-ms 300000` regularly
+expires before the result arrives and the request is lost as `expired`.
 
 The returned request records the exact candidate `surfaceGeneration` and
 `surfaceTabId`. Both must match at commit; a retained pre-v2 request whose tab

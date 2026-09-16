@@ -1661,7 +1661,7 @@ control
       const machine = machineContext;
       const surface = await getMachineSurface(machine.runtime, machine.identity);
       const page = surface.lease;
-      if (!page) throw new Error("Claim this local session's ChatGPT page before opening a control turn.");
+      if (!page) throw new Error("Claim this local session's ChatGPT page before opening a control turn. (No active page lease — it expires after the lease TTL. Re-run surface claim, then this command.)");
       const binding = surface.binding;
       if (correlation.phase !== "BOOT" && (
         !binding ||
@@ -1670,7 +1670,7 @@ control
         binding.projectUrl !== page.projectUrl ||
         binding.chatUrl !== page.chatUrl
       )) {
-        throw new Error("Commit this local session's verified ChatGPT page before opening a control turn.");
+        throw new Error("Commit this local session's verified ChatGPT page before opening a control turn. (BOOT must come first; run surface claim then control open with phase BOOT, then surface commit.)");
       }
       const plugins = opts.plugins?.split(",").map((id) => id.trim());
       const pluginIntent = pluginIntentSchema.parse(opts.pluginIntent ?? "task");

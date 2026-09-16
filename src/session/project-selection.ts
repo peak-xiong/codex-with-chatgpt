@@ -53,7 +53,7 @@ export function validateProjectSelection(
     throw new Error("Project selection evidence does not match the requested Project URL.");
   }
   const age = now - Date.parse(selection.observedAt);
-  if (age < 0 || age > 5 * 60_000) throw new Error("Project selection evidence is stale; observe the candidate again.");
+  if (age < 0 || age > 5 * 60_000) throw new Error(`Project selection evidence is stale (observed ${Math.round(age / 1000)}s ago; window is 300s). Re-observe the candidate and claim immediately in the same step.`);
   if (selection.source === "created" && selection.observedTitle !== workspaceName) {
     throw new Error("Created Project title does not match this workspace; do not adopt another Project.");
   }

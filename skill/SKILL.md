@@ -161,6 +161,27 @@ request/tab/generation; after partial local failure replay that idempotent commi
 `session set` cannot establish a route. Do not repeat BOOT on a healthy committed
 route. Retirement discards a session; it is not ordinary recovery.
 
+### First-pairing runbook (observed failure modes)
+
+Execute observe and claim as one step, and keep BOOT TTLs at the 30-minute
+default. These three traps each cost a full retry loop in real sessions:
+
+- **Stale selection evidence.** `surface claim` requires `--project-selection`
+  (or `--chat-url`) with an observation no older than 300s. Observe the candidate
+  tab, then claim immediately; never observe, do other work, then claim. On
+  `Project selection evidence is stale`, re-observe and re-claim in the same step.
+- **Short BOOT TTL.** The BOOT round trip is human-paced: type the boot prompt,
+  wait for the ChatGPT reply, post the observation. `--ttl-ms 300000` expires
+  before the result arrives and the request reports `expired`. Use the default
+  TTL; only lower it for an explicitly time-bounded retry.
+- **Expired page lease.** `Claim this local session's ChatGPT page before opening
+  a control turn` means the page lease lapsed (idle gaps do this). Re-run
+  `surface claim` and continue; the Project binding survives, nothing else to redo.
+- Lookup commands (`control status|wait|observe`) need the full correlation
+  (`--request --task --iteration --phase`), not just `--request`.
+- A claim or control request that fails validation returns the offending field
+  in the error message; fix that field instead of re-reading the schema.
+
 ## C2C availability without a visible app selection
 
 For the already configured C2C connector, UI selection is optional during

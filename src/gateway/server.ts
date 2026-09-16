@@ -236,7 +236,12 @@ function secretsEqual(left: string, right: string): boolean {
 
 function errorResponse(error: unknown): { status: number; body: { error: string; message: string } } {
   if (error instanceof z.ZodError) {
-    return { status: 400, body: { error: "invalid_request", message: "Control request failed validation." } };
+    // Name the exact fields: an opaque "failed validation" forces the caller to
+    // reverse-engineer the schema from source before it can fix the request.
+    const details = error.issues
+      .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+      .join("; ");
+    return { status: 400, body: { error: "invalid_request", message: `Control request failed validation: ${details}` } };
   }
   const code =
     error !== null && typeof error === "object" && "code" in error && typeof error.code === "string"
