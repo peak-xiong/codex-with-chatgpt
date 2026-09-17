@@ -58,7 +58,9 @@ build, and preserve existing state. `machine setup` installs the runtime, starts
 the machine gateway, and issues the bearer token that guards the public MCP
 endpoint. Record the public base URL with `machine endpoint set --url <https://...>`
 once the tunnel that forwards to this machine is up, and never print the token
-except through the explicit `machine auth show --reveal`. Do not guess accounts
+except through an explicit `--reveal` (`machine auth show --reveal`, or
+`machine endpoint get --reveal`, which prints the finished connector URL with the
+token already appended, ready to paste). Do not guess accounts
 or substitute another tunnel provider without being asked.
 
 Any tunnel that forwards a public HTTPS URL to the gateway's loopback port is

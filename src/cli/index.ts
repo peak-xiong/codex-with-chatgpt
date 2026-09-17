@@ -347,6 +347,25 @@ function transportView(): Record<string, unknown> {
   };
 }
 
+/**
+ * The exact URL a ChatGPT connector needs, bearer token included.
+ *
+ * The connector UI offers only OAuth / no-authentication / mixed and has no static
+ * key field, so the token has to travel in the URL — which makes this string a
+ * credential. It is therefore produced only under an explicit `--reveal`, the same
+ * convention as `c2c machine auth show`.
+ *
+ * `encodeURIComponent` is a no-op for the current `c2c_mcp_[A-Za-z0-9_-]+` format,
+ * so it costs nothing today and keeps the URL valid if the token charset ever widens.
+ */
+function mcpUrlWithToken(mcpUrl: string | null): string {
+  if (!mcpUrl) {
+    throw new Error("公网地址尚未配置：运行 c2c machine endpoint set --url <https://...>");
+  }
+  const { token } = requireHttpAuthToken();
+  return `${mcpUrl}/${encodeURIComponent(token)}`;
+}
+
 function localConnectorMachine(runtime?: MachineRuntimeState): ConnectorMachine {
   const identity = runtime ?? readMachineIdentity();
   if (!identity) throw new Error("Machine identity is unavailable; finish machine setup first.");
@@ -616,13 +635,26 @@ const machineEndpoint = machine
 machineEndpoint
   .command("get", { isDefault: true })
   .option("--json", "machine-readable output", false)
-  .action((opts: { json: boolean }) => {
+  .option("--reveal", "also print the connector URL with its bearer token", false)
+  .action((opts: { json: boolean; reveal: boolean }) => {
     try {
       const view = transportView();
-      if (opts.json) say(JSON.stringify({ ok: true, ...view }));
-      else {
+      const mcpUrl = view.mcpUrl as string | null;
+      // Resolved before anything is printed so `--reveal` is all-or-nothing: a missing
+      // public URL must not leave a half-written report on stdout that looks complete.
+      const revealedUrl = opts.reveal ? mcpUrlWithToken(mcpUrl) : null;
+      if (opts.json) {
+        say(JSON.stringify({
+          ok: true,
+          ...view,
+          // A separate field rather than overwriting `mcpUrl`: consumers must be able to
+          // tell whether the value they hold is a credential.
+          ...(revealedUrl ? { mcpUrlWithToken: revealedUrl } : {}),
+        }));
+      } else {
         say(`本地端口：${view.localPort}`);
-        say(`MCP 地址：${view.mcpUrl ?? "尚未配置"}`);
+        say(`MCP 地址：${mcpUrl ?? "尚未配置"}`);
+        if (revealedUrl) say(`连接器地址（含令牌，可直接粘贴）：${revealedUrl}`);
         say(`Bearer 认证：${view.authConfigured ? `已启用（${view.authTokenHint}）` : "未生成"}`);
       }
     } catch (error) {

@@ -13,6 +13,7 @@ import {
 import { threadSessionFile } from "../src/session/state.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { submitControlResult } from "../src/control/mailbox.js";
+import { requireHttpAuthToken } from "../src/config/http-auth.js";
 
 const projectRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const cliEntry = path.join(projectRoot, "src", "cli", "index.ts");
@@ -98,13 +99,32 @@ describe("machine CLI lifecycle", () => {
     expect(JSON.stringify(started.body)).not.toContain("associationNonce");
     expect((started.body.info as Record<string, unknown>).workspaceCount).toBe(0);
 
-      // A healthy gateway is not "ready" until the public URL a tunnel
-      // forwards to has been recorded, so record it first.
-      const endpoint = runJson(stateDir, [
-        "machine", "endpoint", "set", "--url", "https://c2c-test.ngrok-free.dev",
-      ]);
-      expect(endpoint.command.status, JSON.stringify(endpoint)).toBe(0);
-      expect(endpoint.body).toMatchObject({ mcpUrl: "https://c2c-test.ngrok-free.dev/mcp" });
+    // A healthy gateway is not "ready" until the public URL a tunnel
+    // forwards to has been recorded, so record it first.
+    const endpoint = runJson(stateDir, [
+      "machine", "endpoint", "set", "--url", "https://c2c-test.ngrok-free.dev",
+    ]);
+    expect(endpoint.command.status, JSON.stringify(endpoint)).toBe(0);
+    expect(endpoint.body).toMatchObject({ mcpUrl: "https://c2c-test.ngrok-free.dev/mcp" });
+
+    // The connector UI has no static-key field, so the token has to travel in the
+    // URL. That makes the assembled URL a credential: `endpoint get` must stay
+    // token-free unless `--reveal` asks, and the hint it does print is truncated.
+    // The token is read straight from the store rather than through another CLI run,
+    // so this asserts against the real configured value with no extra subprocess.
+    const authToken = requireHttpAuthToken().token;
+    const plainJson = runJson(stateDir, ["machine", "endpoint", "get"]);
+    expect(plainJson.body).toMatchObject({ mcpUrl: "https://c2c-test.ngrok-free.dev/mcp" });
+    expect(plainJson.body).not.toHaveProperty("mcpUrlWithToken");
+    expect(JSON.stringify(plainJson.body)).not.toContain(authToken);
+    const plainText = runCli(stateDir, ["machine", "endpoint", "get"]);
+    expect(plainText.stdout).not.toContain(authToken);
+
+    const revealed = runJson(stateDir, ["machine", "endpoint", "get", "--reveal"]);
+    // The revealed value must be exactly what the connector needs, so a paste works.
+    expect(revealed.body.mcpUrlWithToken).toBe(
+      `https://c2c-test.ngrok-free.dev/mcp/${authToken}`,
+    );
 
     const status = runJson(stateDir, ["machine", "status"]);
     expect(status.command.status).toBe(0);
@@ -325,6 +345,27 @@ describe("machine CLI lifecycle", () => {
     expect(unregistered.command.status, JSON.stringify(unregistered)).toBe(0);
     expect(unregistered.body.unregistered).toBe(true);
   }, 90_000);
+
+  it("names the recovery action when --reveal has no recorded public URL to append to", () => {
+    // The fixture records no endpoint, so this is the unpaired state. `--reveal` must
+    // fail on the missing URL rather than emit a bare token that a pasted connector
+    // URL would silently reject.
+    const revealed = runJson(stateDir, ["machine", "endpoint", "get", "--reveal"]);
+    expect(revealed.command.status).toBe(1);
+    expect(String(revealed.body.error)).toContain("machine endpoint set --url");
+    expect(revealed.body).not.toHaveProperty("mcpUrlWithToken");
+
+    // The same failure in text mode must not leave a half-written report behind: a
+    // partial listing would read as a successful run with the line silently missing.
+    const revealedText = runCli(stateDir, ["machine", "endpoint", "get", "--reveal"]);
+    expect(revealedText.status).toBe(1);
+    expect(revealedText.stdout).not.toContain("本地端口");
+
+    // Without --reveal the same state stays a normal read-only report.
+    const plain = runJson(stateDir, ["machine", "endpoint", "get"]);
+    expect(plain.command.status).toBe(0);
+    expect(plain.body.mcpUrl).toBeNull();
+  });
 
   it("rejects a workspace override outside the current working directory", () => {
     const otherWorkspace = makeTmpDir("cli-machine-other-workspace");

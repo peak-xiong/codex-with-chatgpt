@@ -243,7 +243,7 @@ Security and login，可能需管理员先授权）。打开 [ChatGPT 插件页]
 | --- | --- |
 | 名称 | 能区分设备的完整名称，例如 `Codex with ChatGPT - Laptop`；现有名称可以保留 |
 | Connection（连接方式） | `Server URL`（不是 `Tunnel`） |
-| MCP Server URL | `c2c machine endpoint get` 返回的 `/mcp` 地址后面接上 `c2c machine auth show --reveal` 的令牌：`<公网基地址>/mcp/<令牌>` |
+| MCP Server URL | `c2c machine endpoint get --reveal` 会打印含令牌、可直接粘贴的完整地址：`<公网基地址>/mcp/<令牌>` |
 | Authentication | `No authentication`（无身份验证） |
 
 选「无身份验证」不是配置错误：该表单只有 `OAuth`、`No authentication`、`Mixed`

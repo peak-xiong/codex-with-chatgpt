@@ -77,7 +77,7 @@ Record the endpoint before configuring ChatGPT:
 ```text
 Name:            <this device's exact ChatGPT app name>
 Connection:      Server URL
-MCP Server URL:  <public-base-url>/mcp/<token from `machine auth show --reveal`>
+MCP Server URL:  <public-base-url>/mcp/<token from `c2c machine endpoint get --reveal`>
 Authentication:  No authentication
 ```
 

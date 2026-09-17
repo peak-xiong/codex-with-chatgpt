@@ -206,7 +206,7 @@ In ChatGPT connector settings verify exactly:
 ```text
 Name:            Codex with ChatGPT
 Connection:      Server URL
-MCP Server URL:  <public-base-url>/mcp/<token from `c2c machine auth show --reveal`>
+MCP Server URL:  <public-base-url>/mcp/<token from `c2c machine endpoint get --reveal`>
 Authentication:  No authentication
 ```
 

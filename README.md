@@ -305,7 +305,7 @@ UI version, the entry may be called an app, plugin, or connector.
 | --- | --- |
 | Name | A distinct device name, e.g. `Codex with ChatGPT - Laptop`; existing single-device names can be kept |
 | Connection | `Server URL` (not `Tunnel`) |
-| MCP Server URL | The `/mcp` URL from `c2c machine endpoint get`, with the token from `c2c machine auth show --reveal` appended: `<public-base-url>/mcp/<token>` |
+| MCP Server URL | `c2c machine endpoint get --reveal` prints the exact value to paste, token included: `<public-base-url>/mcp/<token>` |
 | Authentication | `No authentication` |
 
 `No authentication` is not a mistake: this form offers only `OAuth`,

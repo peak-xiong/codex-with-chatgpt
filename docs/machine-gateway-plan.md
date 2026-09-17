@@ -194,7 +194,7 @@ Machine lifecycle:
 
 ```text
 c2c machine setup [--json]
-c2c machine endpoint get|set --url <https-url>|clear [--json]
+c2c machine endpoint get [--reveal]|set --url <https-url>|clear [--json]
 c2c machine auth show [--reveal]|rotate [--json]
 c2c skill status [--json]
 c2c machine start
