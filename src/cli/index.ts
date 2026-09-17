@@ -200,16 +200,48 @@ function parseControlPhase(value: string): ControlPhase {
   return phase as ControlPhase;
 }
 
-function parseControlCorrelation(opts: {
-  task: string;
-  iteration: string;
-  phase: string;
+function requireControlCorrelation(opts: {
+  task?: string;
+  iteration?: string;
+  phase?: string;
 }): ControlResultCorrelation {
+  if (opts.task === undefined || opts.iteration === undefined || opts.phase === undefined) {
+    throw new Error("--task, --iteration and --phase are all required here");
+  }
   return {
     taskId: validateControlId(opts.task, "task id"),
     iteration: parseControlIteration(opts.iteration),
     phase: parseControlPhase(opts.phase),
   };
+}
+
+/**
+ * Read the task/iteration/phase triple for an *inspection* lookup
+ * (`control status|wait|observe`).
+ *
+ * These commands can locate a request by `--request` alone: the gateway already
+ * stores the triple on the request, and ownership is enforced by the local session,
+ * so passing the triple is a cross-check rather than a requirement. Forcing callers
+ * to recall it was the exact cost that made the first-pairing `control status` fail
+ * on a missing `--task` even though the request id was correct.
+ *
+ * A *partial* triple is still rejected — that is always a mistake, never an intent.
+ */
+function parseControlCorrelation(opts: {
+  task?: string;
+  iteration?: string;
+  phase?: string;
+}): ControlResultCorrelation | undefined {
+  const supplied = [opts.task, opts.iteration, opts.phase].filter(
+    (value) => value !== undefined,
+  ).length;
+  if (supplied === 0) return undefined;
+  if (supplied !== 3) {
+    throw new Error(
+      "pass --task, --iteration and --phase together, or omit all three and look the request up by --request alone",
+    );
+  }
+  return requireControlCorrelation(opts);
 }
 
 function parseScopes(value?: string): string[] {
@@ -1655,7 +1687,7 @@ control
     try {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       const localSessionId = resolveLocalSession(opts.localSession);
-      const correlation = parseControlCorrelation(opts);
+      const correlation = requireControlCorrelation(opts);
       const ttlMs = parseIntegerOption(opts.ttlMs, "ttl-ms", 1_000, MAX_TURN_TTL_MS);
       machineContext = await machineSurfaceContext(workspace, localSessionId);
       const machine = machineContext;
@@ -1792,24 +1824,39 @@ control
     }
   });
 
-function addControlLookupOptions(command: Command): Command {
-  return command
+/**
+ * `optional` correlation: `status` / `wait` / `observe` can find a request by
+ * `--request` alone. `required`: `ack` / `cancel` settle a request, so the triple
+ * stays mandatory there as a tripwire against settling the wrong one.
+ */
+function addControlLookupOptions(
+  command: Command,
+  correlation: "optional" | "required",
+): Command {
+  const withCorrelation =
+    correlation === "required"
+      ? command
+          .requiredOption("--task <id>")
+          .requiredOption("--iteration <n>")
+          .requiredOption("--phase <phase>")
+      : command
+          .option("--task <id>", "optional cross-check; give it together with --iteration and --phase")
+          .option("--iteration <n>", "optional cross-check; give it together with --task and --phase")
+          .option("--phase <phase>", "optional cross-check; give it together with --task and --iteration");
+  return withCorrelation
     .option("-w, --workspace <path>")
     .requiredOption("--request <id>")
-    .requiredOption("--task <id>")
-    .requiredOption("--iteration <n>")
-    .requiredOption("--phase <phase>")
     .option("--local-session <id>")
     .option("--json", "machine-readable output", false);
 }
 
-addControlLookupOptions(control.command("status"))
+addControlLookupOptions(control.command("status"), "optional")
   .action(async (opts: {
     workspace?: string;
     request: string;
-    task: string;
-    iteration: string;
-    phase: string;
+    task?: string;
+    iteration?: string;
+    phase?: string;
     localSession?: string;
     json: boolean;
   }) => {
@@ -1832,14 +1879,15 @@ addControlLookupOptions(control.command("status"))
 addControlLookupOptions(
   control
     .command("wait")
-    .option("--timeout-ms <ms>", "local wait slice; capped by page-check interval, not a task time limit", String(CONTROL_PAGE_CHECK_INTERVAL_MS))
+    .option("--timeout-ms <ms>", "local wait slice; capped by page-check interval, not a task time limit", String(CONTROL_PAGE_CHECK_INTERVAL_MS)),
+  "optional",
 )
   .action(async (opts: {
     workspace?: string;
     request: string;
-    task: string;
-    iteration: string;
-    phase: string;
+    task?: string;
+    iteration?: string;
+    phase?: string;
     localSession?: string;
     timeoutMs: string;
     json: boolean;
@@ -1865,11 +1913,11 @@ addControlLookupOptions(
     }
   });
 
-addControlLookupOptions(control.command("observe"))
+addControlLookupOptions(control.command("observe"), "optional")
   .description("Renew verified ongoing work or record the exact owned Computer Use result")
   .requiredOption("--page-observation <json>", "fresh exact-response observation, without raw page text")
   .action(async (opts: {
-    workspace?: string; request: string; task: string; iteration: string; phase: string;
+    workspace?: string; request: string; task?: string; iteration?: string; phase?: string;
     localSession?: string; pageObservation: string; json: boolean;
   }) => {
     try {
@@ -1890,7 +1938,7 @@ addControlLookupOptions(control.command("observe"))
     }
   });
 
-addControlLookupOptions(control.command("ack"))
+addControlLookupOptions(control.command("ack"), "required")
   .action(async (opts: {
     workspace?: string;
     request: string;
@@ -1905,7 +1953,7 @@ addControlLookupOptions(control.command("ack"))
       const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession));
       const status = await acknowledgeMailboxResult(identity.runtime, identity.identity, {
         requestId: opts.request,
-        ...parseControlCorrelation(opts),
+        ...requireControlCorrelation(opts),
       });
       if (opts.json) say(JSON.stringify({ ok: true, ...status }));
       else check("已确认 control result");
@@ -1914,7 +1962,7 @@ addControlLookupOptions(control.command("ack"))
     }
   });
 
-addControlLookupOptions(control.command("cancel"))
+addControlLookupOptions(control.command("cancel"), "required")
   .action(async (opts: {
     workspace?: string;
     request: string;
@@ -1928,7 +1976,7 @@ addControlLookupOptions(control.command("cancel"))
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       const runtimeObservation = await observeMachineRuntime();
       const localSessionId = resolveLocalSession(opts.localSession);
-      const correlation = parseControlCorrelation(opts);
+      const correlation = requireControlCorrelation(opts);
       let contextCancelled = false;
       let contextInvalidated = false;
       let machineRuntime: MachineRuntimeState;

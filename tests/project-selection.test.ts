@@ -36,6 +36,12 @@ describe("first Project provenance", () => {
     expect(() => validateProjectSelection(evidence, url, "another-workspace")).toThrow(/title/);
     expect(() => validateProjectSelection(evidence, "https://chatgpt.com/g/g-p-other/project", "quant-insight")).toThrow(/URL/);
     expect(() => validateProjectSelection(evidence, url, "quant-insight", Date.parse(evidence.observedAt) + 300001)).toThrow(/stale/);
+    // The message must name the age and the window: "stale" alone left the operator
+    // guessing whether to re-observe or to change something else.
+    expect(() => validateProjectSelection(evidence, url, "quant-insight", Date.parse(evidence.observedAt) + 300001))
+      .toThrow(/observed 300s ago; window is 300s/);
+    expect(() => validateProjectSelection(evidence, url, "quant-insight", Date.parse(evidence.observedAt) + 300001))
+      .toThrow(/Re-observe the candidate and claim immediately/);
     expect(validateProjectSelection(evidence, url, "quant-insight").source).toBe("created");
     expect(validateProjectSelection(projectSelection(url), url, "different-display-name").source).toBe("user-confirmed");
   });

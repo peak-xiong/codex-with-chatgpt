@@ -1114,7 +1114,15 @@ export function getControlResultStatus(
   workspaceId: string,
   requestId: string,
   localSessionId: string,
-  expected: ControlResultCorrelation
+  /**
+   * Optional by design. The stored request already carries this triple, and
+   * ownership is enforced by `localSessionId` above — so it is a redundant
+   * cross-check, not an authorization input. Callers that supply it keep the
+   * exact-match guarantee; callers that only know the request id can omit it
+   * instead of having to guess the task/iteration/phase from memory.
+   * `ack` and `cancel` deliberately keep passing it as a tripwire.
+   */
+  expected?: ControlResultCorrelation
 ): ControlStatus {
   const resolvedWorkspaceId = validateControlId(workspaceId, "workspace id");
   const resolvedRequestId = validateControlId(requestId, "request id");
@@ -1126,7 +1134,7 @@ export function getControlResultStatus(
   if (request.localSessionId !== resolvedLocalSessionId) {
     throw new ControlMailboxError("MAILBOX_SESSION_MISMATCH", "control result request belongs to another local session");
   }
-  assertCorrelation(request, expected);
+  if (expected) assertCorrelation(request, expected);
   const result = readResult(resolvedWorkspaceId, request);
   const progress = readProgress(resolvedWorkspaceId, request);
   const pageObservation = readPageObservation(resolvedWorkspaceId, request);
@@ -1201,7 +1209,7 @@ export async function waitForControlResult(
   requestId: string,
   timeoutMs: number,
   localSessionId: string,
-  expected: ControlResultCorrelation,
+  expected?: ControlResultCorrelation,
   signal?: AbortSignal,
 ): Promise<ControlStatus> {
   const throwIfAborted = (): void => {
@@ -1363,7 +1371,9 @@ export function observeControlResultRequest(
   workspaceId: string,
   requestId: string,
   localSessionId: string,
-  expected: ControlResultCorrelation,
+  // Typed `| undefined` rather than `?` so the parameter order stays as it was:
+  // `observation` is required and must not jump ahead of an optional argument.
+  expected: ControlResultCorrelation | undefined,
   observation: ControlPageObservation,
   renewAuthorization?: () => string,
 ): ControlStatus {

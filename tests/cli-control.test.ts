@@ -602,6 +602,53 @@ describe("control CLI correlation", () => {
       expect(result.body.code).toBe("MAILBOX_CORRELATION_MISMATCH");
     }
 
+    // A lookup by `--request` alone is enough: the request already stores the triple and
+    // `--local-session` proves ownership, so requiring the triple only made the caller
+    // recall values the gateway knows. This is the exact shape that failed a
+    // first-pairing `control status` on a missing `--task`.
+    const bare = runJson([
+      "control",
+      "status",
+      "-w",
+      workspace,
+      "--local-session",
+      "session-a",
+      "--request",
+      request.requestId,
+    ]);
+    expect(bare.command.status, JSON.stringify(bare)).toBe(0);
+    expect(bare.body.status).toBe("pending");
+
+    // A *partial* triple is always a mistake, so it stays rejected — and says so.
+    const partial = runJson([
+      "control",
+      "status",
+      "-w",
+      workspace,
+      "--local-session",
+      "session-a",
+      "--request",
+      request.requestId,
+      "--task",
+      "c2c_0123456789abcdef",
+    ]);
+    expect(partial.command.status).toBe(1);
+    expect(String(partial.body.error)).toContain("pass --task, --iteration and --phase together");
+
+    // Settling still demands the triple: `ack` must not accept a bare lookup.
+    const bareAck = runJson([
+      "control",
+      "ack",
+      "-w",
+      workspace,
+      "--local-session",
+      "session-a",
+      "--request",
+      request.requestId,
+    ]);
+    expect(bareAck.command.status).toBe(1);
+    expect(bareAck.command.stdout + bareAck.command.stderr).toContain("--task");
+
     submitControlResult(request.workspaceId, planResult(request.requestId));
     const waited = runJson([
       "control",
@@ -888,4 +935,27 @@ describe("control CLI correlation", () => {
       cleanup(otherWorkspace);
     }
   }, 90_000);
+
+  it("states the recovery action when a control turn has no page lease or no committed route", () => {
+    // No `claimSurface` here on purpose: an unpaired session is the state the 2026-09-16
+    // first pairing actually hit, and the old message ("...before opening a control turn.")
+    // named the symptom without the fix, which cost a full retry loop.
+    const unclaimed = runJson([
+      "control",
+      "open",
+      "-w",
+      workspace,
+      "--local-session",
+      "session-unpaired",
+      "--task",
+      "c2c_0123456789abcdef",
+      "--iteration",
+      "0",
+      "--phase",
+      "BOOT",
+    ]);
+    expect(unclaimed.command.status).toBe(1);
+    expect(String(unclaimed.body.error)).toContain("Re-run surface claim");
+    expect(String(unclaimed.body.error)).toContain("expires after the lease TTL");
+  });
 });

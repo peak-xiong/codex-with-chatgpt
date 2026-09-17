@@ -177,8 +177,12 @@ default. These three traps each cost a full retry loop in real sessions:
 - **Expired page lease.** `Claim this local session's ChatGPT page before opening
   a control turn` means the page lease lapsed (idle gaps do this). Re-run
   `surface claim` and continue; the Project binding survives, nothing else to redo.
-- Lookup commands (`control status|wait|observe`) need the full correlation
-  (`--request --task --iteration --phase`), not just `--request`.
+  The message states this recovery action; read it instead of guessing.
+- **Lookup needs only `--request`.** `control status|wait|observe` locate the
+  request by `--request` alone, because the request already stores
+  task/iteration/phase and `--local-session` proves ownership. Pass the triple
+  (`--task --iteration --phase`) only as a cross-check, and then give all three:
+  a partial triple is rejected as a mistake. `control ack|cancel` still require it.
 - A claim or control request that fails validation returns the offending field
   in the error message; fix that field instead of re-reading the schema.
 

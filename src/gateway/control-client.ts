@@ -90,6 +90,22 @@ export interface MailboxLookupInput extends ControlResultCorrelation {
   requestId: string;
 }
 
+/**
+ * Input for the *inspection* endpoints (`status`, `wait`, `observe`).
+ *
+ * The triple is optional: the gateway already stores it on the request, and ownership
+ * is enforced by the local session, so `requestId` alone identifies the request.
+ * Supply the triple to add a cross-check. A partial triple is rejected by the gateway
+ * — pass all three or none.
+ *
+ * `ack` and `cancel` deliberately do not use this type: they settle a request, so
+ * `MailboxLookupInput` keeps the triple mandatory there as a tripwire.
+ */
+export interface MailboxInspectionInput
+  extends Partial<Pick<ControlResultCorrelation, "taskId" | "iteration" | "phase">> {
+  requestId: string;
+}
+
 function surfaceLeaseRef(lease: SurfaceLeaseRef): SurfaceLeaseRef {
   assertChatGPTSurfaceIdentity(lease.browserId, lease.surfaceId);
   return {
@@ -306,7 +322,7 @@ export function openMailboxRequest(
 export function getMailboxStatus(
   runtime: MachineRuntimeState,
   identity: MailboxIdentity,
-  input: MailboxLookupInput,
+  input: MailboxInspectionInput,
   timeoutMs = DEFAULT_ADMIN_TIMEOUT_MS,
 ): Promise<ControlStatus> {
   return adminFetch(runtime, "POST", "/admin/mailbox/status", {
@@ -318,7 +334,7 @@ export function getMailboxStatus(
 export function waitMailboxResult(
   runtime: MachineRuntimeState,
   identity: MailboxIdentity,
-  input: MailboxLookupInput & { timeoutMs: number },
+  input: MailboxInspectionInput & { timeoutMs: number },
   timeoutMs = Math.max(DEFAULT_ADMIN_TIMEOUT_MS, input.timeoutMs + 5_000),
 ): Promise<ControlStatus> {
   return adminFetch(runtime, "POST", "/admin/mailbox/wait", {
@@ -354,7 +370,7 @@ export function cancelMailboxRequest(
 export function observeMailboxPage(
   runtime: MachineRuntimeState,
   identity: MailboxIdentity,
-  input: MailboxLookupInput & { observation: ControlPageObservation },
+  input: MailboxInspectionInput & { observation: ControlPageObservation },
   timeoutMs = DEFAULT_ADMIN_TIMEOUT_MS,
 ): Promise<ControlStatus> {
   return adminFetch(runtime, "POST", "/admin/mailbox/observe", {

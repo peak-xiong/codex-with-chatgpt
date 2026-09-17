@@ -201,6 +201,31 @@ function fenceOf(input: string | Pick<TurnCompletionFence, "fence">): string {
 }
 
 /**
+ * Address broker capabilities by the request's own correlation.
+ *
+ * Inspection paths let callers omit the task/iteration/phase triple, because the stored
+ * request already carries it. Everything that *addresses* a capability still needs the
+ * exact values, so they are read back from that same stored request rather than being
+ * required from the caller.
+ *
+ * A missing request is unreachable from `observeControlPage` (it returns early for every
+ * status that has no request). Throwing rather than defaulting is deliberate: a partial
+ * binding would address the wrong capability without saying so.
+ */
+function correlationFromStoredRequest(
+  requestId: string,
+  request: ControlStatus["request"],
+): ControlResultCorrelation {
+  if (!request) {
+    throw new TurnCapabilityError(
+      "BINDING_MISMATCH",
+      `control result request ${requestId} is not on record, so its correlation cannot be resolved`,
+    );
+  }
+  return { taskId: request.taskId, iteration: request.iteration, phase: request.phase };
+}
+
+/**
  * Machine-local control/data-plane composition for registered workspaces.
  *
  * The gateway deliberately has no capability, lease, or completion-fence
@@ -494,7 +519,7 @@ export class MachineGateway {
   getControlResultStatus(
     identity: MachineSurfaceIdentity,
     requestId: string,
-    expected: ControlResultCorrelation,
+    expected?: ControlResultCorrelation,
   ): ControlStatus {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
     return getControlResultStatus(identity.workspaceId, requestId, identity.localSessionId, expected);
@@ -504,7 +529,7 @@ export class MachineGateway {
     identity: MachineSurfaceIdentity,
     requestId: string,
     timeoutMs: number,
-    expected: ControlResultCorrelation,
+    expected?: ControlResultCorrelation,
     signal?: AbortSignal,
   ): Promise<ControlStatus> {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
@@ -559,13 +584,20 @@ export class MachineGateway {
   observeControlPage(
     identity: MachineSurfaceIdentity,
     requestId: string,
-    expected: ControlResultCorrelation,
+    // `| undefined` keeps the parameter order stable: `input` is required and
+    // must not follow an optional argument.
+    expected: ControlResultCorrelation | undefined,
     input: ControlPageObservation,
   ): ControlStatus {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
     const observation = parseControlPageObservation(input);
     const status = this.getControlResultStatus(identity, requestId, expected);
     if (status.status !== "pending" && status.status !== "cancelled") return status;
+    // `expected` is optional on this path. When the caller omits it, address the broker
+    // by the triple the request itself stores. This is not a weaker check: a supplied
+    // triple that disagreed with the stored one was already rejected by
+    // `assertCorrelation`, so the two sources agree by construction.
+    const correlation = expected ?? correlationFromStoredRequest(requestId, status.request);
     if (status.status === "cancelled" && status.hostFailure !== undefined) {
       try {
         return observeControlResultRequest(
@@ -576,13 +608,13 @@ export class MachineGateway {
           observation,
         );
       } finally {
-        this.broker.revokeRequest({ ...identity, ...expected, requestId });
+        this.broker.revokeRequest({ ...identity, ...correlation, requestId });
       }
     }
     if (
       status.status === "pending" &&
       observation.state === "authority_invalid" &&
-      this.broker.hasLiveRequest({ ...identity, ...expected, requestId })
+      this.broker.hasLiveRequest({ ...identity, ...correlation, requestId })
     ) {
       throw new TurnCapabilityError(
         "BINDING_MISMATCH",
@@ -662,20 +694,20 @@ export class MachineGateway {
             throw new TurnCapabilityError("LEASE_NOT_FOUND", "generating observation requires the exact live surface lease");
           }
           const expiresAt = this.broker.keepAliveRequest({
-            ...identity, ...expected, requestId, generation: observation.generation,
+            ...identity, ...correlation, requestId, generation: observation.generation,
           }, observedAt);
           this.surfaceRenew(identity, lease, Math.max(1_000, Date.parse(lease.leaseExpiresAt) - Date.parse(lease.updatedAt)));
           return expiresAt;
         } : undefined,
       );
       if (resolved.status === "cancelled") {
-        this.broker.revokeRequest({ ...identity, ...expected, requestId });
+        this.broker.revokeRequest({ ...identity, ...correlation, requestId });
       }
       return resolved;
     } catch (error) {
       const latest = this.getControlResultStatus(identity, requestId, expected);
       if (latest.status === "cancelled") {
-        this.broker.revokeRequest({ ...identity, ...expected, requestId });
+        this.broker.revokeRequest({ ...identity, ...correlation, requestId });
       }
       throw error;
     }

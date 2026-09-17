@@ -402,6 +402,92 @@ describe("machine gateway control server", () => {
     server = null;
   });
 
+  it("looks a control request up by requestId alone while keeping partial and wrong correlations rejected", async () => {
+    cleanups.push(isolateStateDir());
+    const root = makeTmpDir("machine-server-mailbox-lookup");
+    cleanups.push(root);
+    server = await startMachineGatewayServer({ port: 0, connectStdio: false });
+    const registered = await admin<{
+      workspaceId: string;
+      projectId: string;
+      registrationId: string;
+    }>(server, "/admin/workspaces/register", { root });
+    const identity = {
+      workspaceId: registered.body.workspaceId,
+      projectId: registered.body.projectId,
+      registrationId: registered.body.registrationId,
+      localSessionId: "session-mailbox-lookup",
+    };
+    const opened = await admin<{ request: { requestId: string } }>(server, "/admin/mailbox/open", {
+      ...identity,
+      taskId: "task-mailbox-lookup",
+      iteration: 0,
+      phase: "PLAN",
+    });
+    expect(opened.status).toBe(200);
+    const requestId = opened.body.request.requestId;
+    const storedTriple = { taskId: "task-mailbox-lookup", iteration: 0, phase: "PLAN" };
+
+    // Inspection needs `requestId` only. The request already stores the triple and
+    // ownership is enforced by localSessionId, so demanding the triple just made the
+    // caller recall values the gateway knows — the cost that failed a first-pairing
+    // `control status` on a missing `--task` even though the request id was right.
+    const bare = await admin<{ status: string }>(server, "/admin/mailbox/status", {
+      ...identity,
+      requestId,
+    });
+    expect(bare.status).toBe(200);
+    expect(bare.body.status).toBe("pending");
+
+    const waited = await admin<{ status: string }>(server, "/admin/mailbox/wait", {
+      ...identity,
+      requestId,
+      timeoutMs: 0,
+    });
+    expect(waited.status).toBe(200);
+    expect(waited.body.status).toBe("pending");
+
+    // A partial triple is always a mistake, so it is still rejected — and the error
+    // names the offending field instead of a bare "failed validation".
+    const partial = await admin<{ error: string; message: string }>(server, "/admin/mailbox/status", {
+      ...identity,
+      requestId,
+      taskId: "task-mailbox-lookup",
+    });
+    expect(partial.status).toBe(400);
+    expect(partial.body.error).toBe("invalid_request");
+    expect(partial.body.message).toContain("taskId");
+
+    // A supplied triple must still agree with the stored one.
+    const wrong = await admin<{ error: string }>(server, "/admin/mailbox/status", {
+      ...identity,
+      requestId,
+      ...storedTriple,
+      taskId: "task-other",
+    });
+    expect(wrong.status).toBe(409);
+    expect(wrong.body.error).toContain("mismatch");
+
+    // Terminal transitions keep the triple mandatory as a tripwire against settling
+    // the wrong request: without it the request never reaches the mailbox, and with
+    // it the schema accepts and the mailbox answers on its own terms.
+    const unacknowledged = await admin<{ error: string; message: string }>(server, "/admin/mailbox/ack", {
+      ...identity,
+      requestId,
+    });
+    expect(unacknowledged.status).toBe(400);
+    expect(unacknowledged.body.error).toBe("invalid_request");
+    expect(unacknowledged.body.message).toContain("taskId");
+
+    const acknowledged = await admin<{ error: string }>(server, "/admin/mailbox/ack", {
+      ...identity,
+      requestId,
+      ...storedTriple,
+    });
+    expect(acknowledged.status).toBe(400);
+    expect(acknowledged.body.error).toBe("mailbox_result_not_ready");
+  });
+
   it("issues exact turn capabilities without accepting unknown scopes or registrations", async () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("machine-server-turn");

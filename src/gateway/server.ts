@@ -8,7 +8,12 @@ import { z } from "zod";
 import { projectSelectionSchema } from "../session/project-selection.js";
 import { pluginIdsSchema, pluginIntentSchema, pluginPreflightSchema } from "../session/turn-preflight.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
-import { CONTROL_PHASES, c2cIdSchema } from "../control/result-schema.js";
+import {
+  CONTROL_PHASES,
+  c2cIdSchema,
+  type ControlPhase,
+  type ControlResultCorrelation,
+} from "../control/result-schema.js";
 import { browserTabIdSchema } from "../session/browser-tab-id.js";
 import { parseControlPageObservation } from "../control/wait-policy.js";
 import { Logger, nullLogger } from "../logger/index.js";
@@ -163,14 +168,76 @@ const mailboxOpenSchema = mailboxIdentitySchema
     ttlMs: z.number().int().min(1_000).max(60 * 60_000).optional(),
   })
   .strict();
-const mailboxLookupSchema = mailboxIdentitySchema
+
+/**
+ * Inspection lookups (`status`, `wait`, `observe`) may omit the task/iteration/phase
+ * triple. The stored request already carries it, and ownership is enforced by
+ * `localSessionId`, so demanding it only forced callers to recall values the gateway
+ * already knows — a real cost in the first-pairing session, where the CLI rejected an
+ * otherwise valid `control status` for a missing `--task`.
+ *
+ * A *partial* triple is still rejected: that can only be a copy-paste mistake, and
+ * catching it is the entire reason the fields remain accepted at all.
+ */
+const mailboxLookupCorrelationShape = {
+  taskId: mailboxCorrelationSchema.shape.taskId.optional(),
+  iteration: mailboxCorrelationSchema.shape.iteration.optional(),
+  phase: mailboxCorrelationSchema.shape.phase.optional(),
+};
+const requireWholeCorrelation = (
+  value: { taskId?: string; iteration?: number; phase?: string },
+  ctx: z.RefinementCtx,
+): void => {
+  const supplied = [value.taskId, value.iteration, value.phase].filter(
+    (field) => field !== undefined,
+  ).length;
+  if (supplied !== 0 && supplied !== 3) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["taskId"],
+      message:
+        "pass taskId, iteration and phase together, or omit all three and look the request up by requestId alone",
+    });
+  }
+};
+// `mailboxCorrelationSchema.shape` is spread first because it is the sole source of the
+// two fields every lookup needs: `requestId` (which request) and `localSessionId` (whose
+// request — the actual authorization input). `mailboxLookupCorrelationShape` is applied
+// second so it *relaxes* the triple that shape just required; spreading them in the other
+// order would silently drop both required fields.
+const mailboxLookupBase = mailboxIdentitySchema
+  .omit({ localSessionId: true })
+  .extend(mailboxCorrelationSchema.shape)
+  .extend(mailboxLookupCorrelationShape)
+  .strict();
+// Terminal transitions (`ack`, `cancel`) keep demanding the exact triple on purpose:
+// there it acts as a tripwire against settling the wrong request, and the caller
+// always has the values in hand because it just opened or waited on that request.
+const mailboxSettlingLookupSchema = mailboxIdentitySchema
   .omit({ localSessionId: true })
   .extend(mailboxCorrelationSchema.shape)
   .strict();
-const mailboxWaitSchema = mailboxLookupSchema.extend({
-  timeoutMs: z.number().int().min(0).max(86_400_000),
-}).strict();
-const mailboxObserveSchema = mailboxLookupSchema.extend({ observation: z.unknown() }).strict();
+const mailboxLookupSchema = mailboxLookupBase.superRefine(requireWholeCorrelation);
+const mailboxWaitSchema = mailboxLookupBase
+  .extend({ timeoutMs: z.number().int().min(0).max(86_400_000) })
+  .strict()
+  .superRefine(requireWholeCorrelation);
+const mailboxObserveSchema = mailboxLookupBase
+  .extend({ observation: z.unknown() })
+  .strict()
+  .superRefine(requireWholeCorrelation);
+
+/** Collapse an optional correlation triple to the value the gateway APIs take. */
+function lookupCorrelation(input: {
+  taskId?: string;
+  iteration?: number;
+  phase?: string;
+}): ControlResultCorrelation | undefined {
+  if (input.taskId === undefined || input.iteration === undefined || input.phase === undefined) {
+    return undefined;
+  }
+  return { taskId: input.taskId, iteration: input.iteration, phase: input.phase as ControlPhase };
+}
 
 export interface MachineGatewayServerOptions extends MachineGatewayOptions {
   host?: string;
@@ -469,11 +536,11 @@ export async function startMachineGatewayServer(
   app.post("/admin/mailbox/status", adminGuard, (req, res) => {
     try {
       const input = mailboxLookupSchema.parse(req.body);
-      const { workspaceId, projectId, registrationId, localSessionId, requestId, taskId, iteration, phase } = input;
+      const { workspaceId, projectId, registrationId, localSessionId, requestId } = input;
       res.json(gateway.getControlResultStatus(
         { workspaceId, projectId, registrationId, localSessionId },
         requestId,
-        { taskId, iteration, phase },
+        lookupCorrelation(input),
       ));
     } catch (error) {
       const response = errorResponse(error);
@@ -501,12 +568,12 @@ export async function startMachineGatewayServer(
     res.once("finish", cleanupWait);
     try {
       const input = mailboxWaitSchema.parse(req.body);
-      const { workspaceId, projectId, registrationId, localSessionId, requestId, taskId, iteration, phase, timeoutMs } = input;
+      const { workspaceId, projectId, registrationId, localSessionId, requestId, timeoutMs } = input;
       const status = await gateway.waitForControlResult(
         { workspaceId, projectId, registrationId, localSessionId },
         requestId,
         timeoutMs,
-        { taskId, iteration, phase },
+        lookupCorrelation(input),
         controller.signal,
       );
       if (!controller.signal.aborted && !closing && !res.destroyed && !res.writableEnded) {
@@ -525,10 +592,10 @@ export async function startMachineGatewayServer(
   app.post("/admin/mailbox/observe", adminGuard, (req, res) => {
     try {
       const input = mailboxObserveSchema.parse(req.body);
-      const { workspaceId, projectId, registrationId, localSessionId, requestId, taskId, iteration, phase, observation } = input;
+      const { workspaceId, projectId, registrationId, localSessionId, requestId, observation } = input;
       res.json(gateway.observeControlPage(
         { workspaceId, projectId, registrationId, localSessionId }, requestId,
-        { taskId, iteration, phase }, parseControlPageObservation(observation),
+        lookupCorrelation(input), parseControlPageObservation(observation),
       ));
     } catch (error) {
       const response = errorResponse(error);
@@ -538,7 +605,7 @@ export async function startMachineGatewayServer(
 
   app.post("/admin/mailbox/ack", adminGuard, (req, res) => {
     try {
-      const input = mailboxLookupSchema.parse(req.body);
+      const input = mailboxSettlingLookupSchema.parse(req.body);
       const { workspaceId, projectId, registrationId, localSessionId, requestId, taskId, iteration, phase } = input;
       res.json(gateway.acknowledgeControlResult(
         { workspaceId, projectId, registrationId, localSessionId },
@@ -553,7 +620,7 @@ export async function startMachineGatewayServer(
 
   app.post("/admin/mailbox/cancel", adminGuard, (req, res) => {
     try {
-      const input = mailboxLookupSchema.parse(req.body);
+      const input = mailboxSettlingLookupSchema.parse(req.body);
       const { workspaceId, projectId, registrationId, localSessionId, requestId, taskId, iteration, phase } = input;
       res.json(gateway.cancelControlResultRequest(
         { workspaceId, projectId, registrationId, localSessionId },
