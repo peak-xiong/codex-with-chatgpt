@@ -38,7 +38,9 @@ cwd. Install once per OS user; do not maintain project-local copies.
    with its original correlation. On a
    healthy route, resolve the saved exact tab, verify Project/chat URL and composer
    readiness using this task's documented Computer Use APIs. Expand diagnostics
-   only when an observed failure calls for them.
+   only when an observed failure calls for them. When creating a new Project, select
+   and visibly confirm `Project-only memory` in the dialog before Create; follow
+   `docs/protocol.md#first-project-selection`.
 3. Open one c2c control open --local-session <id> --task <task> --iteration <n>
    --phase <RESEARCH|PLAN|REVIEW> --json. Choose scopes for the needed reads and
    prepare inputs for the question. Send its deliveryPrompt unchanged plus the task;

@@ -345,6 +345,15 @@ so verify Chat in the target Project's composer before sending BOOT. On slow pag
 make one CUA action per call with `timeout_ms: 60000`; a tool timeout is not proof
 that the page is missing or a total task deadline.
 
+Every newly created Project for C2C must use `Project-only memory`
+(`仅限项目的记忆`). In the host CUA creation dialog, select that option and
+confirm its selected state through visible DOM/AX or a screenshot before clicking
+Create. If the option has not loaded, keep the same dialog open, wait, and inspect
+again; never silently accept the default. If selection cannot be confirmed, do
+not create the Project and report the blocker. Preserve an already-bound Project:
+do not delete or recreate it, claim its memory setting was migrated, or assume
+that setting can be edited in place.
+
 Browser creation can time out after creating its tab. Record `listTabs` before
 creation; after a `createBrowserTab` timeout, reconcile with `listTabs` before
 another attempt. Associate a listed tab with this request only by the exact
