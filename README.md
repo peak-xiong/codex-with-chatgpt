@@ -37,6 +37,9 @@ question; Codex finally applies changes and verifies the result. A known
 capability gap is not sent merely to produce a predictable `BLOCKED` response.
 
 Web Search is a built-in ChatGPT capability rather than a Connector MCP tool.
+The public GPT catalog is separate from custom connectors; a GPT appearing or
+missing there says nothing about whether this machine's connector is available
+in the owned Project Chat. Verify the connector through an actual tool call.
 In the current comparison mode, the resulting answer is collected from the
 exact bound response by Computer Use. Control
 prompts contain only the task goal and correlation fields. They never paste
@@ -484,11 +487,19 @@ Default locations on macOS (all belong to the current OS user):
 | Git project state | `<git-common-dir>/codex-with-chatgpt` |
 | Non-Git project state | `<workspace-root>/.codex-with-chatgpt` |
 
-`CODEX_HOME` changes the Skill's configuration root. `C2C_STATE_DIR` changes
+`CODEX_HOME` selects Codex's configuration and Skill discovery root. It does
+not change C2C machine state or repository-local state. CC Switch may expose a
+Skill through an existing symlink; inspect and preserve that link and its
+target rather than creating a second copy or treating a catalog entry as proof
+that the Skill is installed in Codex's active root. `c2c skill status --json`
+reports the destination selected by the current environment. `C2C_STATE_DIR` changes
 machine state, not registered repository-local state; normally leave it unset.
 The managed runtime is not the source Git checkout. Do not edit it or run
 `git pull` there. The gateway owns the protected mailbox and cross-workspace
 page indexes; local project state holds routes/checkpoints and execution records.
+`prefs get/set` and `sandbox-clean` accept an obsolete `-w` for compatibility
+and ignore it because they operate machine-wide. `update-check -w` remains
+workspace-aware and uses that project's update cache.
 
 To update, let active tasks finish first: setup may restart the shared gateway
 and invalidate old authorizations. In the original clean source checkout:

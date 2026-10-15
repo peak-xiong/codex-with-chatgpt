@@ -84,6 +84,7 @@ import {
   retireSurface as retireMachineSurface,
   unregisterWorkspace as unregisterMachineWorkspace,
   waitMailboxResult,
+  MachineAdminError,
   type MachineRegistrationIdentity,
 } from "../gateway/control-client.js";
 import { startMachineGatewayServer, TURN_SCOPES } from "../gateway/server.js";
@@ -291,7 +292,12 @@ function errorCode(error: unknown): string | undefined {
 
 function handleCliError(error: unknown, json: boolean): void {
   const message = error instanceof Error ? error.message : String(error);
-  if (json) say(JSON.stringify({ ok: false, error: message, code: errorCode(error) }));
+  if (json) say(JSON.stringify({
+    ok: false,
+    error: message,
+    code: errorCode(error),
+    ...(error instanceof MachineAdminError ? { status: error.status } : {}),
+  }));
   else cross(message);
   process.exitCode = 1;
 }
@@ -2135,6 +2141,7 @@ program
   .requiredOption("--iteration <n>", "non-negative execution iteration")
   .option("--changed-files <filesOrCount>", "comma-separated files or a count", "0")
   .option("--tests <summary>")
+  .option("--executor <name>", "executor label for this iteration (max 80 characters)")
   .option("--exit-status <status>", "ok | failed | blocked", "ok")
   .option("--notes <text>")
   .option("--command <text>", "command whose output may be offered to ChatGPT")
@@ -2149,6 +2156,7 @@ program
     iteration: string;
     changedFiles: string;
     tests?: string;
+    executor?: string;
     exitStatus: string;
     notes?: string;
     command?: string;
@@ -2170,6 +2178,7 @@ program
         iteration,
         changedFiles,
         tests: opts.tests ?? null,
+        executor: opts.executor,
         exitStatus: parseExecutionExitStatus(opts.exitStatus),
         timestamp: new Date().toISOString(),
         notes: opts.notes,
@@ -2213,6 +2222,7 @@ program
 program
   .command("sandbox-clean")
   .description("Remove obsolete global write grants for C2C machine state")
+  .option("-w, --workspace <path>", "ignored compatibility option; this command is machine-wide")
   .option("--json", "machine-readable output", false)
   .action((opts: { json: boolean }) => {
     try {
@@ -2231,6 +2241,7 @@ const prefs = program
 
 prefs
   .command("get", { isDefault: true })
+  .option("-w, --workspace <path>", "ignored compatibility option; preferences are machine-wide")
   .option("--json", "machine-readable output", false)
   .action((opts: { json: boolean }) => {
     const value = readUiPrefs();
@@ -2240,6 +2251,7 @@ prefs
 
 prefs
   .command("set")
+  .option("-w, --workspace <path>", "ignored compatibility option; preferences are machine-wide")
   .option("--developer-mode", "remember that ChatGPT developer mode is enabled", false)
   .option("--setup-mode <mode>", "auto or manual")
   .option("--json", "machine-readable output", false)

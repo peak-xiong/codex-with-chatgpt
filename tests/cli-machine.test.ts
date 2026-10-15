@@ -52,8 +52,9 @@ function receiveBootForCliSurface(
   workspace: string,
   workspaceId: string,
   localSessionId: string,
+  taskSuffix = localSessionId,
 ): string {
-  const taskId = `boot-${localSessionId}`;
+  const taskId = `boot-${taskSuffix}`;
   const opened = runJson(stateDir, [
     "control", "open", "-w", workspace, "--local-session", localSessionId,
     "--task", taskId, "--iteration", "0", "--phase", "BOOT",
@@ -250,6 +251,23 @@ describe("machine CLI lifecycle", () => {
       "--replace-generation", String(claimed.body.lease.generation), "--replace-tab-id", "tab-cli-machine"]);
     expect(reclaimed.command.status).toBe(0);
     expect(reclaimed.body.lease.generation).toBe(claimed.body.lease.generation + 1);
+    const reclaimBootRequestId = receiveBootForCliSurface(
+      stateDir,
+      workspace,
+      identity.workspaceId,
+      "session-cli-machine",
+      `session-cli-machine-generation-${reclaimed.body.lease.generation}`,
+    );
+    const reclaimedCommit = runJson(stateDir, [
+      "surface", "commit", "-w", workspace,
+      "--local-session", "session-cli-machine",
+      "--generation", String(reclaimed.body.lease.generation),
+      "--tab-id", "tab-cli-machine",
+      "--boot-request", reclaimBootRequestId,
+      "--chat-url", "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/session-cli-machine",
+    ]);
+    expect(reclaimedCommit.command.status).toBe(0);
+    expect(reclaimedCommit.body.binding.lastGeneration).toBe(reclaimed.body.lease.generation);
 
     const surface = runJson(stateDir, [
       "surface",
@@ -307,7 +325,7 @@ describe("machine CLI lifecycle", () => {
       "--phase",
       "PLAN",
       "--generation",
-      "1",
+      String(reclaimed.body.lease.generation),
     ]);
     expect(missingRequest.command.status).toBe(1);
     expect(missingRequest.body.error).toMatch(/request/);
@@ -335,14 +353,21 @@ describe("machine CLI lifecycle", () => {
     const pendingPreflight = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
     expect(pendingPreflight.body).toMatchObject({ nextAction: "resume_request", nextStep: "resume-control" });
 
-    const cancelled = runJson(stateDir, ["machine", "context", "cancel", "--context-id", issued.body.contextId as string]);
+    const cancelled = runJson(stateDir, [
+      "control", "cancel", "-w", workspace,
+      "--local-session", "session-cli-machine",
+      "--request", issued.body.request.requestId as string,
+      "--task", "task-cli-machine",
+      "--iteration", "0",
+      "--phase", "PLAN",
+    ]);
     expect(cancelled.command.status).toBe(0);
-    expect(cancelled.body.cancelled).toBe(true);
+    expect(cancelled.body.status).toBe("cancelled");
 
     const expired = runJson(stateDir, ["control", "open", "-w", workspace,
       "--local-session", "session-cli-machine", "--task", "task-cli-machine-expired",
       "--iteration", "0", "--phase", "PLAN", "--compaction-epoch", "0", "--ttl-ms", "1000"]);
-    expect(expired.command.status).toBe(0);
+    expect(expired.command.status, JSON.stringify(expired)).toBe(0);
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     const expiredPreflight = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
     expect(expiredPreflight.body).toMatchObject({ nextAction: "inspect_expired_response", nextStep: null });
@@ -355,7 +380,7 @@ describe("machine CLI lifecycle", () => {
       "--local-session",
       "session-cli-machine",
       "--generation",
-      "2",
+      String(claimed.body.lease.generation),
       "--tab-id",
       "tab-cli-machine",
     ]);
@@ -370,7 +395,7 @@ describe("machine CLI lifecycle", () => {
       "--local-session",
       "session-cli-machine",
       "--generation",
-      "1",
+      String(reclaimed.body.lease.generation),
       "--tab-id",
       "tab-cli-machine",
     ]);

@@ -154,6 +154,9 @@ absent in Computer Use mode. A scoped real read validates transport separately
 from catalog visibility. If contracts remain unavailable or stale, report that
 specific limitation without recreating apps or changing permissions/providers.
 This is machine-wide discovery, not per-workspace installation.
+The public GPT catalog and custom Connector management are separate surfaces;
+GPT catalog visibility does not enumerate or prove this machine's connector
+availability in a Project Chat. Confirm the required tool by invoking it.
 
 On macOS, enable machine autostart once after setup and verify it:
 
@@ -914,6 +917,7 @@ Production tools are read-only workspace tools:
 workspace_info
 list_directory
 read_file
+read_image
 read_many
 search_workspace
 git_status
@@ -930,12 +934,22 @@ default. Each item carries an index and either a file or explicit error code.
 Oversized first lines are rejected instead of bypassing the byte cap. Budget or
 per-file failures do not invalidate successful items. Reads are non-atomic.
 
+`read_image` returns image content plus path, format, media type and byte-size
+metadata. It accepts PNG, JPEG, GIF and WebP signatures up to 10 MiB, reads
+through an opened file descriptor with a bounded byte count, and reuses the
+workspace containment and sensitive-path checks. Signature screening is not a
+full image decoder or a safety validation. SVG support and video import remain
+deferred; SVG is not sanitized or returned as an image.
+
 `review_context` requires `git.read`, accepts the same working-tree modes and
-pagination as `git_diff`, and adds Git identity metadata. With
+pagination as `git_diff`, and adds Git identity metadata plus `gitStatus`,
+including counts for sensitive changes withheld from path lists. With
 `include_execution: true`, it also requires `execution.read` and derives the
 session/task/iteration exclusively from the capability. Null execution means no
 record was supplied/found, not a passing test. It cannot resolve arbitrary refs,
 remote PRs or deployment state. Use the detailed execution tools when needed.
+Execution records may include an optional executor label (1–80 characters);
+older records without it remain valid and surface as absent/null metadata.
 
 The retained mailbox callbacks `get_control_result_status`,
 `report_control_progress`, and `submit_control_result` are intentionally not
@@ -974,6 +988,9 @@ ChatGPT must end the exact response with `C2C_HOST_OBSERVED_RESULT`, the exact
 extracts only that marker from the exact bound response. The host validates tab,
 chat, generation, response identity, freshness, request, phase, schema, and
 payload size before accepting it.
+The marker and request ID identify a candidate result; they do not themselves
+prove acceptance. Return exactly one allowed result object, choosing either the
+phase success result or `BLOCKED`.
 
 Every delivery prompt declares `RESULT_TRANSPORT: COMPUTER_USE_ONLY` and
 `MAILBOX_CALLBACKS: DISABLED_EXPECTED`. Those declarations override earlier C2C
@@ -1086,6 +1103,10 @@ transport, schema examples and proactive BLOCKED output. Append only the concise
 task, bounded evidence paths and any required `pluginPolicy`. Do not paste source,
 diffs, logs or credentials, duplicate the protocol fields, or restore callback
 directions from older conversation messages.
+
+Machine-wide `prefs get/set` and `sandbox-clean` accept the obsolete `-w`
+workspace option but ignore it. `update-check -w` instead resolves the specified
+workspace and reads or writes that project's update-check cache.
 
 Choose an evidence-closed task as described in "Delegation capability gate".
 For external facts, ask for actually consulted HTTP(S) sources. For local-only

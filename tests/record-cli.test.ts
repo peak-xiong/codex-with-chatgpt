@@ -56,6 +56,8 @@ describe("c2c record", () => {
       const result = runRecord(root, [
         "--iteration",
         "2",
+        "--executor",
+        "Codex worker",
         "--changed-files",
         "3",
         "--command",
@@ -73,6 +75,7 @@ describe("c2c record", () => {
           taskId: "c2c_test",
           iteration: 2,
           changedFiles: 3,
+          executor: "Codex worker",
         }),
       ]);
       expect(listExecutionOutputs(workspace.id)).toEqual([

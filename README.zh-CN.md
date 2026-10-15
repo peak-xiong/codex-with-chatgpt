@@ -28,6 +28,8 @@
 执行和验收。已知能力缺口不得为了得到可预期的 `BLOCKED` 而先行派发。
 
 网页的 Web Search 是 ChatGPT 自身能力，不是 Connector 暴露的本地 MCP 工具；
+公开 GPT 目录与自定义 Connector 是不同入口：GPT 在目录中出现或缺席，都不能证明
+本机 Connector 在目标 Project Chat 中可用。应通过真实工具调用及其关联结果核验。
 搜索结果和其他分析结果统一由 Computer Use 从精确回复读取。为节省本地
 上下文，控制消息只携带任务目标和关联字段，不复制仓库内容、Diff 或日志。
 
@@ -393,10 +395,15 @@ macOS 默认位置如下，均属于当前系统用户：
 | Git 项目状态 | `<git-common-dir>/codex-with-chatgpt` |
 | 非 Git 项目状态 | `<workspace-root>/.codex-with-chatgpt` |
 
-`CODEX_HOME` 可改变 Skill 的配置根目录。`C2C_STATE_DIR` 改变机器状态位置，不改变
+`CODEX_HOME` 选择 Codex 的配置与 Skill 搜索根目录；它不会改变 C2C 机器状态或仓库本地
+状态。CC Switch 可能通过现有符号链接暴露 Skill；检查并保留该链接及其目标，不要另建
+一份副本，也不要把目录登记误当作 Skill 已安装到 Codex 当前使用的根目录。运行环境中的
+`c2c skill status --json` 可报告实际目标。`C2C_STATE_DIR` 改变机器状态位置，不改变
 已注册的仓库本地状态；通常无需设置。托管运行时不是 Git 源码目录，不要直接修改或
 在其中 `git pull`。Gateway 管理受保护的结果箱和跨工作区页面索引；项目自身保存
 路由、checkpoint 和执行记录。
+`prefs get/set` 与 `sandbox-clean` 为兼容旧调用而接受并忽略 `-w`，因为它们作用于整台机器；
+`update-check -w` 仍按指定工作区解析，并使用该项目的更新缓存。
 
 升级前先让活动任务结束：安装可能重启共享网关，使旧授权失效。在最初克隆的干净
 源码目录中执行：

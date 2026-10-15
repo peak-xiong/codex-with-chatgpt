@@ -3,6 +3,7 @@ import {
   adminFetch,
   cancelTurn,
   issueTurn,
+  preflight,
   registerWorkspace,
   revokeRequest,
   retireSurface,
@@ -135,6 +136,29 @@ describe("machine gateway control client", () => {
     });
     await expect(adminFetch(machine, "GET", "http://evil.example/")).rejects.toThrow(/target is invalid/);
     await expect(adminFetch(machine, "GET", "/admin/info", undefined, 0)).rejects.toThrow(/timeout/);
+  });
+
+  it("diagnoses an unavailable legacy preflight endpoint without exposing response details", async () => {
+    const secret = runtime().adminToken;
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({
+      error: "invalid_admin_token",
+      message: `authorization failed for ${secret}`,
+    }, 404));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const error = await preflight(runtime(), "/workspace/project", "session-a").then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+    expect(error).toMatchObject({
+      name: "MachineAdminError",
+      status: 404,
+      code: "invalid_admin_token",
+      message: expect.stringContaining("preflight endpoint is unavailable (HTTP 404)"),
+    });
+    expect((error as Error).message).toContain("verify they match");
+    expect((error as Error).message).toContain("invalid admin token");
+    expect((error as Error).message).not.toContain(secret);
   });
 
   it("revokes a request by exact correlation without requiring a context id", async () => {

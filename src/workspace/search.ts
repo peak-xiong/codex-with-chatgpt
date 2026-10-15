@@ -48,7 +48,11 @@ export function findRipgrep(): string | null {
   }
   for (const candidate of RG_CANDIDATES) {
     try {
-      const result = spawnSync(candidate, ["--version"], { stdio: "ignore", timeout: 3000 });
+      const result = spawnSync(candidate, ["--version"], {
+        stdio: "ignore",
+        timeout: 3000,
+        windowsHide: true,
+      });
       if (result.status === 0) {
         cachedRg = candidate;
         return candidate;
@@ -73,23 +77,18 @@ async function searchWithRipgrep(
   opts: SearchOptions,
   limit: number
 ): Promise<SearchResult> {
-  const args = ["--json", "--max-filesize", "2M", "--max-count", "20"];
+  const args = ["--json", "--max-filesize", "2M", "--max-count", String(limit + 1)];
   if (!opts.regex) args.push("-F");
   args.push("--smart-case");
   if (opts.glob) args.push("-g", opts.glob);
   args.push("--", opts.query, searchAbs);
 
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(rgBin, args, { cwd: ws.root });
+    const child = spawn(rgBin, args, { cwd: ws.root, windowsHide: true });
     const matches: SearchMatch[] = [];
     let truncated = false;
     const rl = readline.createInterface({ input: child.stdout });
     rl.on("line", (line) => {
-      if (matches.length >= limit) {
-        truncated = true;
-        child.kill("SIGTERM");
-        return;
-      }
       try {
         const event = JSON.parse(line) as {
           type: string;
@@ -98,6 +97,11 @@ async function searchWithRipgrep(
         if (event.type !== "match" || !event.data?.path?.text) return;
         const rel = path.relative(ws.root, event.data.path.text).split(path.sep).join("/");
         if (rel.startsWith("..") || ws.ignoreRules.isHidden(rel)) return;
+        if (matches.length >= limit) {
+          truncated = true;
+          child.kill("SIGTERM");
+          return;
+        }
         matches.push({
           path: rel,
           line: event.data.line_number ?? 0,
@@ -161,11 +165,11 @@ async function searchWithNode(
           const line = lines[i];
           const hit = line.toLowerCase().includes(needle);
           if (hit) {
-            matches.push({ path: childRel, line: i + 1, text: line.trimEnd().slice(0, 500) });
             if (matches.length >= limit) {
               truncated = true;
               return;
             }
+            matches.push({ path: childRel, line: i + 1, text: line.trimEnd().slice(0, 500) });
           }
         }
       }

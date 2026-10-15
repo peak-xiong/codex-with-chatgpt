@@ -38,6 +38,7 @@ export function runGit(root: string, args: string[]): GitCommandResult {
     maxBuffer: 64 * 1024 * 1024,
     timeout: 30_000,
     env: workspaceGitEnv(),
+    windowsHide: true,
   });
   return {
     ok: result.status === 0,
@@ -82,9 +83,15 @@ export interface GitStatusResult {
   unstaged: { path: string; change: string }[];
   untracked: string[];
   conflicted: string[];
+  hidden: { changes: number; conflicts: number };
 }
 
-export function gitStatus(root: string): GitStatusResult {
+export function gitStatus(target: GitTarget): GitStatusResult {
+  const root = typeof target === "string" ? target : target.root;
+  const ignoreRules =
+    typeof target === "object" && target.ignoreRules
+      ? target.ignoreRules
+      : new IgnoreRules(root);
   const empty: GitStatusResult = {
     isRepo: false,
     branch: null,
@@ -95,36 +102,51 @@ export function gitStatus(root: string): GitStatusResult {
     unstaged: [],
     untracked: [],
     conflicted: [],
+    hidden: { changes: 0, conflicts: 0 },
   };
-  const result = runGit(root, ["status", "--porcelain=v2", "--branch", "--", "."]);
+  const result = runGit(root, ["status", "--porcelain=v2", "--branch", "-z", "--", "."]);
   if (!result.ok) return empty;
   const out: GitStatusResult = { ...empty, isRepo: true };
-  for (const line of result.stdout.split("\n")) {
-    if (line.startsWith("# branch.head ")) {
-      out.branch = line.slice("# branch.head ".length).trim();
-    } else if (line.startsWith("# branch.upstream ")) {
-      out.upstream = line.slice("# branch.upstream ".length).trim();
-    } else if (line.startsWith("# branch.ab ")) {
-      const m = line.match(/\+(\d+) -(\d+)/);
+  const records = result.stdout.split("\0");
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (record.startsWith("# branch.head ")) {
+      out.branch = record.slice("# branch.head ".length).trim();
+    } else if (record.startsWith("# branch.upstream ")) {
+      out.upstream = record.slice("# branch.upstream ".length).trim();
+    } else if (record.startsWith("# branch.ab ")) {
+      const m = record.match(/\+(\d+) -(\d+)/);
       if (m) {
         out.ahead = parseInt(m[1], 10);
         out.behind = parseInt(m[2], 10);
       }
-    } else if (line.startsWith("1 ") || line.startsWith("2 ")) {
-      const parts = line.split(" ");
+    } else if (record.startsWith("1 ") || record.startsWith("2 ")) {
+      const isRename = record.startsWith("2 ");
+      const parts = record.split(" ");
       const xy = parts[1];
-      const filePath = line.startsWith("2 ")
-        ? line.split("\t")[0]?.split(" ").slice(9).join(" ") + " -> " + (line.split("\t")[1] ?? "")
-        : parts.slice(8).join(" ");
+      const filePath = parts.slice(isRename ? 9 : 8).join(" ");
+      const originalPath = isRename ? records[++i] ?? "" : "";
+      const displayPath = isRename ? `${filePath} -> ${originalPath}` : filePath;
+      if (
+        ignoreRules.isSensitive(filePath) ||
+        (isRename && ignoreRules.isSensitive(originalPath))
+      ) {
+        out.hidden.changes++;
+        continue;
+      }
       const x = xy[0];
       const y = xy[1];
-      if (x !== ".") out.staged.push({ path: filePath, change: x });
-      if (y !== ".") out.unstaged.push({ path: filePath, change: y });
-    } else if (line.startsWith("? ")) {
-      out.untracked.push(line.slice(2));
-    } else if (line.startsWith("u ")) {
-      const parts = line.split(" ");
-      out.conflicted.push(parts.slice(10).join(" "));
+      if (x !== ".") out.staged.push({ path: displayPath, change: x });
+      if (y !== ".") out.unstaged.push({ path: displayPath, change: y });
+    } else if (record.startsWith("? ")) {
+      const filePath = record.slice(2);
+      if (ignoreRules.isSensitive(filePath)) out.hidden.changes++;
+      else out.untracked.push(filePath);
+    } else if (record.startsWith("u ")) {
+      const parts = record.split(" ");
+      const filePath = parts.slice(10).join(" ");
+      if (ignoreRules.isSensitive(filePath)) out.hidden.conflicts++;
+      else out.conflicted.push(filePath);
     }
   }
   return out;

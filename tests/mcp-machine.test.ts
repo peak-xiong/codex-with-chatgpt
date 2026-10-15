@@ -1,5 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import fs from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   acknowledgeControlResult,
@@ -76,13 +78,27 @@ describe("machine MCP capability correlation", () => {
       appendExecutionRecord(registration.workspaceId, {
         localSessionId: correlation().localSessionId, taskId: correlation().taskId, iteration,
         changedFiles: [], tests: null, exitStatus: iteration === 1 ? "failed" : "ok", timestamp: new Date().toISOString(),
+        ...(iteration === 1 ? { executor: "Codex" } : {}),
       });
     }
     const connection = await connectedClient(gateway);
     try {
       const result = await connection.client.callTool({ name: "review_context", arguments: { context_id: grant.token, include_execution: true } });
       expect(result.isError).not.toBe(true);
-      expect(result.structuredContent).toMatchObject({ execution: { iteration: 1, exitStatus: "failed" } });
+      expect(result.structuredContent).toMatchObject({
+        execution: { iteration: 1, exitStatus: "failed", executor: "Codex" },
+        gitStatus: { hidden: { changes: 0, conflicts: 0 } },
+      });
+      const status = await connection.client.callTool({
+        name: "git_status", arguments: { context_id: grant.token },
+      });
+      expect(status.isError).not.toBe(true);
+      expect(status.structuredContent).toMatchObject({
+        isRepo: false,
+        hidden: { changes: 0, conflicts: 0 },
+      });
+      expect(status.structuredContent).toHaveProperty("hidden.changes", 0);
+      expect(status.structuredContent).toHaveProperty("hidden.conflicts", 0);
     } finally { await connection.close(); }
   });
 
@@ -105,6 +121,69 @@ describe("machine MCP capability correlation", () => {
       expect(diff.isError).not.toBe(true);
       expect(diff.structuredContent).toMatchObject({ atomicSnapshot: false, execution: null, diff: { isRepo: false } });
     } finally { await connection.close(); }
+  });
+
+  it("reads bounded image content under the workspace capability and rejects unsafe paths and sizes", async () => {
+    cleanups.push(isolateStateDir());
+    const root = makeTmpDir("mcp-read-image"); cleanups.push(root);
+    const png = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=",
+      "base64",
+    );
+    fs.writeFileSync(path.join(root, "pixel.png"), png);
+    fs.writeFileSync(path.join(root, ".env"), png);
+    fs.writeFileSync(path.join(root, "not-an-image.bin"), Buffer.from("not an image"));
+    fs.writeFileSync(path.join(root, "oversized.png"), Buffer.concat([
+      png,
+      Buffer.alloc(10 * 1024 * 1024 + 1 - png.length),
+    ]));
+
+    const gateway = new MachineGateway();
+    const registration = gateway.registerWorkspace(root);
+    const request = openControlResultRequest(registration.workspaceId, correlation());
+    const grant = gateway.issueTurn({
+      ...registration, ...correlation(), requestId: request.requestId,
+      scopes: ["workspace.read"], compactionEpoch: 0, generation: 1,
+    });
+    const deniedCorrelation = {
+      ...correlation(), localSessionId: "session-image-denied", taskId: "task-image-denied",
+    };
+    const deniedRequest = openControlResultRequest(registration.workspaceId, deniedCorrelation);
+    const deniedGrant = gateway.issueTurn({
+      ...registration, ...deniedCorrelation, requestId: deniedRequest.requestId,
+      scopes: ["execution.read"], compactionEpoch: 0, generation: 1,
+    });
+    const connection = await connectedClient(gateway);
+    try {
+      const read = await connection.client.callTool({
+        name: "read_image", arguments: { context_id: grant.token, path: "pixel.png" },
+      });
+      expect(read.isError).not.toBe(true);
+      expect(read.structuredContent).toEqual({ path: "pixel.png", format: "png", mediaType: "image/png", sizeBytes: png.length });
+      const image = read.content.find((item) => item.type === "image");
+      expect(image).toMatchObject({ type: "image", mimeType: "image/png", data: png.toString("base64") });
+
+      const wrongCapability = await connection.client.callTool({
+        name: "read_image", arguments: { context_id: deniedGrant.token, path: "pixel.png" },
+      });
+      expect(wrongCapability.isError).toBe(true);
+      expect(JSON.stringify(wrongCapability)).toContain("SCOPE_DENIED");
+
+      for (const [requested, code] of [
+        ["../pixel.png", "PATH_OUTSIDE_WORKSPACE"],
+        [".env", "ACCESS_DENIED_SENSITIVE_FILE"],
+        ["oversized.png", "FILE_TOO_LARGE"],
+        ["not-an-image.bin", "UNSUPPORTED_IMAGE_FORMAT"],
+      ] as const) {
+        const rejected = await connection.client.callTool({
+          name: "read_image", arguments: { context_id: grant.token, path: requested },
+        });
+        expect(rejected.isError).toBe(true);
+        expect(JSON.stringify(rejected)).toContain(code);
+      }
+    } finally {
+      await connection.close();
+    }
   });
 
   it("reports the serving device and rejects another device's context before a workspace read", async () => {
@@ -433,6 +512,7 @@ describe("machine MCP capability correlation", () => {
       iteration: correlation().iteration,
       changedFiles: ["src/index.ts"],
       tests: "436 passed",
+      executor: "Codex",
       exitStatus: "ok",
       timestamp: new Date().toISOString(),
       outputAvailable: false,
@@ -457,9 +537,21 @@ describe("machine MCP capability correlation", () => {
           taskId: correlation().taskId,
           iteration: correlation().iteration,
           changedFiles: ["src/index.ts"],
+          executor: "Codex",
           exitStatus: "ok",
         })],
       });
+
+      const status = await connection.client.callTool({
+        name: "test_status",
+        arguments: {
+          context_id: grant.token,
+          local_session_id: correlation().localSessionId,
+          task_id: correlation().taskId,
+          iteration: correlation().iteration,
+        },
+      });
+      expect(status.structuredContent).toMatchObject({ available: true, executor: "Codex" });
     } finally {
       await connection.close();
     }

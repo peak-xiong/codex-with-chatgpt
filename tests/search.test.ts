@@ -68,6 +68,56 @@ describe.each(engines())("search engine: %s", (engine) => {
     expect(result.truncated).toBe(true);
   });
 
+  it("detects truncation after the limit inside one dense file", async () => {
+    configure();
+    const denseRoot = makeTmpDir("search-dense");
+    try {
+      write(denseRoot, "dense.txt", Array.from({ length: 45 }, () => "dense-needle").join("\n"));
+      const result = await searchWorkspace(new Workspace(denseRoot), {
+        query: "dense-needle",
+        limit: 35,
+      });
+      expect(result.matches).toHaveLength(35);
+      expect(result.truncated).toBe(true);
+    } finally {
+      cleanup(denseRoot);
+    }
+  });
+
+  it("does not mark an exact visible-match limit as truncated", async () => {
+    configure();
+    const exactRoot = makeTmpDir("search-exact-cap");
+    try {
+      write(exactRoot, "exact.txt", Array.from({ length: 5 }, () => "exact-needle").join("\n"));
+      const result = await searchWorkspace(new Workspace(exactRoot), {
+        query: "exact-needle",
+        limit: 5,
+      });
+      expect(result.matches).toHaveLength(5);
+      expect(result.truncated).toBe(false);
+    } finally {
+      cleanup(exactRoot);
+    }
+  });
+
+  it("does not let hidden matches trigger visible-result truncation", async () => {
+    configure();
+    const hiddenRoot = makeTmpDir("search-hidden-cap");
+    try {
+      write(hiddenRoot, ".c2cignore", "z-hidden.txt\n");
+      write(hiddenRoot, "a-visible.txt", "hidden-needle\n");
+      write(hiddenRoot, "z-hidden.txt", Array.from({ length: 12 }, () => "hidden-needle").join("\n"));
+      const result = await searchWorkspace(new Workspace(hiddenRoot), {
+        query: "hidden-needle",
+        limit: 1,
+      });
+      expect(result.matches.map((match) => match.path)).toEqual(["a-visible.txt"]);
+      expect(result.truncated).toBe(false);
+    } finally {
+      cleanup(hiddenRoot);
+    }
+  });
+
   it("supports glob filters", async () => {
     configure();
     const result = await searchWorkspace(ws, { query: "needle-alpha", glob: "*.md" });

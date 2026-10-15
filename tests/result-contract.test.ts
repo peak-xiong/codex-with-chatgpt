@@ -55,7 +55,7 @@ describe("control result prompt contract", () => {
     });
     const contract = controlResultContract(phase);
     for (const instruction of contract.instructions) expect(prompt).toContain(instruction);
-    expect(JSON.parse(prompt.split("\n").at(-1)!)).toEqual(contract.examples);
+    expect(prompt).toContain(JSON.stringify(contract.examples[0]));
     expect(contract.examples.some((example) => example.kind === "BLOCKED")).toBe(true);
     expect(prompt).toContain("C2C_HOST_OBSERVED_RESULT");
     expect(prompt).toContain("COMPUTER_USE_ONLY");
@@ -63,6 +63,20 @@ describe("control result prompt contract", () => {
     expect(prompt).toContain("MAILBOX_CALLBACKS: DISABLED_EXPECTED");
     expect(Buffer.byteLength(prompt)).toBeLessThan(2300);
     expect(prompt).toContain(request.requestId);
+    expect(prompt).toContain(`RESULT_REQUEST_ID: ${request.requestId}`);
+    expect(prompt).toContain("Emit exactly one allowed result object");
+    expect(prompt).not.toContain(JSON.stringify(contract.examples));
+    expect(prompt).toContain("No user interruption is needed.");
+    expect(prompt).not.toContain("<the exact id above>");
+    const success = contract.examples.find((example) => example.kind !== "BLOCKED");
+    const blocked = contract.examples.find((example) => example.kind === "BLOCKED");
+    expect(prompt).toContain(JSON.stringify(success));
+    expect(prompt).toContain(JSON.stringify(blocked));
+    expect(prompt.indexOf("C2C_HOST_OBSERVED_RESULT")).toBeLessThan(prompt.lastIndexOf(`RESULT_REQUEST_ID: ${request.requestId}`));
+    if (phase === "BOOT") {
+      expect(prompt).toContain("BOOT success is valid only after required identity and tool evidence is verified");
+      expect(prompt).toContain('"kind":"BOOT","payload":{}');
+    }
   });
 
   it("does not let an absent mailbox callback block a successful BOOT", () => {

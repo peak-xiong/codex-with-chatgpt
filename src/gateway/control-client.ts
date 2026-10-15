@@ -168,8 +168,10 @@ export async function adminFetch<T = unknown>(
       | { error?: unknown; message?: unknown }
       | undefined;
     if (!response.ok) {
-      const message = typeof parsed?.message === "string" ? parsed.message : `Admin request failed (${response.status})`;
       const code = typeof parsed?.error === "string" ? parsed.error : undefined;
+      const message = route === "/admin/preflight" && response.status === 404
+        ? "Machine Gateway preflight endpoint is unavailable (HTTP 404). The installed CLI and Gateway may be from different versions; verify they match. A 404 can also hide an invalid admin token, so confirm the machine credentials before concluding there is a version mismatch."
+        : typeof parsed?.message === "string" ? parsed.message : `Admin request failed (${response.status})`;
       throw new MachineAdminError(message, response.status, code);
     }
     return parsed as T;

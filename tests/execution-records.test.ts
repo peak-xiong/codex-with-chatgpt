@@ -53,6 +53,25 @@ describe("execution record store", () => {
     ).toBe("1 failed");
   });
 
+  it("accepts legacy records without an executor and validates optional executor labels", () => {
+    stateDir = isolateStateDir();
+    const base = {
+      localSessionId: "session-executor",
+      taskId: "c2c_executor",
+      iteration: 0,
+      changedFiles: 0,
+      tests: null,
+      exitStatus: "ok" as const,
+      timestamp: "2026-01-01T00:00:00.000Z",
+    };
+    appendExecutionRecord("ws1", base);
+    appendExecutionRecord("ws1", { ...base, iteration: 1, executor: "Codex" });
+    expect(readExecutionRecords("ws1").map((record) => record.executor)).toEqual([undefined, "Codex"]);
+    expect(() => appendExecutionRecord("ws1", { ...base, iteration: 2, executor: "" })).toThrow(/executor/);
+    expect(() => appendExecutionRecord("ws1", { ...base, iteration: 2, executor: "   " })).toThrow(/executor/);
+    expect(() => appendExecutionRecord("ws1", { ...base, iteration: 2, executor: "x".repeat(81) })).toThrow(/80/);
+  });
+
   it("rejects a record log copied from another workspace", () => {
     stateDir = isolateStateDir();
     appendExecutionRecord("ws1", {

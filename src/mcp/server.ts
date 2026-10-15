@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { browserTabIdSchema } from "../session/browser-tab-id.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
+import { MAX_IMAGE_BYTES, readWorkspaceImage } from "../workspace/read-image.js";
 import { readMany, readManyFilesSchema, READ_MANY_MAX_BYTES } from "../workspace/read-many.js";
 import {
   MAX_SEARCH_GLOB_LENGTH,
@@ -63,7 +64,7 @@ const contextIdSchema = z
   .describe("Short-lived CONTEXT_ID supplied by the local Codex session for this exact turn");
 
 type ToolResult = {
-  content: { type: "text"; text: string }[];
+  content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[];
   structuredContent?: Record<string, unknown>;
   isError?: boolean;
 };
@@ -213,6 +214,13 @@ const readFileOutputSchema = {
   content: z.string(),
 };
 
+const readImageOutputSchema = {
+  path: z.string(),
+  format: z.enum(["png", "jpeg", "gif", "webp"]),
+  mediaType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]),
+  sizeBytes: z.number().int().nonnegative().max(MAX_IMAGE_BYTES),
+};
+
 const searchMatchOutputSchema = z.object({
   path: z.string(),
   line: z.number().int().nonnegative(),
@@ -241,6 +249,10 @@ const gitStatusOutputSchema = {
   unstaged: z.array(gitChangeOutputSchema),
   untracked: z.array(z.string()),
   conflicted: z.array(z.string()),
+  hidden: z.object({
+    changes: z.number().int().nonnegative(),
+    conflicts: z.number().int().nonnegative(),
+  }),
 };
 
 const gitDiffOutputSchema = {
@@ -254,6 +266,21 @@ const gitDiffOutputSchema = {
   diff: z.string(),
 };
 
+const reviewContextOutputSchema = {
+  observedAt: timestampOutputSchema,
+  atomicSnapshot: z.boolean(),
+  git: gitIdentityOutputSchema,
+  gitStatus: z.object(gitStatusOutputSchema),
+  diff: z.object(gitDiffOutputSchema),
+  execution: z.object({
+    iteration: c2cIterationSchema,
+    exitStatus: z.enum(EXECUTION_EXIT_STATUSES),
+    timestamp: timestampOutputSchema,
+    executor: z.string().nullable(),
+    details: z.string(),
+  }).nullable(),
+};
+
 const testStatusOutputSchema = {
   available: z.boolean(),
   message: z.string().optional(),
@@ -261,6 +288,7 @@ const testStatusOutputSchema = {
   taskId: c2cIdSchema.optional(),
   iteration: c2cIterationSchema.optional(),
   tests: z.string().nullable().optional(),
+  executor: z.string().nullable().optional(),
   exitStatus: z.enum(EXECUTION_EXIT_STATUSES).optional(),
   timestamp: timestampOutputSchema.optional(),
   outputAvailable: z.boolean().optional(),
@@ -467,6 +495,37 @@ export function createMcpServer(ctx: McpContext, options: McpServerOptions = {})
   );
 
   server.registerTool(
+    "read_image",
+    {
+      title: "Read image",
+      description:
+        `Read one workspace image as MCP image content, limited to 10 MiB. Supports PNG, JPEG, GIF and WebP signatures; signature screening does not fully decode or validate image contents. Sensitive files and paths outside the workspace are denied. ${UNTRUSTED_NOTE}`,
+      inputSchema: {
+        context_id: contextIdSchema,
+        path: z.string().describe("Workspace-relative image path"),
+      },
+      outputSchema: readImageOutputSchema,
+      annotations: { readOnlyHint: true },
+    },
+    async (args) => withClaimedWorkspace(gateway, args.context_id, ["workspace.read"], async ({ workspace }) => {
+      const image = await readWorkspaceImage(workspace, args.path);
+      const metadata = {
+        path: image.path,
+        format: image.format,
+        mediaType: image.mediaType,
+        sizeBytes: image.sizeBytes,
+      };
+      return {
+        content: [
+          { type: "image" as const, data: image.bytes.toString("base64"), mimeType: image.mediaType },
+          { type: "text" as const, text: JSON.stringify(metadata) },
+        ],
+        structuredContent: metadata,
+      };
+    }),
+  );
+
+  server.registerTool(
     "search_workspace",
     {
       title: "Search workspace",
@@ -501,7 +560,7 @@ export function createMcpServer(ctx: McpContext, options: McpServerOptions = {})
     },
     async (args) =>
       withClaimedWorkspace(gateway, args.context_id, ["git.read"], ({ workspace }) =>
-        okStructured(gitStatus(workspace.root))
+        okStructured(gitStatus(workspace))
       )
   );
 
@@ -527,6 +586,7 @@ export function createMcpServer(ctx: McpContext, options: McpServerOptions = {})
       max_bytes: z.number().int().min(1024).max(READ_MANY_MAX_BYTES).default(32768),
       include_execution: z.boolean().default(false),
     },
+    outputSchema: reviewContextOutputSchema,
     annotations: { readOnlyHint: true },
   }, async (args) => withClaimedWorkspace(gateway, args.context_id,
     args.include_execution ? ["git.read", "execution.read"] : ["git.read"], ({ workspace, lease }) => {
@@ -536,8 +596,10 @@ export function createMcpServer(ctx: McpContext, options: McpServerOptions = {})
       const execution = args.include_execution ? latestExecutionRecord(workspace.id, {
         localSessionId: lease.binding.localSessionId, taskId: lease.binding.taskId, iteration: lease.binding.iteration,
       }) : null;
-      return okStructured({ observedAt: new Date().toISOString(), atomicSnapshot: false, git: info, diff,
+      return okStructured({ observedAt: new Date().toISOString(), atomicSnapshot: false, git: info,
+        gitStatus: gitStatus(workspace), diff,
         execution: execution ? { iteration: execution.iteration, exitStatus: execution.exitStatus, timestamp: execution.timestamp,
+          executor: execution.executor ?? null,
           details: "Use execution_summary/execution_output for recorded details" } : null });
     }));
 
@@ -621,6 +683,7 @@ export function createMcpServer(ctx: McpContext, options: McpServerOptions = {})
           taskId: latest.taskId,
           iteration: latest.iteration,
           tests: latest.tests,
+          executor: latest.executor ?? null,
           exitStatus: latest.exitStatus,
           timestamp: latest.timestamp,
           outputAvailable: Boolean(latest.outputAvailable),

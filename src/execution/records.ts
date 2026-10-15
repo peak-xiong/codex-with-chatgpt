@@ -22,6 +22,7 @@ export interface ExecutionRecord {
   exitStatus: ExecutionExitStatus;
   timestamp: string;
   notes?: string;
+  executor?: string;
   /** Present when Codex recorded a sanitized command output for this iteration. */
   outputId?: number;
   outputAvailable?: boolean;
@@ -43,6 +44,10 @@ const canonicalTimestampSchema = z.string().refine(
 );
 const boundedTextSchema = (max: number) =>
   z.string().max(max).refine((value) => !UNSAFE_TEXT.test(value), "text contains unsafe control characters");
+const executorSchema = z.string().min(1).max(80).refine(
+  (value) => value.trim() === value && !UNSAFE_TEXT.test(value),
+  "executor must be trimmed, non-empty, and free of unsafe control characters",
+);
 const changedFileSchema = z
   .string()
   .min(1)
@@ -70,6 +75,7 @@ export const executionRecordSchema = z
     exitStatus: z.enum(EXECUTION_EXIT_STATUSES),
     timestamp: canonicalTimestampSchema,
     notes: boundedTextSchema(400).optional(),
+    executor: executorSchema.optional(),
     outputId: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER).optional(),
     outputAvailable: z.boolean().optional(),
   })

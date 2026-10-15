@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import path from "node:path";
 import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
+import { IgnoreRules } from "../src/workspace/ignore.js";
 import { makeTmpDir, cleanup, write, makeGitRepo, git } from "./helpers.js";
 
 let repo: string;
@@ -55,6 +56,70 @@ describe("gitStatus", () => {
 
     git(repo, "reset", "staged.txt");
     git(repo, "checkout", "--", "hello.txt");
+  });
+
+  it("filters sensitive status entries, counts them, and parses NUL paths", () => {
+    const isolatedRepo = makeTmpDir("git-status-sensitive");
+    try {
+      makeGitRepo(isolatedRepo);
+      write(
+        isolatedRepo,
+        ".c2cignore",
+        "conflict secret.txt\nrename secret old.txt\nrename secret new.txt\n",
+      );
+      write(isolatedRepo, ".env", "base\n");
+      write(isolatedRepo, "secrets.json", "base\n");
+      write(isolatedRepo, "conflict secret.txt", "base\n");
+      write(isolatedRepo, "rename secret old.txt", "sensitive origin\n");
+      write(isolatedRepo, "rename-to-secret old.txt", "safe origin\n");
+      write(isolatedRepo, "rename visible old.txt", "safe rename\n");
+      write(isolatedRepo, "ordinary modified.txt", "base ordinary\n");
+      git(isolatedRepo, "add", "-f", ".c2cignore", ".env", "secrets.json", "conflict secret.txt", "rename secret old.txt", "rename-to-secret old.txt", "rename visible old.txt", "ordinary modified.txt");
+      git(isolatedRepo, "commit", "-m", "status fixtures");
+
+      git(isolatedRepo, "checkout", "-b", "conflict-side");
+      write(isolatedRepo, ".env", "side\n");
+      write(isolatedRepo, "conflict secret.txt", "side\n");
+      git(isolatedRepo, "add", "-f", ".env", "conflict secret.txt");
+      git(isolatedRepo, "commit", "-m", "side secret change");
+      git(isolatedRepo, "checkout", "main");
+      write(isolatedRepo, ".env", "main\n");
+      write(isolatedRepo, "conflict secret.txt", "main\n");
+      git(isolatedRepo, "add", "-f", ".env", "conflict secret.txt");
+      git(isolatedRepo, "commit", "-m", "main secret change");
+      expect(() => git(isolatedRepo, "merge", "conflict-side")).toThrow();
+
+      write(isolatedRepo, "secrets.json", "staged secret\n");
+      git(isolatedRepo, "add", "secrets.json");
+      write(isolatedRepo, "secrets.json", "unstaged secret\n");
+      write(isolatedRepo, "credentials.json", "untracked secret\n");
+      git(isolatedRepo, "mv", "rename secret old.txt", "renamed public.txt");
+      git(isolatedRepo, "mv", "rename-to-secret old.txt", "rename secret new.txt");
+      git(isolatedRepo, "mv", "rename visible old.txt", "renamed visible new.txt");
+      write(isolatedRepo, "ordinary modified.txt", "modified ordinary\n");
+      write(isolatedRepo, "line\nbreak.txt", "ordinary\n");
+      write(isolatedRepo, "ordinary file.txt", "ordinary\n");
+
+      const status = gitStatus({ root: isolatedRepo, ignoreRules: new IgnoreRules(isolatedRepo) });
+      expect(status.isRepo).toBe(true);
+      expect(status.hidden).toEqual({ changes: 4, conflicts: 2 });
+      expect(status.staged.map((entry) => entry.path)).not.toContain("secrets.json");
+      expect(status.unstaged.map((entry) => entry.path)).not.toContain("secrets.json");
+      expect(status.untracked).not.toContain("credentials.json");
+      expect(status.conflicted).toEqual([]);
+      expect(status.staged.map((entry) => entry.path)).not.toContain("renamed public.txt -> rename secret old.txt");
+      expect(status.staged.map((entry) => entry.path)).not.toContain("rename secret new.txt -> rename-to-secret old.txt");
+      expect(status.staged.map((entry) => entry.path)).toContain("renamed visible new.txt -> rename visible old.txt");
+      expect(status.unstaged.map((entry) => entry.path)).toContain("ordinary modified.txt");
+      expect(status.untracked).toContain("line\nbreak.txt");
+      expect(status.untracked).toContain("ordinary file.txt");
+
+      const stringTargetStatus = gitStatus(isolatedRepo);
+      expect(stringTargetStatus.hidden).toEqual({ changes: 4, conflicts: 2 });
+      expect(stringTargetStatus.untracked).toContain("ordinary file.txt");
+    } finally {
+      cleanup(isolatedRepo);
+    }
   });
 });
 
