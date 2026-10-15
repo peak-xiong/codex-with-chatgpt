@@ -100,6 +100,12 @@
 | C2C-028 | CC Switch 的 Skill 目录链接被通用 symlink 防护拒绝，导致本机 machine setup 无法完成 | 2026-10-15 修复限定 symlink 解析：install/status/snapshot/restore 共用 canonical resolver，仅允许当前用户 `.agents/skills/codex-with-chatgpt` 的精确目录目标，保留目录链接，并在快照/恢复时检查链接文本、目标及目录身份；`SKILL.md` 文件链接和其他目录目标仍拒绝。聚焦 `skill-install` 与 `setup-transaction` 测试 19/19 通过，typecheck/build 退出码均为 0。主代理实测在 `a53b196` 上 machine setup 全局安装成功，CC Switch symlink 保留，autostart enable、doctor 全部 OK 且 `drifted=false`。首次 setup 因 stop ownership probe 失败而停止；原服务健康，直接复检 probe 正常后重试 setup 成功。该瞬时失败根因未确认，不能据此声称已修复。 |
 | C2C-029 | 新建 C2C Project 未强制选择并确认 Project-only memory | `docs/protocol.md#first-project-selection` 现要求 host CUA 在 Create 前选择并通过可见 DOM/AX 或截图确认 `Project-only memory`；选项未加载时留在同一 dialog 等待检查，无法确认则停止创建。既有绑定 Project 不删除、不重建、不声称迁移，也不假定设置可原位修改；Skill 仅引用该权威规则。2026-10-16 仅修正规则文本，尚未真实新建 Project 验收，未全局部署。 |
 
+### 2026-10-16 本地部署记录
+
+- C2C-029 的规则已随 `cb63429` 全局安装，安装元数据 revision 与提交一致；`skill status` 返回 `installed=true, matches=true`，CC Switch 目录链接保留。
+- `machine setup` 成功，`machine doctor --no-fix` 确认 Gateway 健康、LaunchAgent 已加载且 `drifted=false`；原连接器、端点与令牌配置保留。上述“未全局部署”是部署前记录，现已完成部署。
+- 按用户要求，网页端完整流程及新建 Project 的记忆选项验收暂不执行，留待用户准备好后测试；本次健康检查不等同于端到端验收。
+
 ## 控制平面出网与错误归因
 
 ### 2026-10-16 公网入口 BIC 诊断与设置调整
