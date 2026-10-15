@@ -97,6 +97,7 @@
 | C2C-025 | 安装提示把首次配置与已有安装升级混为一谈 | 新增显式 `machine setup --reuse-existing`，只在已有官方 Tunnel 配置和受保护密钥存在时复用；禁止与首次安装参数混用。中英文安装说明、协议、Skill 和排障文档区分首次安装、升级、Tunnel 更换及密钥轮换。（2026-09-16：该参数与整套隧道配置已随传输层改造移除，本条为历史记录。） |
 | C2C-026 | ChatGPT-first 仅按任务类型分派，导致任意 commit/ref 审查和部署判定在已知工具缺口下仍被派发 | 增加证据闭包门禁、支持/禁止能力矩阵、最小 scope 指引及混合任务拆分；已知缺口留在 Codex，只有有效分派后才允许用 BLOCKED 报告新发现的缺口。 |
 | C2C-027 | 上游增量接入需保留机器 Gateway 能力上下文与 Computer Use-only 结果传输，并补齐 CLI、执行记录及图片读取边界 | 源码改动覆盖旧 Gateway 预检 404 的端点不可用/可能版本不匹配诊断（保留 HTTP 状态和机器码，不能单凭 404 定性）、完整结果 envelope 与真实 BOOT correlation、可选 80 字符 executor、10 MiB 有界 fd 图片读取及机器级 `-w` 兼容。图片仅作 PNG/JPEG/GIF/WebP 签名筛查，不是解码或安全验证；SVG 与视频导入延期。2026-10-15 本地源码验证：聚焦 Vitest 3 个文件、37 项通过，日志 `/tmp/c2c-luna-check.b0OArv/logs/focused-vitest.log`；隔离 `pnpm test` 全量 45 个文件、616 项通过，日志 `/tmp/c2c-luna-check.b0OArv/logs/full-suite.log`。`./node_modules/.bin/tsc --noEmit` 和 `./node_modules/.bin/tsc -p tsconfig.json` 均由执行结果确认退出码 0；对应 tee 日志为空，因为命令没有诊断输出。以上仅验证当前源码；本机已安装运行时仍为 `e735c61`，未验证真实 ChatGPT live BOOT，也未验证 deployment。 |
+| C2C-028 | CC Switch 的 Skill 目录链接被通用 symlink 防护拒绝，导致本机 machine setup 无法完成 | 2026-10-15 本机 machine setup build 成功后，setup 在快照既有 `~/.codex/skills/codex-with-chatgpt -> ~/.agents/skills/codex-with-chatgpt` 时中止；根因是 Skill 安装路径把所有目录 symlink 都拒绝。现在 install/status/snapshot/restore 共用 canonical resolver，仅允许当前用户 `.agents/skills/codex-with-chatgpt` 的精确目标，保留目录链接，并在快照/恢复时检查链接文本、目标及目录身份；`SKILL.md` 文件链接和其他目录目标仍拒绝。自动化覆盖已补，未在本任务运行。 |
 
 ## 控制平面出网与错误归因
 

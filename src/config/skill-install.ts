@@ -36,13 +36,37 @@ export interface SkillStatusResult {
 
 export interface SkillInstallSnapshot {
   readonly codexHome: string;
+  /** Codex-visible path, which may pass through the approved directory link. */
   readonly path: string;
+  /** Validated physical target used for filesystem operations. */
+  readonly ioPath: string;
+  readonly directory: SkillDirectorySnapshot;
   readonly previous: { readonly kind: "missing" } | {
     readonly kind: "file";
     readonly bytes: Buffer;
     readonly mode: number;
   };
 }
+
+type SkillDirectorySnapshot = {
+  readonly kind: "missing" | "directory" | "supported-symlink";
+  readonly linkText?: string;
+  readonly resolvedPath?: string;
+  readonly dev?: number;
+  readonly ino?: number;
+  readonly parentDev?: number;
+  readonly parentIno?: number;
+};
+
+type SkillTargetResolution = {
+  /** Codex-visible path. */
+  readonly path: string;
+  /** Physical path used for filesystem operations. */
+  readonly ioPath: string;
+  readonly directory: string;
+  readonly parent: string;
+  readonly directoryState: SkillDirectorySnapshot;
+};
 
 export function getSkillCheckoutRoot(): string {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -67,19 +91,26 @@ export function installGlobalSkill(options: SkillInstallOptions = {}): SkillInst
   const sourceInfo = readSkillSource(options.checkoutRoot);
   const rendered = renderSkill(sourceInfo.content, sourceInfo.checkoutRoot);
   const contentHash = hashContent(rendered);
-  const target = getSkillInstallPath(options.codexHome);
-  const targetDir = path.dirname(target);
-
-  ensureSafeDirectory(path.dirname(targetDir));
-  ensureSafeDirectory(targetDir);
+  let resolution = resolveCanonicalSkillTarget(options.codexHome);
+  const target = resolution.path;
+  ensureSafeDirectory(resolution.parent);
+  if (resolution.directoryState.kind === "missing") {
+    ensureSafeDirectory(resolution.directory);
+    resolution = resolveCanonicalSkillTarget(options.codexHome);
+  }
 
   let changed = true;
-  const existing = readSafeTarget(target);
+  const ioTarget = resolution.ioPath;
+  assertResolutionUnchanged(resolution, resolveCanonicalSkillTarget(options.codexHome));
+  const existing = readSafeTarget(ioTarget);
   if (existing !== null && existing.content === rendered) {
+    assertResolutionUnchanged(resolution, resolveCanonicalSkillTarget(options.codexHome));
     changed = false;
-    chmodOwnerOnly(target, 0o600);
+    chmodOwnerOnly(ioTarget, 0o600);
   } else {
-    writeAtomicSkill(target, rendered);
+    writeAtomicSkill(ioTarget, rendered, () => {
+      assertResolutionUnchanged(resolution, resolveCanonicalSkillTarget(options.codexHome));
+    });
   }
 
   return {
@@ -95,39 +126,65 @@ export function installGlobalSkill(options: SkillInstallOptions = {}): SkillInst
 /** Capture the global Skill target before a multi-step machine setup. */
 export function snapshotGlobalSkill(options: SkillInstallOptions = {}): SkillInstallSnapshot {
   const codexHome = resolveCodexHome(options.codexHome);
-  const target = getSkillInstallPath(codexHome);
-  const existing = fs.lstatSync(target, { throwIfNoEntry: false });
-  if (!existing) return { codexHome, path: target, previous: { kind: "missing" } };
+  const resolution = resolveCanonicalSkillTarget(codexHome);
+  const target = resolution.path;
+  const ioTarget = resolution.ioPath;
+  assertResolutionUnchanged(resolution, resolveCanonicalSkillTarget(codexHome));
+  const existing = fs.lstatSync(ioTarget, { throwIfNoEntry: false });
+  if (!existing) {
+    assertResolutionUnchanged(resolution, resolveCanonicalSkillTarget(codexHome));
+    return {
+      codexHome,
+      path: target,
+      ioPath: ioTarget,
+      directory: resolution.directoryState,
+      previous: { kind: "missing" },
+    };
+  }
   if (existing.isSymbolicLink()) throw new Error(`Refusing to snapshot symlink Skill target: ${target}`);
   if (!existing.isFile()) throw new Error(`Skill target is not a regular file: ${target}`);
+  const bytes = fs.readFileSync(ioTarget);
+  assertResolutionUnchanged(resolution, resolveCanonicalSkillTarget(codexHome));
   return {
     codexHome,
     path: target,
-    previous: { kind: "file", bytes: fs.readFileSync(target), mode: existing.mode & 0o777 },
+    ioPath: ioTarget,
+    directory: resolution.directoryState,
+    previous: { kind: "file", bytes, mode: existing.mode & 0o777 },
   };
 }
 
 /** Restore the global Skill target captured by snapshotGlobalSkill. */
 export function restoreGlobalSkill(snapshot: SkillInstallSnapshot): void {
-  const target = getSkillInstallPath(snapshot.codexHome);
-  if (target !== snapshot.path) throw new Error("Skill rollback target does not match its snapshot");
-  ensureSafeDirectory(path.dirname(path.dirname(target)));
-  const existing = fs.lstatSync(target, { throwIfNoEntry: false });
-  if (existing?.isSymbolicLink()) throw new Error(`Refusing to overwrite symlink Skill target: ${target}`);
-  fs.rmSync(target, { force: true });
-  if (snapshot.previous.kind === "missing") return;
-  fs.writeFileSync(target, snapshot.previous.bytes, { mode: snapshot.previous.mode });
-  chmodOwnerOnly(target, snapshot.previous.mode);
+  const resolution = resolveCanonicalSkillTarget(snapshot.codexHome);
+  const target = resolution.path;
+  const ioTarget = resolution.ioPath;
+  if (target !== snapshot.path || ioTarget !== snapshot.ioPath) {
+    throw new Error("Skill rollback target does not match its snapshot");
+  }
+  assertSnapshotDirectoryUnchanged(snapshot.directory, resolution.directoryState, true);
+  if (snapshot.previous.kind === "missing") {
+    assertRestorableTarget(resolution, ioTarget, () => resolveCanonicalSkillTarget(snapshot.codexHome));
+    fs.rmSync(ioTarget, { force: true });
+    return;
+  }
+  restoreSnapshotFile(ioTarget, snapshot.previous.bytes, snapshot.previous.mode, () => {
+    assertRestorableTarget(resolution, ioTarget, () => resolveCanonicalSkillTarget(snapshot.codexHome));
+  });
 }
 
 export function statusGlobalSkill(options: SkillInstallOptions = {}): SkillStatusResult {
   const sourceInfo = readSkillSource(options.checkoutRoot);
   const rendered = renderSkill(sourceInfo.content, sourceInfo.checkoutRoot);
-  const target = getSkillInstallPath(options.codexHome);
-  const targetDir = path.dirname(target);
-  const parentSafe = assertSafeDirectory(path.dirname(targetDir));
-  const targetDirSafe = parentSafe && assertSafeDirectory(targetDir);
-  const existing = targetDirSafe ? readSafeTarget(target, { allowMissing: true }) : null;
+  const resolution = resolveCanonicalSkillTarget(options.codexHome);
+  const target = resolution.path;
+  const ioTarget = resolution.ioPath;
+  const parentSafe = assertSafeDirectory(resolution.parent);
+  assertResolutionUnchanged(resolution, resolveCanonicalSkillTarget(options.codexHome));
+  const existing = parentSafe && resolution.directoryState.kind !== "missing"
+    ? readSafeTarget(ioTarget, { allowMissing: true })
+    : null;
+  assertResolutionUnchanged(resolution, resolveCanonicalSkillTarget(options.codexHome));
   const contentHash = existing === null ? null : hashContent(existing.content);
   const expectedContentHash = hashContent(rendered);
   return {
@@ -144,6 +201,130 @@ export function statusGlobalSkill(options: SkillInstallOptions = {}): SkillStatu
 function resolveCodexHome(override?: string): string {
   const configured = override?.trim() || process.env.CODEX_HOME?.trim();
   return path.resolve(configured || path.join(os.homedir(), ".codex"));
+}
+
+function resolveCanonicalSkillTarget(codexHome?: string): SkillTargetResolution {
+  const home = resolveCodexHome(codexHome);
+  const parent = path.join(home, "skills");
+  const directory = path.join(parent, SKILL_NAME);
+  const target = path.join(directory, "SKILL.md");
+  const parentExists = assertSafeDirectory(parent);
+  if (!parentExists) {
+    return { path: target, ioPath: target, directory, parent, directoryState: { kind: "missing" } };
+  }
+
+  const directoryInfo = fs.lstatSync(directory, { throwIfNoEntry: false });
+  if (!directoryInfo) {
+    const parentInfo = fs.lstatSync(parent);
+    return {
+      path: target,
+      ioPath: target,
+      directory,
+      parent,
+      directoryState: { kind: "missing", parentDev: parentInfo.dev, parentIno: parentInfo.ino },
+    };
+  }
+  if (directoryInfo.isSymbolicLink()) {
+    const linkText = fs.readlinkSync(directory);
+    const resolvedPath = path.resolve(path.dirname(directory), linkText);
+    const expectedPath = path.join(os.homedir(), ".agents", "skills", SKILL_NAME);
+    if (resolvedPath !== expectedPath) {
+      throw new Error(`Unsupported Skill directory symlink target: ${directory} -> ${linkText}`);
+    }
+    const realUserHome = fs.realpathSync(os.homedir());
+    const physicalDirectory = path.join(realUserHome, ".agents", "skills", SKILL_NAME);
+    assertPlainDirectoryPath(physicalDirectory, realUserHome);
+    const targetInfo = fs.lstatSync(physicalDirectory);
+    const parentInfo = fs.lstatSync(parent);
+    return {
+      path: target,
+      ioPath: path.join(physicalDirectory, "SKILL.md"),
+      directory,
+      parent,
+      directoryState: {
+        kind: "supported-symlink",
+        linkText,
+        resolvedPath,
+        dev: targetInfo.dev,
+        ino: targetInfo.ino,
+        parentDev: parentInfo.dev,
+        parentIno: parentInfo.ino,
+      },
+    };
+  }
+  if (!directoryInfo.isDirectory()) throw new Error(`Skill target directory is not a directory: ${directory}`);
+  const parentInfo = fs.lstatSync(parent);
+  return {
+    path: target,
+    ioPath: target,
+    directory,
+    parent,
+    directoryState: {
+      kind: "directory",
+      dev: directoryInfo.dev,
+      ino: directoryInfo.ino,
+      parentDev: parentInfo.dev,
+      parentIno: parentInfo.ino,
+    },
+  };
+}
+
+function assertPlainDirectoryPath(directory: string, trustedRoot: string): void {
+  const absolute = path.resolve(directory);
+  const root = path.resolve(trustedRoot);
+  const relative = path.relative(root, absolute);
+  if (relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) {
+    throw new Error(`Supported Skill symlink target is outside the current user's home: ${absolute}`);
+  }
+  let current = root;
+  for (const segment of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    const stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Supported Skill symlink target is not a plain directory path: ${current}`);
+    }
+  }
+}
+
+function assertResolutionUnchanged(
+  before: SkillTargetResolution,
+  after: SkillTargetResolution,
+): void {
+  if (before.path !== after.path || before.ioPath !== after.ioPath) {
+    throw new Error("Skill target path changed during operation");
+  }
+  assertSnapshotDirectoryUnchanged(before.directoryState, after.directoryState);
+}
+
+function assertSnapshotDirectoryUnchanged(
+  before: SkillDirectorySnapshot,
+  after: SkillDirectorySnapshot,
+  allowCreatedDirectory = false,
+): void {
+  if (allowCreatedDirectory && before.kind === "missing" && after.kind === "directory") {
+    if ((before.parentDev !== undefined && before.parentDev !== after.parentDev) ||
+        (before.parentIno !== undefined && before.parentIno !== after.parentIno)) {
+      throw new Error("Skill target parent directory changed during operation");
+    }
+    return;
+  }
+  if (before.kind !== after.kind || before.linkText !== after.linkText ||
+      before.resolvedPath !== after.resolvedPath || before.dev !== after.dev || before.ino !== after.ino ||
+      before.parentDev !== after.parentDev || before.parentIno !== after.parentIno) {
+    throw new Error("Skill target directory or symlink changed during operation");
+  }
+}
+
+function assertRestorableTarget(
+  resolution: SkillTargetResolution,
+  ioTarget: string,
+  resolveCurrent: () => SkillTargetResolution,
+): void {
+  assertResolutionUnchanged(resolution, resolveCurrent());
+  const existing = fs.lstatSync(ioTarget, { throwIfNoEntry: false });
+  if (existing?.isSymbolicLink()) throw new Error(`Refusing to overwrite symlink Skill target: ${resolution.path}`);
+  if (existing && !existing.isFile()) throw new Error(`Skill target is not a regular file: ${resolution.path}`);
+  assertResolutionUnchanged(resolution, resolveCurrent());
 }
 
 function readSkillSource(checkoutRootOption?: string): {
@@ -220,9 +401,39 @@ function readSafeTarget(
   return { content: fs.readFileSync(target, "utf8") };
 }
 
-function writeAtomicSkill(target: string, content: string): void {
+function restoreSnapshotFile(
+  target: string,
+  bytes: Buffer,
+  mode: number,
+  beforeRename: () => void,
+): void {
+  const temporary = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.${process.pid}.${randomBytes(8).toString("hex")}.rollback`,
+  );
+  try {
+    const fd = fs.openSync(temporary, "wx", 0o600);
+    try {
+      fs.writeFileSync(fd, bytes);
+      fs.fchmodSync(fd, mode & 0o777);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    beforeRename();
+    fs.renameSync(temporary, target);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+}
+
+function writeAtomicSkill(target: string, content: string, beforeRename: () => void): void {
+  beforeRename();
   const existing = readSafeTarget(target, { allowMissing: true });
-  if (existing !== null && existing.content === content) return;
+  if (existing !== null && existing.content === content) {
+    beforeRename();
+    return;
+  }
 
   const temporary = path.join(
     path.dirname(target),
@@ -236,8 +447,12 @@ function writeAtomicSkill(target: string, content: string): void {
     } finally {
       fs.closeSync(fd);
     }
-    const beforeRename = readSafeTarget(target, { allowMissing: true });
-    if (beforeRename !== null && beforeRename.content === content) return;
+    const current = readSafeTarget(target, { allowMissing: true });
+    if (current !== null && current.content === content) {
+      beforeRename();
+      return;
+    }
+    beforeRename();
     fs.renameSync(temporary, target);
     chmodOwnerOnly(target, 0o600);
   } finally {

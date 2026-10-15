@@ -491,7 +491,10 @@ Default locations on macOS (all belong to the current OS user):
 not change C2C machine state or repository-local state. CC Switch may expose a
 Skill through an existing symlink; inspect and preserve that link and its
 target rather than creating a second copy or treating a catalog entry as proof
-that the Skill is installed in Codex's active root. `c2c skill status --json`
+that the Skill is installed in Codex's active root. The supported CC Switch
+layout is `~/.codex/skills/codex-with-chatgpt` pointing to the same user's
+`~/.agents/skills/codex-with-chatgpt`; other directory links and a linked
+`SKILL.md` are rejected. `c2c skill status --json`
 reports the destination selected by the current environment. `C2C_STATE_DIR` changes
 machine state, not registered repository-local state; normally leave it unset.
 The managed runtime is not the source Git checkout. Do not edit it or run

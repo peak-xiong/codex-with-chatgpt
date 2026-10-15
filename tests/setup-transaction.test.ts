@@ -1,9 +1,28 @@
-import { describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   resolveMachineSetupOptions,
   runRollbackSteps,
   shouldRestorePreviousGateway,
 } from "../src/config/setup-transaction.js";
+import { installGlobalSkill, restoreGlobalSkill, snapshotGlobalSkill } from "../src/config/skill-install.js";
+import { cleanup, makeTmpDir, write } from "./helpers.js";
+
+const temporaryDirectories: string[] = [];
+
+function tempDir(name: string): string {
+  const dir = makeTmpDir(name);
+  temporaryDirectories.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  while (temporaryDirectories.length > 0) cleanup(temporaryDirectories.pop()!);
+});
 
 describe("machine setup rollback", () => {
   it("requires complete first-time credentials", () => {
@@ -88,5 +107,36 @@ describe("machine setup rollback", () => {
       { label: "sync", run: () => undefined },
       { label: "async", run: async () => undefined },
     ])).resolves.toEqual([]);
+  });
+
+  it("restores the shared Skill through its preserved CC Switch link during setup rollback", async () => {
+    const userHome = tempDir("setup-rollback-home");
+    vi.spyOn(os, "homedir").mockReturnValue(userHome);
+    const codexHome = tempDir("setup-rollback-codex");
+    const nextCheckout = tempDir("setup-rollback-second");
+    const sharedSkillDir = path.join(userHome, ".agents", "skills", "codex-with-chatgpt");
+    const linkParent = path.join(codexHome, "skills");
+    const linkPath = path.join(linkParent, "codex-with-chatgpt");
+    const skillFile = path.join(sharedSkillDir, "SKILL.md");
+    const originalBytes = Buffer.from("pre-setup Skill bytes\n");
+    write(nextCheckout, "skill/SKILL.md", "next=<ACTUAL_CHECKOUT_PATH>\n");
+    fs.mkdirSync(sharedSkillDir, { recursive: true });
+    fs.mkdirSync(linkParent, { recursive: true });
+    fs.writeFileSync(skillFile, originalBytes, { mode: 0o640 });
+    fs.chmodSync(skillFile, 0o640);
+    const originalMode = fs.statSync(skillFile).mode & 0o777;
+    fs.symlinkSync(sharedSkillDir, linkPath, "dir");
+
+    const snapshot = snapshotGlobalSkill({ codexHome });
+    installGlobalSkill({ checkoutRoot: nextCheckout, codexHome });
+    const errors = await runRollbackSteps([
+      { label: "restore global Skill", run: () => restoreGlobalSkill(snapshot) },
+    ]);
+
+    expect(errors).toEqual([]);
+    expect(fs.readFileSync(skillFile)).toEqual(originalBytes);
+    expect(fs.statSync(skillFile).mode & 0o777).toBe(originalMode);
+    expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(linkPath)).toBe(sharedSkillDir);
   });
 });

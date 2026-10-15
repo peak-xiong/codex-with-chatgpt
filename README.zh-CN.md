@@ -398,6 +398,8 @@ macOS 默认位置如下，均属于当前系统用户：
 `CODEX_HOME` 选择 Codex 的配置与 Skill 搜索根目录；它不会改变 C2C 机器状态或仓库本地
 状态。CC Switch 可能通过现有符号链接暴露 Skill；检查并保留该链接及其目标，不要另建
 一份副本，也不要把目录登记误当作 Skill 已安装到 Codex 当前使用的根目录。运行环境中的
+受支持布局是 `~/.codex/skills/codex-with-chatgpt` 指向同一用户的
+`~/.agents/skills/codex-with-chatgpt`；其他目录链接和符号链接 `SKILL.md` 会被拒绝。
 `c2c skill status --json` 可报告实际目标。`C2C_STATE_DIR` 改变机器状态位置，不改变
 已注册的仓库本地状态；通常无需设置。托管运行时不是 Git 源码目录，不要直接修改或
 在其中 `git pull`。Gateway 管理受保护的结果箱和跨工作区页面索引；项目自身保存
