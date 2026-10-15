@@ -76,6 +76,8 @@ export interface ControlStatus {
   hostFailure?: ControlHostFailure;
   hostObservedResult?: ControlHostObservedResult;
   pageObservation?: ControlPageObservationState;
+  /** Correlated page evidence after authority ended; never an authorized delivery. */
+  lateEvidence?: ControlPageObservation;
 }
 
 /**
@@ -92,39 +94,39 @@ export function getControlMailboxDir(workspaceId: string): string {
 }
 
 function workspaceDir(workspaceId: string): string {
-  return getControlMailboxDir(workspaceId);
+  return path.join(getStateDir(), "control-mailbox", validateControlId(workspaceId, "workspace id"));
 }
 
 function requestsDir(workspaceId: string): string {
-  return ensureDir(path.join(workspaceDir(workspaceId), "requests"));
+  return path.join(workspaceDir(workspaceId), "requests");
 }
 
 function resultsDir(workspaceId: string): string {
-  return ensureDir(path.join(workspaceDir(workspaceId), "results"));
+  return path.join(workspaceDir(workspaceId), "results");
 }
 
 function progressDir(workspaceId: string): string {
-  return ensureDir(path.join(workspaceDir(workspaceId), "progress"));
+  return path.join(workspaceDir(workspaceId), "progress");
 }
 
 function observationsDir(workspaceId: string): string {
-  return ensureDir(path.join(workspaceDir(workspaceId), "observations"));
+  return path.join(workspaceDir(workspaceId), "observations");
 }
 
 function acksDir(workspaceId: string): string {
-  return ensureDir(path.join(workspaceDir(workspaceId), "acks"));
+  return path.join(workspaceDir(workspaceId), "acks");
 }
 
 function cancelledDir(workspaceId: string): string {
-  return ensureDir(path.join(workspaceDir(workspaceId), "cancelled"));
+  return path.join(workspaceDir(workspaceId), "cancelled");
 }
 
 function activeDir(workspaceId: string): string {
-  return ensureDir(path.join(workspaceDir(workspaceId), "active"));
+  return path.join(workspaceDir(workspaceId), "active");
 }
 
 function locksDir(workspaceId: string): string {
-  return ensureDir(path.join(workspaceDir(workspaceId), "locks"));
+  return path.join(workspaceDir(workspaceId), "locks");
 }
 
 function requestFile(workspaceId: string, requestId: string): string {
@@ -132,7 +134,7 @@ function requestFile(workspaceId: string, requestId: string): string {
 }
 
 function renewalFile(workspaceId: string, requestId: string): string {
-  return path.join(ensureDir(path.join(workspaceDir(workspaceId), "renewals")), `${validateControlId(requestId, "request id")}.json`);
+  return path.join(workspaceDir(workspaceId), "renewals", `${validateControlId(requestId, "request id")}.json`);
 }
 
 function resultFile(workspaceId: string, requestId: string): string {
@@ -792,6 +794,7 @@ function isUnfinished(workspaceId: string, request: ControlResultRequest): boole
 
 function listRequests(workspaceId: string): ControlResultRequest[] {
   const dir = requestsDir(workspaceId);
+  if (!fs.existsSync(dir)) return [];
   return fs
     .readdirSync(dir)
     .filter((name) => name.endsWith(".json"))
@@ -1098,15 +1101,18 @@ export function reportControlProgress(workspaceId: string, input: unknown): Cont
   });
 }
 
+/** Read-only snapshot; the gateway serializes its synchronous state mutations. */
+export function inspectActiveControlResultStatus(workspaceId: string, localSessionId: string): ControlStatus | null {
+  const request = readActiveRequest(validateControlId(workspaceId, "workspace id"), validateLocalSessionId(localSessionId));
+  return request ? getControlResultStatus(workspaceId, request.requestId, localSessionId, request) : null;
+}
+
 /** Locate recovery work even when the checkout checkpoint was never written. */
 export function getActiveControlResultStatus(workspaceId: string, localSessionId: string): ControlStatus | null {
   const resolvedWorkspaceId = validateControlId(workspaceId, "workspace id");
   const resolvedLocalSessionId = validateLocalSessionId(localSessionId);
   return withFileLock(sessionLifecycleLockFile(resolvedWorkspaceId, resolvedLocalSessionId), () => {
-    const request = readActiveRequest(resolvedWorkspaceId, resolvedLocalSessionId);
-    return request ? getControlResultStatus(
-      resolvedWorkspaceId, request.requestId, resolvedLocalSessionId, request,
-    ) : null;
+    return inspectActiveControlResultStatus(resolvedWorkspaceId, resolvedLocalSessionId);
   });
 }
 
@@ -1138,7 +1144,13 @@ export function getControlResultStatus(
   const result = readResult(resolvedWorkspaceId, request);
   const progress = readProgress(resolvedWorkspaceId, request);
   const pageObservation = readPageObservation(resolvedWorkspaceId, request);
-  const observed = pageObservation ? { pageObservation } : {};
+  const evidenceValue = readStoredJson(lateEvidenceFile(resolvedWorkspaceId, resolvedRequestId), "late page evidence");
+  const lateEvidence = evidenceValue === null ? undefined : parseControlPageObservation(evidenceValue);
+  if (lateEvidence && (lateEvidence.state !== "final" || lateEvidence.responseToRequestId !== request.requestId ||
+      lateEvidence.tabId !== request.surfaceTabId || lateEvidence.generation !== request.surfaceGeneration)) {
+    integrityError("late evidence does not match the original request");
+  }
+  const observed = { ...(pageObservation ? { pageObservation } : {}), ...(lateEvidence ? { lateEvidence } : {}) };
   const terminal = readTerminalState(resolvedWorkspaceId, request);
   if (terminal?.kind === "acknowledged") {
     if (!result) integrityError("acknowledged control result request has no result");
@@ -1204,6 +1216,40 @@ export function requireBootControlResult(
   return status;
 }
 
+function lateEvidenceFile(workspaceId: string, requestId: string): string {
+  return path.join(workspaceDir(workspaceId), "late-evidence", `${validateControlId(requestId, "request id")}.json`);
+}
+
+/** Preserve a verified exact response without renewing authority or publishing a receipt. */
+export function recordLateControlEvidence(
+  workspaceId: string, requestId: string, localSessionId: string,
+  expected: ControlResultCorrelation, input: ControlPageObservation,
+): ControlStatus {
+  return withFileLock(requestLockFile(workspaceId, requestId), () => {
+    const status = getControlResultStatus(workspaceId, requestId, localSessionId, expected);
+    // A receipt or terminal outcome racing this observation wins unchanged.
+    if (status.status !== "pending" && status.status !== "expired") return status;
+    const observation = parseControlPageObservation(input);
+    if (!status.request || observation.state !== "final" ||
+        observation.responseToRequestId !== requestId || observation.tabId !== status.request.surfaceTabId ||
+        observation.generation !== status.request.surfaceGeneration) {
+      throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "late response does not match its original request");
+    }
+    if (observation.terminalResult && !status.request.allowedKinds.includes(observation.terminalResult.kind)) {
+      throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "late result kind is not allowed by the original phase");
+    }
+    if (status.lateEvidence) {
+      if (canonicalJson(status.lateEvidence) !== canonicalJson(observation)) {
+        throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "late evidence already exists");
+      }
+      return status;
+    }
+    advanceControlPageObservation(status.pageObservation ?? null, observation);
+    writeSecureJson(lateEvidenceFile(workspaceId, requestId), observation);
+    return getControlResultStatus(workspaceId, requestId, localSessionId, expected);
+  });
+}
+
 export async function waitForControlResult(
   workspaceId: string,
   requestId: string,
@@ -1211,6 +1257,7 @@ export async function waitForControlResult(
   localSessionId: string,
   expected?: ControlResultCorrelation,
   signal?: AbortSignal,
+  pollIntervalMs = 250,
 ): Promise<ControlStatus> {
   const throwIfAborted = (): void => {
     if (signal?.aborted) {
@@ -1249,7 +1296,7 @@ export async function waitForControlResult(
     deadline ??= Date.now() + Math.min(CONTROL_PAGE_CHECK_INTERVAL_MS, Math.max(0, timeoutMs), controlWaitPolicy(status).checkPageAfterMs);
     const remaining = Math.min(deadline, Date.parse(status.request!.expiresAt)) - Date.now();
     if (remaining <= 0) return status;
-    await waitForPoll(Math.min(250, remaining));
+    await waitForPoll(Math.min(pollIntervalMs, remaining));
   }
 }
 
@@ -1661,6 +1708,7 @@ function pruneControlMailboxUnlocked(resolvedWorkspaceId: string, now: number): 
             resultFile(resolvedWorkspaceId, request.requestId),
             progressFile(resolvedWorkspaceId, request.requestId),
             observationFile(resolvedWorkspaceId, request.requestId),
+            lateEvidenceFile(resolvedWorkspaceId, request.requestId),
             ackFile(resolvedWorkspaceId, request.requestId),
             cancelledFile(resolvedWorkspaceId, request.requestId),
             renewalFile(resolvedWorkspaceId, request.requestId),

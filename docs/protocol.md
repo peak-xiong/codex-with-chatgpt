@@ -6,6 +6,36 @@ retained but inactive while Computer Use is the result transport. Values shown
 as `<...>` are placeholders; never
 send a placeholder as a real identifier.
 
+## Read-only session preflight
+
+Run `c2c preflight --json` from the trusted workspace once at turn entry.
+It combines runtime identity/health, device Connector, endpoint configuration,
+current registration, saved Project/chat/tab, active control request and pairing
+action. Carry `sessionIdentity.id` and resume `surface.control` before opening work.
+`nextAction` keeps its setup, registration, pairing, reclaiming and inspection
+values for compatibility. `nextStep` is derived from the existing pairing decision:
+`create-project`, `create-project-chat`, `inspect-owned-page`, or `resume-control`.
+It remains null until gateway, endpoint, HTTP auth and safe permissions, exact device
+Connector, and workspace registration are ready. Pass `--project-url <url>` only
+when the user already selected that exact Project; this maps to `create-project-chat`
+without saving the URL. If a saved binding has no live lease, preflight keeps
+`nextAction: claim_saved_page` and suppresses page inspection in `nextStep` until the
+saved tab and generation are reclaimed. Preflight does not start/register/repair/
+migrate, create a Workspace, or renew leases. A legacy state needing migration
+reports an error instead of silently rebuilding it. It is a point-in-time view, not
+a lock across a browser turn.
+
+Endpoint `reachability: unverified` is deliberate: local health and a configured
+URL cannot establish ChatGPT's connectivity or app permissions. Validate a real
+task-scoped MCP read when dispatching; avoid adding a separate discovery turn.
+
+The public result view is `wait.state`, `wait.delivery`, `wait.result` and
+`wait.nextAction`. A Computer Use result is delivered/blocked even though legacy
+storage uses cancelled + hostObservedResult. Existing storage remains readable;
+no mailbox migration or callback activation is required. The Computer Use wait
+path sleeps to the next page observation boundary rather than reading disk every
+250 ms. Existing callback tests retain their mailbox wait behavior.
+
 ## Identifiers and scopes
 
 The gateway uses these identifiers:
@@ -292,6 +322,41 @@ reuse just because a same-name Project is visible. An existing user instruction
 to use an exact URL already supplies that choice and needs no repeated approval.
 Quoted incident reports and example URLs do not supply it.
 
+Complete setup/registration checks before using browser guidance: the gateway must
+be healthy, endpoint and HTTP auth must be configured with safe file permissions,
+the exact device Connector must be bound, and this workspace must be registered.
+Then follow `nextStep`. `create-project` means create this workspace's Project and
+session Chat in the UI; `create-project-chat` means create the session Chat in the
+saved or explicitly selected Project; `inspect-owned-page` means inspect only the
+exact owned tab; `resume-control` means resume the original request. For a first
+pairing, retain the exact `providerTabId` from creation or a clear inventory delta,
+observe its Project URL/title, record fresh creation or explicit selection evidence,
+claim that exact tab, complete the correlated BOOT sequence on its claimed
+tab/generation, and commit the matching BOOT result and observed Chat URL. Never
+claim from URL/title similarity alone.
+
+Use the visible Projects entry -> list -> Create -> dialog flow. After each action,
+refresh the current DOM/AX state or screenshot and choose from observed controls;
+do not guess selectors. Project creation may reset the homepage Chat radio to Work,
+so verify Chat in the target Project's composer before sending BOOT. On slow pages,
+make one CUA action per call with `timeout_ms: 60000`; a tool timeout is not proof
+that the page is missing or a total task deadline.
+
+Browser creation can time out after creating its tab. Record `listTabs` before
+creation; after a `createBrowserTab` timeout, reconcile with `listTabs` before
+another attempt. Associate a listed tab with this request only by the exact
+identity returned from creation or a clear before/after inventory difference.
+If associated, retain its complete `providerTabId`, including the namespace, and
+continue with that exact tab; do not blindly retry creation or open another tab.
+URL/title similarity alone is not ownership evidence. If association is ambiguous,
+keep the tab as a diagnostic candidate and continue observing; do not claim it or
+create another. A DOM snapshot or screenshot timeout, or a generic "Please wait..."
+page, means the page is unreadable or still loading. Back off and read the same
+tab again; it does not establish that creation failed or that C2C rejected a
+binding. Claim the first Project only after the exact tab exposes a verifiable
+Project URL and fresh creation evidence. Diagnose explicit CLI/Gateway selection,
+tab or generation validation errors separately from browser read timeouts.
+
 `session get` and `surface get` return additive `pairing` guidance. With no route,
 `pairing.action` is `create-project`. Use `surface get --project-url <url> --json`
 only for a URL already selected by the user; it returns `use-requested-project`
@@ -455,7 +520,7 @@ task finished. Independent sessions retain independent progress pages.
 For C2C, ordinary discovery may use the current chat's picker or prompt-directed
 tool discovery in the normal correlated request. A visible app selection is
 optional; do not open the catalog solely because a chip or picker entry is absent. Any
-exceptional settings or pre-send recovery probe helper is hidden, turn-local and unmarked, with its exact
+exceptional settings helper is hidden, turn-local and unmarked, with its exact
 creation handle retained by the host. Close it after use/failure only after a
 fresh check confirms it remains that helper and has not been taken over. Never
 close user pages, current progress/candidate pages, another session's pages, or
@@ -473,12 +538,21 @@ const tab = await cua.getTab(tabId, { browser: "iab" });
 Validate the returned current URL against the saved `projectUrl` and `chatUrl`.
 A saved route without a `tabId` is invalid for browser routing and follows the
 same replacement branch; it is never a reason to select a tab by URL.
-If the call fails, the tab is closed, or the URL is not the saved Project/chat,
+If fresh evidence proves the tab is missing/closed, or the URL is not the saved Project/chat,
 create a hidden replacement only for this `localSessionId`:
 
 ```javascript
 const replacement = await cua.createBrowserTab("iab", targetUrl, { visible: false });
 ```
+
+A read timeout is not proof of closure. Keep the exact tab and pending request,
+back off and retry observation. `surface check --page-state read-timeout` returns
+`wait`; loading/generating also keep the page. Do not repeat the send.
+This page state is valid only for an already claimed exact tab and generation.
+Before first claim, keep reconciling and reading the exact candidate tab; do not
+invent a generation or use `surface check` to represent a failed DOM read. If the
+candidate cannot be tied to the creation request by its returned identity or the
+inventory difference, leave it unclaimed and do not create a replacement.
 
 Use the saved chat URL when present, otherwise the Project URL. Claim the
 returned stable provider tab id (see "Browser tab identity") with the session's `--local-session`; if a lease is
@@ -525,15 +599,20 @@ c2c surface check --local-session <id> --tab-id <id> --generation <n> \
 | Exact tab missing/closed, or URL changed | Reopen the saved chat in a hidden owned candidate |
 | Explicit archived/unavailable conversation at the exact saved chat URL | Create a new chat in the same owned tab from the saved Project URL, with a fresh generation |
 | C2C picker entry or selected-app chip missing | Keep the chat; attempt the normal authorized request with prompt-directed tool discovery |
-| Explicit chat-specific tool unavailability confirmed, and same-Project replacement capability established | Resolve the request, then use guarded same-tab recovery; UI absence alone never establishes this state |
+| Confirmed tool unavailability | Keep the current chat and diagnose the actual tool failure; tool failure alone does not justify creating another chat |
 | Login, CAPTCHA, 2FA, consent | Show the observed entry or service URL; the user completes login/consent, then the host rechecks the same page |
-| Loading/generating | Wait with bounded backoff and lease renewal |
+| Loading/generating/read-timeout | Wait on the same page with bounded backoff and lease renewal when supported by fresh evidence |
 | Inconclusive UI or absent route | Inspect/pair; do not infer archived or deleted |
 
 `--page-state` is one of `ready`, `archived`, `unavailable`,
-`connector-unavailable`, `missing`,
-`auth-required`, `consent-required`, `loading`, `generating`, or `unknown`.
-Omit the observed URL only for a missing tab or an inconclusive/loading probe.
+`connector-unavailable`, `missing`, `auth-required`, `consent-required`, `loading`,
+`generating`, `read-timeout`, `network-error`, or `unknown`. `network-error` returns
+`inspect-page` with `tabAction: keep` and `targetUrl: null`, even when no URL is
+available. Do not parse generic `data:` or `chrome-error:` metadata as a page route.
+A browser tool refusal on a `data:` URL is a host policy limitation, not evidence of
+C2C or Connector denial; keep the exact tab and do not retry creation. Omit the
+observed URL for a missing tab, an inconclusive/loading/read-timeout probe, or
+`network-error`.
 Stale tab/generation observations fail. The check is not a persistent attestation:
 the host must recheck immediately before and after each send.
 
@@ -544,24 +623,14 @@ in "Result delivery preflight". Successful tool use keeps the original chat
 regardless of the UI. A model-only unavailable claim is an unverified report,
 not independent proof that the chat must be replaced.
 
-Before probing a different composer, inspect the current control request. Do not
-probe/rotate while it is generating or unresolved; first consume any durable
-result and preserve progress. Only after explicit chat-specific tool
-unavailability is confirmed independently of picker visibility,
-the host may create at most one hidden turn-local helper at the saved Project URL
-to inspect its new-Chat composer. Retain its exact creation handle. Do not claim
-it as a session page, send a message or deliver any capability to it. Reuse the
-same semantic search, then close only this owned helper after a fresh ownership
-check, also on failure. Never navigate the old progress tab to obtain this proof.
-
-Use at most one recheck for ambiguous helper observations. If still inconclusive,
-end the recovery inspection with a diagnostic and preserve the original route.
-A new composer's picker can corroborate availability but cannot by itself prove
-the old chat is broken. Only confirmed chat-specific failure plus established
-same-Project replacement capability allows `connector-unavailable`. Re-resolve
-the old exact tab, URL, generation and active request before reporting it.
-No message is sent in the helper. This flow never retries or routes around a
-platform-refused task; a discovery inspection bound is not a generation deadline.
+If the composer is ready and only app visibility is uncertain, use `ready` and
+continue the normal correlated request; no separate discovery message or helper
+tab is needed. Reserve `connector-unavailable` for confirmed tool failures. It
+returns `inspect-page` with `tabAction: keep`: diagnose on the existing route,
+preserve any result and report actual denials through the normal failure path.
+It neither authorizes resubmitting a refused request nor asks the user to select
+an app merely because its chip is absent. Loading and unresolved generation keep
+their current request identity.
 
 The decision also returns `tabAction`: `keep` retains the exact tab,
 `navigate-owned` rotates its chat in place, `create` allocates one hidden
@@ -584,7 +653,7 @@ claim succeeds, navigate this owned tab to the saved Project and run the existin
 BOOT/commit sequence. This revokes old contexts before navigating and changes
 generation/chat, not tab ID. For `create`, create one hidden candidate at the
 returned target and claim it with the same replacement guards. A lost tab
-reuses the original chat; a confirmed archived/unavailable/connector-unavailable
+reuses the original chat; a confirmed archived/unavailable
 chat gets a new chat in
 the same Project. Do not unarchive automatically. After an interrupted claim,
 reuse the recorded candidate and repeat verification before committing. Failed
@@ -673,7 +742,7 @@ does not resolve the ref, approve deployment, or claim that commit-matched sourc
 is available unless the host provided and verified it. If the evidence cannot
 be made complete, keep the review local and do not open a control request.
 
-Known missing capability or evidence is a host preflight failure, not a reason
+Known missing required capability or evidence is a host preflight failure, not a reason
 to create a request that is expected to return `BLOCKED`. `BLOCKED` remains the
 terminal result for a gap discovered after otherwise valid delegation.
 
@@ -845,13 +914,28 @@ Production tools are read-only workspace tools:
 workspace_info
 list_directory
 read_file
+read_many
 search_workspace
 git_status
 git_diff
+review_context
 test_status
 execution_summary
 execution_output
 ```
+
+`read_many` accepts 1–16 workspace-relative file ranges, reuses `read_file`
+permissions/sensitive-path checks and bounds compact JSON output to 64 KiB by
+default. Each item carries an index and either a file or explicit error code.
+Oversized first lines are rejected instead of bypassing the byte cap. Budget or
+per-file failures do not invalidate successful items. Reads are non-atomic.
+
+`review_context` requires `git.read`, accepts the same working-tree modes and
+pagination as `git_diff`, and adds Git identity metadata. With
+`include_execution: true`, it also requires `execution.read` and derives the
+session/task/iteration exclusively from the capability. Null execution means no
+record was supplied/found, not a passing test. It cannot resolve arbitrary refs,
+remote PRs or deployment state. Use the detailed execution tools when needed.
 
 The retained mailbox callbacks `get_control_result_status`,
 `report_control_progress`, and `submit_control_result` are intentionally not
@@ -898,8 +982,9 @@ mailbox directions in the same conversation. The absence of
 `submit_control_result` is expected, is not a blocker, and must not be reported
 as `BLOCKED`. The page marker itself is the delivery; there is no mailbox receipt.
 
-Unavailable read tools, explicit platform rejection or required approval stop
-business work. ChatGPT returns `BLOCKED` in the same final marker. Record phase,
+Unavailable required read tools, explicit platform rejection or required approval stop
+business work. Missing optional evidence allows scoped conclusions with explicit
+gaps. Required input failures return `BLOCKED` in the same final marker. Record phase,
 request ID, timestamp and sanitized observed error/trace;
 distinguish actual MCP error evidence from a model-reported error. Do not infer
 that missing selection caused a rejection, or that a safety check came from
@@ -1095,7 +1180,7 @@ Each request has a monotonically increasing `observationSequence` and one exact
 response identity. The normal ordered lifecycle is:
 
 ```text
-send_attempted -> sent -> response_created -> generating* -> final
+send_attempted -> sent -> [response_created] -> generating* -> final
        \-----------------> response_start_failed
                        \-> response_start_failed
 ```
@@ -1105,7 +1190,11 @@ never means merely "no response is visible yet". `unknown` records an ambiguous
 check without advancing the last definitive state or changing its required
 next action. `page_lost` and `authority_invalid` may terminate from any stage. An
 exact replay is idempotent; a conflicting sequence, lower sequence, skipped
-transition, or different `responseId` is rejected.
+transition, or different `responseId` is rejected. Brackets denote an optional
+event: the first paired response may already be generating or final, so `sent`
+can advance directly to either. This does not permit skipping proof of sending.
+Opaque response locators are normalized deterministically by the CLI; reuse the
+same observed locator or the returned normalized ID on subsequent checks.
 
 For fresh ongoing activity or a confirmed final result/failure, the host submits an
 observation locally:
@@ -1183,6 +1272,17 @@ generating evidence the lease still expires, so an abandoned task cannot retain
 local access indefinitely. Expiry, revoked authorization or gateway restart
 ends this attempt without resurrecting the token or duplicating the task.
 Preserve any already validated result before closing local failure state.
+
+Opening work renews its page lease to cover the request lifetime. For a pending
+request with live authority, claiming the exact unchanged committed tab/chat
+restores an expired lease without changing generation or resending. Changed routes,
+competing owners or expired/revoked capabilities cannot use this recovery.
+
+A final exact response after authority ends may be retained as `lateEvidence`
+only when it matches the recorded prompt's page, tab, generation and sequence.
+`wait.state: evidence_only`, `wait.delivery: none` and
+`wait.nextAction: review_late_evidence` distinguish this from delivery. It cannot
+authorize local reads, commit BOOT or produce an MCP receipt.
 
 For a successful `final`, require `responseIsFinal: true`,
 `delivery: computer_use`, and a `terminalResult` parsed from the exact marker.

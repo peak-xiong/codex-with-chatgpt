@@ -5,7 +5,7 @@ import type { SurfaceBinding, SurfaceLease } from "./surface-ownership.js";
 
 export const PAGE_STATES = [
   "ready", "archived", "unavailable", "connector-unavailable", "missing", "auth-required",
-  "consent-required", "loading", "generating", "unknown",
+  "consent-required", "loading", "generating", "read-timeout", "network-error", "unknown",
 ] as const;
 
 export const pageObservationSchema = z.object({
@@ -51,13 +51,17 @@ export function assessPageHealth(surface: PageRouteState, input: PageObservation
     tabId: observation.tabId,
     generation: observation.generation,
   });
+  // Error-page URLs are diagnostics, not routes to normalize or compare.
+  if (observation.state === "network-error") {
+    return decision("inspect-page", "network-error");
+  }
   if (observation.state === "auth-required" || observation.state === "consent-required") {
     return decision("user-action", observation.state);
   }
   if (observation.state === "missing") {
     return decision(chatUrl ? "reopen-chat" : "create-project-chat", "tab-missing", chatUrl ?? projectUrl, "create");
   }
-  if (observation.state === "loading" || observation.state === "generating") {
+  if (observation.state === "loading" || observation.state === "generating" || observation.state === "read-timeout") {
     return decision("wait", observation.state);
   }
   if (!observation.url || observation.state === "unknown") {
@@ -71,11 +75,15 @@ export function assessPageHealth(surface: PageRouteState, input: PageObservation
   if (!routeMatches) {
     return decision(chatUrl ? "reopen-chat" : "create-project-chat", "url-mismatch", chatUrl ?? projectUrl, "create");
   }
+  // Tool availability is not chat availability. Diagnose on this route without rotating it.
+  // A missing app chip/picker alone is a ready/unknown UI observation, not this state.
+  if (observation.state === "connector-unavailable") {
+    return decision("inspect-page", "connector-unavailable");
+  }
   // Do not overwrite a user-navigated tab or infer failure of the saved chat from another URL.
   if (
     observation.state === "archived" ||
-    observation.state === "unavailable" ||
-    observation.state === "connector-unavailable"
+    observation.state === "unavailable"
   ) {
     if (!chatUrl) return decision("inspect-page", "candidate-state-unconfirmed", null, "inspect");
     return decision("create-project-chat", observation.state, projectUrl, "navigate-owned");

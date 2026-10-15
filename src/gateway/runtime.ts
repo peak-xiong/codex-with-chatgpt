@@ -134,7 +134,7 @@ export function writeMachineRuntime(state: MachineRuntimeState): void {
 }
 
 export function readMachineRuntime(): MachineRuntimeState | null {
-  const file = machineRuntimeFile();
+  const file = path.join(getStateDir(), "runtime", "machine.json");
   const value = readJsonIfExists<unknown>(file);
   if (value === null) {
     if (fs.existsSync(file)) throw new Error("machine runtime is unreadable or malformed");

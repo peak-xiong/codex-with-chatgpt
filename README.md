@@ -370,6 +370,14 @@ bindings for the new account.
 
 ### 6. Verify installation, then the real round trip
 
+For ordinary sessions, start with `c2c preflight --json` from the project root.
+It returns the device Connector, registration, saved page, pending request and
+next action in one read-only snapshot. Reuse the same owned tab, wait through
+loading/read timeouts, and read only the prompt-paired response. There is no total
+task timeout. Missing optional evidence can be reported as gaps; platform denials
+and missing required evidence still block that attempt. The checks below are for
+installation verification, not a checklist to repeat before every message.
+
 Use the global command from now on:
 
 ```sh

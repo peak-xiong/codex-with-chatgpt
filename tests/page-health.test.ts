@@ -42,18 +42,11 @@ describe("host page recovery decisions", () => {
 
   it("reuses a confirmed unavailable chat tab but never navigates an unrelated or unverified page", () => {
     expect(assessPageHealth(surface, { ...observation, state: "unavailable" }).tabAction).toBe("navigate-owned");
-    expect(assessPageHealth(surface, { ...observation, state: "connector-unavailable" })).toMatchObject({
-      action: "create-project-chat", reason: "connector-unavailable", targetUrl: projectUrl,
-      controlReady: false, tabAction: "navigate-owned",
-    });
     expect(assessPageHealth(surface, { ...observation, state: "archived", url: chatUrl.replace("chat-a", "other") })).toMatchObject({
       action: "reopen-chat", tabAction: "create", targetUrl: chatUrl,
     });
     expect(assessPageHealth({ ...surface, binding: null, lease: { ...lease, chatUrl: undefined } }, {
       ...observation, state: "unavailable", url: projectUrl,
-    })).toMatchObject({ action: "inspect-page", tabAction: "inspect" });
-    expect(assessPageHealth({ ...surface, binding: null, lease: { ...lease, chatUrl: undefined } }, {
-      ...observation, state: "connector-unavailable", url: projectUrl,
     })).toMatchObject({ action: "inspect-page", tabAction: "inspect" });
     expect(assessPageHealth({ ...surface, lease: null }, observation)).toMatchObject({
       action: "verify-candidate", tabAction: "keep",
@@ -63,16 +56,62 @@ describe("host page recovery decisions", () => {
     }
   });
 
+  it("keeps committed and candidate pages when the connector is unavailable", () => {
+    for (const route of [surface, { ...surface, binding: null, lease: { ...lease, chatUrl: undefined } }]) {
+      expect(assessPageHealth(route, {
+        ...observation, state: "connector-unavailable", url: route.binding ? chatUrl : projectUrl,
+      })).toMatchObject({
+        action: "inspect-page", reason: "connector-unavailable", targetUrl: null,
+        controlReady: false, tabAction: "keep", tabId: lease.tabId, generation: lease.generation,
+      });
+    }
+    expect(assessPageHealth(surface, observation)).toMatchObject({
+      action: "resume-chat", controlReady: true, tabAction: "keep",
+    });
+  });
+
   it("does not turn transient, authentication or ambiguous states into replacement", () => {
     for (const state of ["auth-required", "consent-required"] as const) {
       expect(assessPageHealth(surface, { ...observation, state, url: "https://chatgpt.com/" }).action).toBe("user-action");
     }
-    for (const state of ["loading", "generating"] as const) {
+    for (const state of ["loading", "generating", "read-timeout"] as const) {
       expect(assessPageHealth(surface, { ...observation, state, url: undefined }).action).toBe("wait");
     }
     expect(assessPageHealth(surface, { ...observation, state: "unknown" }).action).toBe("inspect-page");
     expect(assessPageHealth(surface, { ...observation, url: undefined }).action).toBe("inspect-page");
     expect(() => assessPageHealth({ projectUrl: null, lease: null, binding: null }, observation)).toThrow(/current surface/);
+  });
+
+  it("waits on the exact claimed tab and generation when a read times out", () => {
+    expect(assessPageHealth(surface, {
+      ...observation, state: "read-timeout", url: "https://chatgpt.com/",
+    })).toMatchObject({
+      action: "wait", reason: "read-timeout", targetUrl: null, controlReady: false,
+      tabAction: "keep", tabId: lease.tabId, generation: lease.generation,
+    });
+  });
+
+  it("keeps explicit browser policy errors without interpreting data or chrome error URLs", () => {
+    for (const url of ["data:text/html,network-error", "chrome-error://chromewebdata/"]) {
+      expect(assessPageHealth(surface, {
+        tabId: lease.tabId, generation: lease.generation, state: "network-error", url,
+      })).toMatchObject({
+        action: "inspect-page", reason: "network-error", targetUrl: null, controlReady: false,
+        tabAction: "keep", tabId: lease.tabId, generation: lease.generation,
+      });
+    }
+    expect(assessPageHealth(surface, {
+      tabId: lease.tabId, generation: lease.generation, state: "network-error",
+    })).toMatchObject({
+      action: "inspect-page", reason: "network-error", targetUrl: null, controlReady: false,
+      tabAction: "keep", tabId: lease.tabId, generation: lease.generation,
+    });
+    expect(() => assessPageHealth(surface, {
+      tabId: "tab-b", generation: lease.generation, state: "network-error",
+    })).toThrow(/tab and generation/);
+    expect(() => assessPageHealth(surface, {
+      tabId: lease.tabId, generation: lease.generation - 1, state: "network-error",
+    })).toThrow(/tab and generation/);
   });
 
   it("rejects observations from another page or an older generation", () => {

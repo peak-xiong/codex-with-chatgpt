@@ -13,7 +13,8 @@ import {
 import { threadSessionFile } from "../src/session/state.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { submitControlResult } from "../src/control/mailbox.js";
-import { requireHttpAuthToken } from "../src/config/http-auth.js";
+import { httpAuthFile, requireHttpAuthToken } from "../src/config/http-auth.js";
+import { machineConnectorFile } from "../src/gateway/connector-binding.js";
 
 const projectRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const cliEntry = path.join(projectRoot, "src", "cli", "index.ts");
@@ -91,7 +92,11 @@ describe("machine CLI lifecycle", () => {
     delete process.env.C2C_STATE_DIR;
   });
 
-  it("reuses one machine gateway and routes an exact workspace turn", () => {
+  it("reuses one machine gateway and routes an exact workspace turn", async () => {
+    const initialPreflight = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
+    expect(initialPreflight.command.status).toBe(0);
+    expect(initialPreflight.body).toMatchObject({ nextAction: "configure_endpoint", nextStep: null });
+
     const started = runJson(stateDir, ["machine", "start"]);
     expect(started.command.status, JSON.stringify(started)).toBe(0);
     expect(started.body).toMatchObject({ ok: true, started: false });
@@ -107,12 +112,27 @@ describe("machine CLI lifecycle", () => {
     expect(endpoint.command.status, JSON.stringify(endpoint)).toBe(0);
     expect(endpoint.body).toMatchObject({ mcpUrl: "https://c2c-test.ngrok-free.dev/mcp" });
 
+    fs.unlinkSync(httpAuthFile());
+    const authGate = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
+    expect(authGate.body).toMatchObject({ nextAction: "configure_auth", nextStep: null });
+    const authToken = requireHttpAuthToken().token;
+    fs.chmodSync(httpAuthFile(), 0o644);
+    const permissionsGate = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
+    expect(permissionsGate.body).toMatchObject({ nextAction: "repair_auth_permissions", nextStep: null });
+    fs.chmodSync(httpAuthFile(), 0o600);
+    fs.unlinkSync(machineConnectorFile());
+    const connectorGate = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
+    expect(connectorGate.body).toMatchObject({ nextAction: "configure_connector", nextStep: null });
+    const connector = runJson(stateDir, ["machine", "connector", "set", "--name", "test ChatGPT app"]);
+    expect(connector.command.status).toBe(0);
+    const registrationGate = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
+    expect(registrationGate.body).toMatchObject({ nextAction: "register_workspace", nextStep: null });
+
     // The connector UI has no static-key field, so the token has to travel in the
     // URL. That makes the assembled URL a credential: `endpoint get` must stay
     // token-free unless `--reveal` asks, and the hint it does print is truncated.
     // The token is read straight from the store rather than through another CLI run,
     // so this asserts against the real configured value with no extra subprocess.
-    const authToken = requireHttpAuthToken().token;
     const plainJson = runJson(stateDir, ["machine", "endpoint", "get"]);
     expect(plainJson.body).toMatchObject({ mcpUrl: "https://c2c-test.ngrok-free.dev/mcp" });
     expect(plainJson.body).not.toHaveProperty("mcpUrlWithToken");
@@ -147,6 +167,15 @@ describe("machine CLI lifecycle", () => {
       registrationId: string;
     };
 
+    const registerGate = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
+    expect(registerGate.body).toMatchObject({ nextAction: "pair_project_chat", nextStep: "create-project" });
+    const selectedProject = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine",
+      "--project-url", "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project"]);
+    expect(selectedProject.body).toMatchObject({
+      nextAction: "pair_project_chat", nextStep: "create-project-chat",
+      pairing: { action: "use-requested-project", selectionSource: "user-confirmed" },
+    });
+
     const initial = runJson(stateDir, ["surface", "get", "--local-session", "session-cli-machine"]);
     expect(initial.command.status).toBe(0);
     expect(initial.body).toMatchObject({ projectUrl: null, binding: null, pairing: { action: "create-project" } });
@@ -175,6 +204,8 @@ describe("machine CLI lifecycle", () => {
       "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/session-cli-machine",
     ]);
     expect(claimed.command.status).toBe(0);
+    const ownedPagePreflight = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
+    expect(ownedPagePreflight.body).toMatchObject({ nextStep: "inspect-owned-page" });
     const bootRequestId = receiveBootForCliSurface(
       stateDir,
       workspace,
@@ -198,6 +229,27 @@ describe("machine CLI lifecycle", () => {
       "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/session-cli-machine",
     ]);
     expect(committed.command.status).toBe(0);
+    const secondSessionPreflight = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine-two"]);
+    expect(secondSessionPreflight.body).toMatchObject({
+      nextAction: "pair_project_chat", nextStep: "create-project-chat",
+      pairing: { action: "create-project-chat" },
+    });
+
+    const released = runJson(stateDir, ["surface", "release", "--local-session", "session-cli-machine",
+      "--generation", String(claimed.body.lease.generation), "--tab-id", "tab-cli-machine"]);
+    expect(released.command.status).toBe(0);
+    expect(released.body.released).toBe(true);
+    const reclaimPreflight = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
+    expect(reclaimPreflight.body).toMatchObject({
+      nextAction: "claim_saved_page", nextStep: null,
+      pairing: { action: "inspect-owned-page" },
+    });
+    const reclaimed = runJson(stateDir, ["surface", "claim", "--local-session", "session-cli-machine",
+      "--tab-id", "tab-cli-machine", "--project-url", "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project",
+      "--chat-url", "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/session-cli-machine",
+      "--replace-generation", String(claimed.body.lease.generation), "--replace-tab-id", "tab-cli-machine"]);
+    expect(reclaimed.command.status).toBe(0);
+    expect(reclaimed.body.lease.generation).toBe(claimed.body.lease.generation + 1);
 
     const surface = runJson(stateDir, [
       "surface",
@@ -214,7 +266,7 @@ describe("machine CLI lifecycle", () => {
     );
     const pageCheckArgs = [
       "surface", "check", "--local-session", "session-cli-machine", "--tab-id", "tab-cli-machine",
-      "--generation", String(claimed.body.lease.generation),
+      "--generation", String(reclaimed.body.lease.generation),
       "--observed-url", committed.body.binding.chatUrl,
     ];
     const archived = runJson(stateDir, [...pageCheckArgs, "--page-state", "archived"]);
@@ -227,8 +279,8 @@ describe("machine CLI lifecycle", () => {
     ]);
     expect(connectorUnavailable.command.status).toBe(0);
     expect(connectorUnavailable.body).toMatchObject({
-      action: "create-project-chat", reason: "connector-unavailable", controlReady: false,
-      targetUrl: surface.body.projectUrl, tabAction: "navigate-owned", control: null,
+      action: "inspect-page", reason: "connector-unavailable", controlReady: false,
+      targetUrl: null, tabAction: "keep", control: null,
     });
     const healthy = runJson(stateDir, [...pageCheckArgs, "--page-state", "ready"]);
     expect(healthy.body).toMatchObject({ action: "resume-chat", controlReady: true });
@@ -280,10 +332,20 @@ describe("machine CLI lifecycle", () => {
     ]);
     expect(issued.command.status).toBe(0);
     expect(issued.body.contextId).toMatch(/^c2c_ctx_[A-Za-z0-9_-]{43}$/);
+    const pendingPreflight = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
+    expect(pendingPreflight.body).toMatchObject({ nextAction: "resume_request", nextStep: "resume-control" });
 
     const cancelled = runJson(stateDir, ["machine", "context", "cancel", "--context-id", issued.body.contextId as string]);
     expect(cancelled.command.status).toBe(0);
     expect(cancelled.body.cancelled).toBe(true);
+
+    const expired = runJson(stateDir, ["control", "open", "-w", workspace,
+      "--local-session", "session-cli-machine", "--task", "task-cli-machine-expired",
+      "--iteration", "0", "--phase", "PLAN", "--compaction-epoch", "0", "--ttl-ms", "1000"]);
+    expect(expired.command.status).toBe(0);
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    const expiredPreflight = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
+    expect(expiredPreflight.body).toMatchObject({ nextAction: "inspect_expired_response", nextStep: null });
 
     const staleRelease = runJson(stateDir, [
       "surface",
@@ -300,7 +362,7 @@ describe("machine CLI lifecycle", () => {
     expect(staleRelease.command.status).toBe(1);
     expect(staleRelease.body.error).toMatch(/generation|tab-id/);
 
-    const released = runJson(stateDir, [
+    const releasedAfterExpiredRequest = runJson(stateDir, [
       "surface",
       "release",
       "-w",
@@ -312,8 +374,8 @@ describe("machine CLI lifecycle", () => {
       "--tab-id",
       "tab-cli-machine",
     ]);
-    expect(released.command.status).toBe(0);
-    expect(released.body.released).toBe(true);
+    expect(releasedAfterExpiredRequest.command.status).toBe(0);
+    expect(releasedAfterExpiredRequest.body.released).toBe(true);
 
     const retired = runJson(stateDir, [
       "surface",

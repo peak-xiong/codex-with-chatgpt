@@ -228,7 +228,12 @@ export class Workspace {
       totalLines++;
       if (totalLines >= startLine && totalLines <= endLimit && !byteTruncated) {
         const cost = Buffer.byteLength(line, "utf8") + 1;
-        if (collectedBytes + cost > maxBytes && lines.length > 0) {
+        if (collectedBytes + cost > maxBytes) {
+          if (lines.length === 0) {
+            rl.close();
+            stream.destroy();
+            throw new WorkspaceError("FILE_TOO_LARGE", "First requested line exceeds the read byte budget; use a bounded local artifact.");
+          }
           byteTruncated = true;
         } else {
           lines.push(line);

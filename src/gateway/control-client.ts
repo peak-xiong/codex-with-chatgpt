@@ -186,6 +186,13 @@ export function registerWorkspace(
   return adminFetch(runtime, "POST", "/admin/workspaces/register", { root }, timeoutMs);
 }
 
+export function preflight(runtime: MachineRuntimeState, root: string, localSessionId: string) {
+  return adminFetch<{
+    registration: RegisterWorkspaceResponse | null;
+    surface: SurfaceViewResponse | null;
+  }>(runtime, "POST", "/admin/preflight", { root, localSessionId });
+}
+
 export function issueTurn(
   runtime: MachineRuntimeState,
   input: IssueTurnCapabilityInput,

@@ -36,7 +36,7 @@ export function publicEndpointFile(): string {
 }
 
 function readEndpoint(): PublicEndpoint | null {
-  const file = publicEndpointFile();
+  const file = path.join(getStateDir(), "http", "endpoint.json");
   const stat = fs.lstatSync(file, { throwIfNoEntry: false });
   if (!stat) return null;
   if (!stat.isFile() || stat.isSymbolicLink()) {

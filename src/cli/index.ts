@@ -73,6 +73,7 @@ import {
   cancelTurn as cancelMachineTurn,
   getMailboxStatus,
   getSurface as getMachineSurface,
+  preflight as machinePreflight,
   issueTurn as issueMachineTurn,
   openMailboxRequest,
   observeMailboxPage,
@@ -133,11 +134,11 @@ import { PRODUCT_NAME, VERSION } from "../version.js";
 import { Workspace } from "../workspace/manager.js";
 import { assessPageHealth, PAGE_STATES, pageObservationSchema } from "../session/page-health.js";
 import { planProjectPairing } from "../session/project-selection.js";
+import { DEFAULT_SURFACE_TTL_MS } from "../session/surface-ownership.js";
 
 const program = new Command();
 const DEFAULT_TURN_TTL_MS = 30 * 60_000;
 const MAX_TURN_TTL_MS = 60 * 60_000;
-const DEFAULT_SURFACE_TTL_MS = 60 * 60_000;
 const MAX_RECORD_OUTPUT_READ = 256 * 1024;
 
 const say = (message: string): void => {
@@ -419,6 +420,7 @@ function sessionOwnerEpoch(localSessionId: string): string {
 async function machineSurfaceContext(
   workspace: Workspace,
   localSessionId: string,
+  allowSetup = true,
 ): Promise<{
   runtime: MachineRuntimeState;
   identity: {
@@ -428,8 +430,12 @@ async function machineSurfaceContext(
     localSessionId: string;
   };
 }> {
-  const runtime = (await ensureMachineGateway()).runtime;
-  const registration = await registerMachineWorkspace(runtime, workspace.root);
+  const observed = await observeMachineRuntime();
+  if (!allowSetup && observed.state !== "healthy") throw new Error("Machine gateway is not running; use machine start explicitly.");
+  const runtime = observed.state === "healthy" ? observed.runtime : (await ensureMachineGateway()).runtime;
+  let registration = (await machinePreflight(runtime, workspace.root, localSessionId)).registration;
+  if (!registration && allowSetup) registration = await registerMachineWorkspace(runtime, workspace.root);
+  if (!registration) throw new Error("Workspace is not registered; use workspace register explicitly.");
   if (registration.workspaceId !== workspace.id || registration.projectId !== workspace.projectId) {
     throw new Error("Machine workspace registration does not match the trusted local workspace.");
   }
@@ -449,6 +455,64 @@ program
   .description(`${PRODUCT_NAME} — ChatGPT thinks. Codex works.`)
   .version(VERSION, "-v, --version")
   .configureHelp({ sortSubcommands: true });
+
+program.command("preflight")
+  .description("Read-only gateway, device, workspace and session snapshot; never starts or repairs services")
+  .option("-w, --workspace <path>")
+  .option("--local-session <id>")
+  .option("--project-url <url>", "exact Project URL already selected by the user; does not bind it")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; localSession?: string; projectUrl?: string; json: boolean }) => {
+    try {
+      const root = resolveWorkspace(opts.workspace);
+      const sessionIdentity = currentLocalSessionIdentity(opts.localSession);
+      const gateway = await observeMachineRuntime();
+      const identity = gateway.state === "healthy" ? gateway.runtime : readMachineIdentity();
+      const connector = identity ? machineConnectorStatus({ machineId: identity.machineId }) : { status: "unconfigured", binding: null };
+      const endpoint = publicEndpointStatus();
+      const auth = httpAuthStatus();
+      const snapshot = gateway.state === "healthy" ? await machinePreflight(gateway.runtime, root, sessionIdentity.id) : null;
+      const control = snapshot?.surface?.control;
+      const wait = control ? controlWaitPolicy(control) : null;
+      const pairing = snapshot?.surface ? planProjectPairing(snapshot.surface, opts.projectUrl) : null;
+      const nextAction = gateway.state !== "healthy" ? "start_gateway"
+        : control?.status === "pending" ? "resume_request"
+        : control?.status === "received" ? "consume_result"
+        : control?.status === "expired" ? "inspect_expired_response"
+        : !endpoint ? "configure_endpoint"
+        : !auth.configured ? "configure_auth"
+        : !auth.permissionsSafe ? "repair_auth_permissions"
+        : connector.status !== "bound" ? "configure_connector"
+        : !snapshot?.registration ? "register_workspace"
+        : !snapshot.surface?.binding ? "pair_project_chat"
+        : !snapshot.surface.lease ? "claim_saved_page" : "inspect_saved_page";
+      const pairingNextStep = pairing ? ({
+        "create-project": "create-project",
+        "use-requested-project": "create-project-chat",
+        "create-project-chat": "create-project-chat",
+        "inspect-owned-page": "inspect-owned-page",
+        "resume-control": "resume-control",
+      } as const)[pairing.action] : null;
+      const prerequisitesReady = gateway.state === "healthy" && endpoint !== null && auth.configured &&
+        auth.permissionsSafe && connector.status === "bound" && Boolean(snapshot?.registration);
+      const hasUnleasedSavedBinding = Boolean(snapshot?.surface?.binding && !snapshot.surface.lease);
+      const routeActionReady = nextAction === "pair_project_chat" || nextAction === "inspect_saved_page";
+      const pendingControlReady = nextAction === "resume_request" && control?.status === "pending" &&
+        pairing?.action === "resume-control";
+      const nextStep = prerequisitesReady && (routeActionReady || pendingControlReady) &&
+        (!hasUnleasedSavedBinding || pendingControlReady) ? pairingNextStep : null;
+      const payload = {
+        ok: gateway.state === "healthy", readOnly: true, sessionIdentity,
+        gateway: machineRuntimeObservationView(gateway), connector,
+        auth: { configured: auth.configured, permissionsSafe: auth.permissionsSafe },
+        endpoint: { configured: endpoint !== null, mcpUrl: publicMcpUrl(endpoint), reachability: "unverified", requires: "actual ChatGPT MCP invocation" },
+        registration: snapshot?.registration ?? null, surface: snapshot?.surface ?? null,
+        pairing, wait, nextAction, nextStep,
+      };
+      if (opts.json) say(JSON.stringify(payload));
+      else say(`Gateway: ${gateway.state}; connector: ${connector.status}; next: ${nextAction}`);
+    } catch (error) { handleCliError(error, opts.json); }
+  });
 
 // Started by the machine daemon and reached through a public tunnel.
 program
@@ -1894,7 +1958,7 @@ addControlLookupOptions(control.command("status"), "optional")
   }) => {
     try {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
-      const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession));
+      const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession), false);
       const status = await getMailboxStatus(identity.runtime, identity.identity, {
         requestId: opts.request,
         ...parseControlCorrelation(opts),
@@ -1926,7 +1990,7 @@ addControlLookupOptions(
   }) => {
     try {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
-      const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession));
+      const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession), false);
       const timeoutMs = parseIntegerOption(opts.timeoutMs, "timeout-ms", 0, 86_400_000);
       const status = await waitMailboxResult(identity.runtime, identity.identity, {
         requestId: opts.request,
@@ -1934,8 +1998,8 @@ addControlLookupOptions(
         timeoutMs,
       });
       const received = status.status === "received" || status.status === "acknowledged";
-      const computerUseDelivered = status.status === "cancelled" && status.hostObservedResult !== undefined;
       const wait = controlWaitPolicy(status);
+      const computerUseDelivered = wait.delivery === "computer_use";
       if (opts.json) say(JSON.stringify({ ok: received || computerUseDelivered, ...status, wait }));
       else if (status.result) say(JSON.stringify(status.result, null, 2));
       else say(`状态：${status.status}; ${wait.outcome}; ${wait.nextAction}`);
@@ -1958,7 +2022,7 @@ addControlLookupOptions(control.command("observe"), "optional")
       catch { throw new Error("page-observation must be valid JSON; raw page text is not accepted"); }
       const observation = parseControlPageObservation(rawObservation);
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
-      const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession));
+      const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession), false);
       const status = await observeMailboxPage(identity.runtime, identity.identity, {
         requestId: opts.request, ...parseControlCorrelation(opts), observation,
       });

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { controlWaitPolicy } from "../src/control/wait-policy.js";
 import { MachineGateway, requireCurrentTurnSurface } from "../src/gateway/machine-gateway.js";
 import { TurnCapabilityError, type TurnCapabilityBinding } from "../src/gateway/turn-capability.js";
 import { acknowledgeControlResult, getControlResultStatus, openControlResultRequest, submitControlResult } from "../src/control/mailbox.js";
@@ -360,6 +361,7 @@ describe("machine gateway surface invalidation", () => {
       hostFailure: { reason: "callback_missing" },
       hostObservedResult: { result: { kind: "BOOT" } },
     });
+    expect(controlWaitPolicy(failed)).toMatchObject({ state: "failed", delivery: "none", result: null });
     expect(() => gateway.surfaceCommit(identity, candidate, {
       bootRequestId: boot.request.requestId,
       chatUrl: candidate.chatUrl,
@@ -392,8 +394,10 @@ describe("machine gateway surface invalidation", () => {
       now: claimedAt,
     });
     const context = issueBootTurn(gateway, registration, "session-expiry", owned.generation, "task-expiry").grant;
-
-    expect(reapExpiredSurfaceLeases(registration.projectId, new Date(claimedAt.getTime() + 1_001))).toBe(1);
+    // Opening the request now renews the idle lease. Exercise actual later lease loss.
+    gateway.surfaceRenew({ ...registration, localSessionId: "session-expiry" }, owned, 1_000);
+    const renewed = gateway.surfaceGet({ ...registration, localSessionId: "session-expiry" }).lease!;
+    expect(reapExpiredSurfaceLeases(registration.projectId, new Date(Date.parse(renewed.leaseExpiresAt) + 1))).toBe(1);
     expectCode(() => gateway.claimTurn(context.token, ["workspace.read"]), "STALE_BINDING_EPOCH");
     expect(gateway.turnStatus(context.token).status).toBe("revoked");
   });

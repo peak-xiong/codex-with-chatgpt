@@ -23,6 +23,8 @@ import {
   acknowledgeControlResult,
   cancelControlResultRequest,
   getActiveControlResultStatus,
+  inspectActiveControlResultStatus,
+  recordLateControlEvidence,
   getControlResultStatus,
   openControlResultRequestWithStatus,
   observeControlResultRequest,
@@ -38,6 +40,7 @@ import {
 } from "../control/mailbox.js";
 import {
   parseControlProgressUpdate,
+  canonicalJson,
   parseControlResultSubmission,
   parseReportControlProgressInput,
   parseSubmitControlResultInput,
@@ -57,6 +60,8 @@ import {
   requireSurfaceGeneration,
   releaseSurface,
   renewSurface,
+  recoverSurface,
+  inspectSurface,
   retireSurfaceSession,
   unregisterSurfaceOwnership,
   currentProjectUrl,
@@ -75,7 +80,7 @@ import {
   projectIdFromChatUrl,
   projectIdFromUrl,
 } from "../session/state.js";
-import { parseControlPageObservation, type ControlPageObservation } from "../control/wait-policy.js";
+import { CONTROL_PAGE_CHECK_INTERVAL_MS, parseControlPageObservation, type ControlPageObservation } from "../control/wait-policy.js";
 
 export type SurfaceGenerationValidator = (binding: TurnCapabilityBinding) => void;
 
@@ -275,6 +280,20 @@ export class MachineGateway {
     };
   }
 
+  /** One read-only snapshot; never repairs a route or creates a registration. */
+  preflight(root: string, localSessionId: string) {
+    const registration = this.registry.inspect(root);
+    if (!registration) return { registration: null, surface: null };
+    const { workspaceId, projectId, registrationId, workspace } = registration;
+    return {
+      registration: { workspaceId, projectId, registrationId, workspaceName: workspace.name },
+      surface: {
+        ...inspectSurface(projectId, localSessionId),
+        control: inspectActiveControlResultStatus(workspaceId, localSessionId),
+      },
+    };
+  }
+
   surfaceClaim(
     identity: MachineSurfaceIdentity,
     input: Omit<ClaimSurfaceOptions, "projectId" | "localSessionId">,
@@ -290,6 +309,15 @@ export class MachineGateway {
     if (!idempotent) {
       const control = getActiveControlResultStatus(identity.workspaceId, identity.localSessionId);
       if (control?.status === "pending" || control?.status === "received") {
+        const binding = currentSurfaceBinding(identity.projectId, identity.localSessionId);
+        if (!previous && control.status === "pending" && binding &&
+            binding.browserId === input.browserId && binding.surfaceId === input.surfaceId &&
+            binding.tabId === input.tabId && binding.projectUrl === normalizeProjectUrl(input.projectUrl) &&
+            binding.chatUrl === (input.chatUrl && normalizeChatUrl(input.chatUrl)) &&
+            binding.lastGeneration === control.request?.surfaceGeneration &&
+            this.broker.hasLiveRequest({ ...identity, ...correlationFromStoredRequest(control.requestId, control.request), requestId: control.requestId })) {
+          return recoverSurface(binding, input.ownerProcessEpoch ?? currentOwnerProcessEpoch(), input.leaseTtlMs);
+        }
         throw new SurfaceOwnershipError(
           "SURFACE_CONTROL_UNRESOLVED",
           "Resolve the active mailbox request before replacing this page: cancel pending work or consume and acknowledge a received result.",
@@ -508,12 +536,27 @@ export class MachineGateway {
       identity.projectId,
       identity.localSessionId,
     );
-    return openControlResultRequestWithStatus(identity.workspaceId, {
+    const opened = openControlResultRequestWithStatus(identity.workspaceId, {
       ...input,
       localSessionId: identity.localSessionId,
       surfaceGeneration: surface?.generation,
       surfaceTabId: surface?.tabId,
     });
+    if (surface && opened.created) {
+      // Starting work must not inherit a nearly expired idle page lease.
+      try {
+        this.surfaceRenew(identity, surface, Math.max(
+          Date.parse(surface.leaseExpiresAt) - Date.parse(surface.updatedAt),
+          Date.parse(opened.request.expiresAt) - Date.now(),
+          1_000,
+        ));
+      } catch (error) {
+        // No prompt/capability has been issued yet. Do not leave an orphan pending request.
+        cancelControlResultRequest(identity.workspaceId, opened.request.requestId, identity.localSessionId, input);
+        throw error;
+      }
+    }
+    return opened;
   }
 
   getControlResultStatus(
@@ -540,6 +583,8 @@ export class MachineGateway {
       identity.localSessionId,
       expected,
       signal,
+      // Computer Use is the producer; repeated mailbox reads cannot observe the page.
+      CONTROL_PAGE_CHECK_INTERVAL_MS,
     );
   }
 
@@ -592,12 +637,31 @@ export class MachineGateway {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
     const observation = parseControlPageObservation(input);
     const status = this.getControlResultStatus(identity, requestId, expected);
-    if (status.status !== "pending" && status.status !== "cancelled") return status;
+    if (status.lateEvidence && status.status !== "pending" && canonicalJson(status.lateEvidence) === canonicalJson(observation)) return status;
+    if (status.status !== "pending" && status.status !== "cancelled" && status.status !== "expired") return status;
     // `expected` is optional on this path. When the caller omits it, address the broker
     // by the triple the request itself stores. This is not a weaker check: a supplied
     // triple that disagreed with the stored one was already rejected by
     // `assertCorrelation`, so the two sources agree by construction.
     const correlation = expected ?? correlationFromStoredRequest(requestId, status.request);
+    const liveAuthority = this.broker.hasLiveRequest({ ...identity, ...correlation, requestId });
+    if ((status.status === "expired" || (status.status === "pending" && !liveAuthority)) && observation.state === "final") {
+      const prior = status.pageObservation?.lastDefinitive;
+      // Only the historical prompt-paired route is evidence; it cannot authorize new reads or BOOT.
+      if (!prior || !("observedUrl" in prior) || observation.observedUrl !== prior.observedUrl ||
+          Date.parse(observation.observedAt) < Date.now() - 60_000 || Date.parse(observation.observedAt) > Date.now() + 5_000) {
+        throw new TurnCapabilityError("BINDING_MISMATCH", "late evidence must match the saved exact page");
+      }
+      const preserved = recordLateControlEvidence(identity.workspaceId, requestId, identity.localSessionId, correlation, observation);
+      if (preserved.status !== "pending") return preserved;
+      return observeControlResultRequest(identity.workspaceId, requestId, identity.localSessionId, correlation, {
+        tabId: observation.tabId, generation: observation.generation,
+        responseToRequestId: requestId, observedAt: observation.observedAt,
+        observationSequence: observation.observationSequence,
+        state: "authority_invalid", reason: "capability_invalid", source: "host_observed", errorCode: "TOKEN_REVOKED",
+      });
+    }
+    if (status.status === "expired") return status;
     if (status.status === "cancelled" && status.hostFailure !== undefined) {
       try {
         return observeControlResultRequest(
@@ -614,14 +678,14 @@ export class MachineGateway {
     if (
       status.status === "pending" &&
       observation.state === "authority_invalid" &&
-      this.broker.hasLiveRequest({ ...identity, ...correlation, requestId })
+      liveAuthority
     ) {
       throw new TurnCapabilityError(
         "BINDING_MISMATCH",
         "authority-invalid observation conflicts with a live capability for this request",
       );
     }
-    const lease = currentSurfaceLease(identity.projectId, identity.localSessionId);
+    let lease = currentSurfaceLease(identity.projectId, identity.localSessionId);
     const binding = currentSurfaceBinding(identity.projectId, identity.localSessionId);
     const observedAt = Date.parse(observation.observedAt);
     const observedUrl = "observedUrl" in observation && observation.observedUrl
@@ -667,9 +731,12 @@ export class MachineGateway {
       binding.chatUrl &&
       canonicalChatUrl === binding.chatUrl,
     );
+    const recoverableRoute = !lease && committedRoute && requestSurfaceMatches &&
+      binding?.tabId === observation.tabId &&
+      liveAuthority;
     if (
       !status.request || observation.responseToRequestId !== requestId ||
-      !requestSurfaceMatches || (!liveLeaseMatches && !mayCloseWithoutLiveLease) ||
+      !requestSurfaceMatches || (!liveLeaseMatches && !mayCloseWithoutLiveLease && !recoverableRoute) ||
       (observedUrl !== null && (
         observedUrl.username || observedUrl.password || observedUrl.search || observedUrl.hash ||
         (!candidateBootRoute && !committedRoute)
@@ -690,7 +757,9 @@ export class MachineGateway {
         expected,
         observation,
         observation.state === "generating" ? () => {
-          if (!lease || !liveLeaseMatches) {
+          // The mailbox validates sequence and response identity before invoking this callback.
+          if (recoverableRoute) lease = recoverSurface(binding!, currentOwnerProcessEpoch());
+          if (!lease) {
             throw new TurnCapabilityError("LEASE_NOT_FOUND", "generating observation requires the exact live surface lease");
           }
           const expiresAt = this.broker.keepAliveRequest({

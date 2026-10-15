@@ -508,6 +508,16 @@ export async function startMachineGatewayServer(
     }
   });
 
+  app.post("/admin/preflight", adminGuard, (req, res) => {
+    try {
+      const input = z.object({ root: z.string().min(1).max(4096), localSessionId: c2cIdSchema }).strict().parse(req.body);
+      res.json(gateway.preflight(input.root, input.localSessionId));
+    } catch (error) {
+      const response = errorResponse(error);
+      res.status(response.status).json(response.body);
+    }
+  });
+
   app.post("/admin/surfaces/retire", adminGuard, (req, res) => {
     try {
       const input = surfaceIdentitySchema.parse(req.body);

@@ -27,7 +27,7 @@ import {
 
 const SURFACE_STATE_VERSION = 1;
 const MACHINE_SURFACE_STATE_VERSION = 3;
-const DEFAULT_LEASE_TTL_MS = 2 * 60 * 1000;
+export const DEFAULT_SURFACE_TTL_MS = 60 * 60 * 1000;
 export const MAX_ACTIVE_SURFACE_SESSIONS = 100;
 const PROCESS_EPOCH = `pid-${process.pid}-${randomBytes(16).toString("hex")}`;
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -195,9 +195,11 @@ const MACHINE_SURFACE_LEGACY_SCHEMA_VERSIONS = new Set([1, 2]);
 export const CHATGPT_BROWSER_ID = "iab" as const;
 export const CHATGPT_SURFACE_ID = "chatgpt" as const;
 
-function machineStateDirectory(): string {
+function machineStateDirectory(readOnly = false): string {
   const root = path.resolve(getStateDir());
-  ensureDir(root);
+  const directory = path.join(root, MACHINE_SURFACE_STATE_DIRECTORY);
+  if (readOnly && !fs.existsSync(root)) return directory;
+  if (!readOnly) ensureDir(root);
   const rootStat = fs.lstatSync(root);
   if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
     throw new SurfaceOwnershipError(
@@ -206,12 +208,12 @@ function machineStateDirectory(): string {
     );
   }
   try {
-    fs.chmodSync(root, 0o700);
+    if (!readOnly) fs.chmodSync(root, 0o700);
   } catch {
     // Best effort on filesystems without chmod semantics.
   }
-  const directory = path.join(root, MACHINE_SURFACE_STATE_DIRECTORY);
-  ensureDir(directory);
+  if (readOnly && !fs.existsSync(directory)) return directory;
+  if (!readOnly) ensureDir(directory);
   const stat = fs.lstatSync(directory);
   if (stat.isSymbolicLink() || !stat.isDirectory() || fs.realpathSync.native(directory) !== directory) {
     throw new SurfaceOwnershipError(
@@ -220,7 +222,7 @@ function machineStateDirectory(): string {
     );
   }
   try {
-    fs.chmodSync(directory, 0o700);
+    if (!readOnly) fs.chmodSync(directory, 0o700);
   } catch {
     // Best effort on filesystems without chmod semantics.
   }
@@ -378,7 +380,7 @@ function nowDate(value?: Date): Date {
 }
 
 function leaseTtl(value: number | undefined): number {
-  const result = value ?? DEFAULT_LEASE_TTL_MS;
+  const result = value ?? DEFAULT_SURFACE_TTL_MS;
   if (!Number.isInteger(result) || result < 1_000 || result > 24 * 60 * 60 * 1000) {
     throw new SurfaceOwnershipError(
       "INVALID_SURFACE_OWNERSHIP_STATE",
@@ -870,8 +872,8 @@ function validateLegacyMachineSurfaceState(
   });
 }
 
-function readMachineState(): MachineSurfaceOwnershipState {
-  const file = machineSurfaceOwnershipFile();
+function readMachineState(readOnly = false): MachineSurfaceOwnershipState {
+  const file = path.join(machineStateDirectory(readOnly), MACHINE_SURFACE_STATE_FILE);
   const raw = readJsonIfExists<unknown>(file);
   if (raw === null) {
     if (fs.existsSync(file)) {
@@ -888,6 +890,7 @@ function readMachineState(): MachineSurfaceOwnershipState {
     MACHINE_SURFACE_LEGACY_SCHEMA_VERSIONS.has(value.schemaVersion)
   ) {
     validateLegacyMachineSurfaceState(value, value.schemaVersion);
+    if (readOnly) throw new SurfaceOwnershipError("INVALID_SURFACE_OWNERSHIP_STATE", "legacy surface state needs explicit migration; preflight does not migrate it");
     return rebuildLegacyMachineSurfaceState(file, value.schemaVersion);
   }
   assertOnlyKeys(
@@ -1807,6 +1810,62 @@ export function renewSurface(options: RenewSurfaceOptions): SurfaceLease {
     publishProjectIntoMachineState(machine, state, ref.projectId);
     syncAndSave(ref.projectId, state, machine);
     return updated;
+  });
+}
+
+/** Read the authoritative index without reaping, migrating or writing checkout mirrors. */
+export function inspectSurface(projectId: string, localSessionId: string) {
+  safeId(projectId, "project id");
+  safeId(localSessionId, "local session id");
+  const machine = readMachineState(true);
+  const key = sessionKey(projectId, localSessionId);
+  return {
+    projectUrl: machine.projectUrls[projectId] ?? null,
+    binding: machine.bindings.find((entry) => sessionKey(entry.projectId, entry.localSessionId) === key) ?? null,
+    lease: machine.leases.find((entry) => sessionKey(entry.projectId, entry.localSessionId) === key && Date.parse(entry.leaseExpiresAt) > Date.now()) ?? null,
+  };
+}
+
+/** Recover only an unchanged committed route; never rotate its generation. */
+export function recoverSurface(binding: SurfaceBinding, ownerProcessEpoch: string, ttlMs = DEFAULT_SURFACE_TTL_MS): SurfaceLease {
+  const ttl = leaseTtl(ttlMs);
+  safeEpoch(ownerProcessEpoch);
+  return withSurfaceOwnershipLocks(binding.projectId, () => {
+    const state = readState(binding.projectId);
+    const machine = readMachineState();
+    syncProjectIntoMachineState(machine, state, binding.projectId);
+    const current = latestSessionBinding(state, binding.projectId, binding.localSessionId);
+    const key = sessionKey(binding.projectId, binding.localSessionId);
+    if (!current || !bindingMatchesRequest(current, binding) ||
+        current.lastGeneration !== binding.lastGeneration || machine.generations[key] !== binding.lastGeneration) {
+      throw new SurfaceOwnershipError("SESSION_ALREADY_OWNED", "the saved route changed before recovery");
+    }
+    const at = new Date();
+    reapMachineExpiredLeases(machine, at);
+    reapExpired(state, at);
+    assertMachineRequestAvailable(machine, binding.projectId, binding.projectUrl,
+      binding.browserId, binding.surfaceId, binding.tabId);
+    const existing = state.leases.find((entry) => sessionKey(entry.projectId, entry.localSessionId) === key);
+    if (existing) {
+      if (existing.generation !== binding.lastGeneration || !leaseMatchesRequest(existing, binding, ownerProcessEpoch)) {
+        throw new SurfaceOwnershipError("SESSION_ALREADY_OWNED", "another live owner must not be replaced by recovery");
+      }
+      return existing;
+    }
+    if (machine.leases.length >= MAX_ACTIVE_SURFACE_SESSIONS) {
+      throw new SurfaceOwnershipError("SESSION_CAPACITY_REACHED", "page recovery must wait for a free session slot");
+    }
+    const lease: SurfaceLease = {
+      projectId: binding.projectId, localSessionId: binding.localSessionId,
+      browserId: binding.browserId, surfaceId: binding.surfaceId, tabId: binding.tabId,
+      projectUrl: binding.projectUrl, chatUrl: binding.chatUrl,
+      generation: binding.lastGeneration, ownerProcessEpoch, ownerPid: process.pid,
+      claimedAt: timestamp(at), updatedAt: timestamp(at), leaseExpiresAt: timestamp(new Date(at.getTime() + ttl)),
+    };
+    state.leases.push(lease);
+    publishProjectIntoMachineState(machine, state, binding.projectId);
+    syncAndSave(binding.projectId, state, machine);
+    return lease;
   });
 }
 

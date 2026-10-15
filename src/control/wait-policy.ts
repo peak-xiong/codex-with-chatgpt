@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { browserTabIdSchema } from "../session/browser-tab-id.js";
 import type { ControlStatus } from "./mailbox.js";
 import {
@@ -24,7 +25,11 @@ const observedPageIdentity = z.object({
 }).strict();
 
 const responseIdentity = observedPageIdentity.extend({
-  responseId: c2cIdSchema,
+  // Browser locators are not necessarily C2C identifiers (e.g. contain ':' or '/').
+  // Normalize once at the protocol boundary; a repeated locator has the same id.
+  responseId: z.string().min(1).max(1024).refine((value) => !/[\u0000-\u001f\u007f]/.test(value))
+    .transform((value) => c2cIdSchema.safeParse(value).success ? value
+      : `response-${createHash("sha256").update(value).digest("hex")}`),
 }).strict();
 
 const failureReasonSchema = z.enum([
@@ -207,8 +212,10 @@ export function advanceControlPageObservation(
     (observation.state === "response_start_failed" &&
       (prior?.state === "send_attempted" || prior?.state === "sent")) ||
     (observation.state === "response_created" && prior?.state === "sent") ||
-    (observation.state === "generating" && (prior?.state === "response_created" || prior?.state === "generating")) ||
-    (observation.state === "final" && (prior?.state === "response_created" || prior?.state === "generating")) ||
+    // A prompt-paired response can first be observed already generating or final.
+    // Persist that observation directly, without manufacturing earlier events.
+    (observation.state === "generating" && (prior?.state === "sent" || prior?.state === "response_created" || prior?.state === "generating")) ||
+    (observation.state === "final" && (prior?.state === "sent" || prior?.state === "response_created" || prior?.state === "generating")) ||
     observation.state === "page_lost" ||
     observation.state === "authority_invalid";
   if (!transitionAllowed) {
@@ -234,7 +241,8 @@ export function advanceControlPageObservation(
 export function controlWaitPolicy(status: ControlStatus, now = Date.now()) {
   const remainingMs = status.request ? Math.max(0, Date.parse(status.request.expiresAt) - now) : 0;
   const received = status.status === "received" || status.status === "acknowledged";
-  const hostObserved = status.status === "cancelled" && status.hostObservedResult !== undefined;
+  const hostObserved = status.status === "cancelled" && status.hostObservedResult !== undefined &&
+    (!status.hostFailure || status.hostObservedResult.result.kind === "BLOCKED");
   const outcome = received
     ? status.result?.kind === "BLOCKED" ? "blocked" : "delivered"
     : hostObserved ? status.hostObservedResult?.result.kind === "BLOCKED" ? "blocked" : "delivered"
@@ -249,8 +257,13 @@ export function controlWaitPolicy(status: ControlStatus, now = Date.now()) {
         : "inspect_exact_response";
   return {
     outcome,
+    state: status.lateEvidence ? "evidence_only" : hostObserved || received
+      ? outcome === "blocked" ? "blocked" : "delivered"
+      : status.hostFailure ? "failed" : status.status,
+    result: received && status.result ? { kind: status.result.kind, payload: status.result.payload }
+      : hostObserved ? status.hostObservedResult!.result : null,
     delivery: received ? "mcp" : hostObserved ? "computer_use" : "none",
-    nextAction: received
+    nextAction: status.lateEvidence ? "review_late_evidence" : received
       ? status.status === "received" ? "persist_then_ack" : "stop"
       : outcome === "pending" ? pendingAction : "stop",
     leaseExpiresAt: status.request?.expiresAt ?? null,

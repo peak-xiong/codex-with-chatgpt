@@ -71,6 +71,44 @@ function planResult(requestId: string) {
   } as const;
 }
 
+it("preflight inspects an unregistered checkout without creating files or a registration", () => {
+  const before = fs.readdirSync(workspace, { recursive: true });
+  const first = runJson(["preflight", "--local-session", "session-preflight"]);
+  expect(first.command.status).toBe(0);
+  expect(first.body).toMatchObject({ readOnly: true, registration: null, surface: null, gateway: { state: "healthy" },
+    endpoint: { reachability: "unverified" } });
+  expect(fs.readdirSync(workspace, { recursive: true })).toEqual(before);
+  const second = runJson(["preflight", "--local-session", "session-preflight"]);
+  expect(second.body.registration).toBeNull();
+  expect(JSON.stringify(second.body)).not.toContain("adminToken");
+});
+
+it("preflight on a new installation reports setup without creating a state directory or starting a service", () => {
+  const absentState = path.join(workspace, "absent-state");
+  const result = spawnSync(process.execPath, ["--import", "tsx/esm", cliEntry,
+    "preflight", "--local-session", "session-new-install", "--json"], {
+    cwd: workspace, encoding: "utf8", timeout: 30_000,
+    env: { ...process.env, C2C_STATE_DIR: absentState },
+  });
+  expect(result.status).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ readOnly: true, nextAction: "start_gateway", gateway: { state: "stopped" } });
+  expect(fs.existsSync(absentState)).toBe(false);
+});
+
+it("preflight includes the exact active request without changing its registration or page lease", () => {
+  claimSurface("session-a");
+  const opened = runJson(["control", "open", "--local-session", "session-a", "--task", "preflight-active", "--iteration", "0", "--phase", "PLAN"]);
+  expect(opened.command.status).toBe(0);
+  const before = runJson(["preflight", "--local-session", "session-a"]);
+  const after = runJson(["preflight", "--local-session", "session-a"]);
+  expect(after.body.registration).toEqual(before.body.registration);
+  expect(after.body.surface).toEqual(before.body.surface);
+  expect(after.body.registration).not.toBeNull();
+  expect(after.body).toMatchObject({ nextAction: "resume_request", surface: { control: {
+    requestId: (opened.body.request as { requestId: string }).requestId, status: "pending",
+  } } });
+});
+
 beforeEach(async () => {
   stateDir = isolateStateDir();
   workspace = makeTmpDir("cli-control-workspace");
@@ -484,7 +522,7 @@ describe("control CLI correlation", () => {
     expect(opened.body.deliveryPrompt).toContain("RESULT_PHASE: RESEARCH");
     expect(opened.body.deliveryPrompt).toContain("RESULT_TRANSPORT: COMPUTER_USE_ONLY");
     expect(opened.body.deliveryPrompt).toContain("MAILBOX_CALLBACKS: DISABLED_EXPECTED");
-    expect(opened.body.deliveryPrompt).toContain("submit_control_result is expected and is not a blocker");
+    expect(opened.body.deliveryPrompt).toContain("mailbox callbacks are disabled and their absence is expected");
     expect(opened.body.resultContract).toMatchObject({
       phase: "RESEARCH",
       resultTransport: "computer_use",

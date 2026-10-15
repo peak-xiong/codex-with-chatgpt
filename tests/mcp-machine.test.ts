@@ -64,6 +64,49 @@ afterEach(() => {
 });
 
 describe("machine MCP capability correlation", () => {
+  it("review_context includes only the capability's exact execution iteration", async () => {
+    cleanups.push(isolateStateDir());
+    const root = makeTmpDir("mcp-review-context"); cleanups.push(root);
+    const gateway = new MachineGateway();
+    const registration = gateway.registerWorkspace(root);
+    const request = openControlResultRequest(registration.workspaceId, correlation());
+    const grant = gateway.issueTurn({ ...registration, ...correlation(), requestId: request.requestId,
+      scopes: ["git.read", "execution.read"], compactionEpoch: 0, generation: 1 });
+    for (const iteration of [1, 2]) {
+      appendExecutionRecord(registration.workspaceId, {
+        localSessionId: correlation().localSessionId, taskId: correlation().taskId, iteration,
+        changedFiles: [], tests: null, exitStatus: iteration === 1 ? "failed" : "ok", timestamp: new Date().toISOString(),
+      });
+    }
+    const connection = await connectedClient(gateway);
+    try {
+      const result = await connection.client.callTool({ name: "review_context", arguments: { context_id: grant.token, include_execution: true } });
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({ execution: { iteration: 1, exitStatus: "failed" } });
+    } finally { await connection.close(); }
+  });
+
+  it("gates aggregate reads by capability and derives execution correlation from the exact turn", async () => {
+    cleanups.push(isolateStateDir());
+    const root = makeTmpDir("mcp-batch"); cleanups.push(root); write(root, "a.txt", "bounded content");
+    const gateway = new MachineGateway();
+    const registration = gateway.registerWorkspace(root);
+    const request = openControlResultRequest(registration.workspaceId, correlation());
+    const grant = gateway.issueTurn({ ...registration, ...correlation(), requestId: request.requestId,
+      scopes: ["workspace.read", "git.read"], compactionEpoch: 0, generation: 1 });
+    const connection = await connectedClient(gateway);
+    try {
+      const read = await connection.client.callTool({ name: "read_many", arguments: { context_id: grant.token, files: [{ path: "a.txt" }] } });
+      expect(read.isError).not.toBe(true);
+      expect(read.structuredContent).toMatchObject({ items: [{ file: { content: "bounded content" } }] });
+      const denied = await connection.client.callTool({ name: "review_context", arguments: { context_id: grant.token, include_execution: true } });
+      expect(denied.isError).toBe(true);
+      const diff = await connection.client.callTool({ name: "review_context", arguments: { context_id: grant.token } });
+      expect(diff.isError).not.toBe(true);
+      expect(diff.structuredContent).toMatchObject({ atomicSnapshot: false, execution: null, diff: { isRepo: false } });
+    } finally { await connection.close(); }
+  });
+
   it("reports the serving device and rejects another device's context before a workspace read", async () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("mcp-two-devices"); cleanups.push(root);
@@ -168,6 +211,8 @@ describe("machine MCP capability correlation", () => {
     });
     const turn = { taskId: "boot-computer-use", iteration: 0, phase: "BOOT" as const };
     const { request } = gateway.openControlResultRequest(identity, turn);
+    gateway.issueTurn({ ...identity, ...turn, requestId: request.requestId, generation: lease.generation,
+      scopes: ["workspace.read"], compactionEpoch: 0 });
     const page = {
       tabId: lease.tabId,
       generation: lease.generation,

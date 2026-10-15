@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { browserTabIdSchema } from "../session/browser-tab-id.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
+import { readMany, readManyFilesSchema, READ_MANY_MAX_BYTES } from "../workspace/read-many.js";
 import {
   MAX_SEARCH_GLOB_LENGTH,
   MAX_SEARCH_QUERY_LENGTH,
@@ -503,6 +504,42 @@ export function createMcpServer(ctx: McpContext, options: McpServerOptions = {})
         okStructured(gitStatus(workspace.root))
       )
   );
+
+  server.registerTool("read_many", {
+    title: "Read bounded files",
+    description: `Read up to 16 bounded file ranges in one call. Per-file failures are explicit; the reads are not an atomic snapshot. ${UNTRUSTED_NOTE}`,
+    inputSchema: {
+      context_id: contextIdSchema, files: readManyFilesSchema,
+      max_bytes: z.number().int().min(1024).max(READ_MANY_MAX_BYTES).default(READ_MANY_MAX_BYTES),
+    },
+    annotations: { readOnlyHint: true },
+  }, async (args) => withClaimedWorkspace(gateway, args.context_id, ["workspace.read"],
+    async ({ workspace }) => okStructured(await readMany(workspace, args.files, args.max_bytes))));
+
+  server.registerTool("review_context", {
+    title: "Read working-tree review context",
+    description: `One bounded current working-tree diff and optional exact-turn execution record. Supports unstaged/staged/head only, not arbitrary refs or PRs. Not an atomic snapshot. ${UNTRUSTED_NOTE}`,
+    inputSchema: {
+      context_id: contextIdSchema,
+      mode: z.enum(["unstaged", "staged", "head"]).default("unstaged"),
+      path: z.string().min(1).max(1024).optional(),
+      offset: z.number().int().nonnegative().default(0),
+      max_bytes: z.number().int().min(1024).max(READ_MANY_MAX_BYTES).default(32768),
+      include_execution: z.boolean().default(false),
+    },
+    annotations: { readOnlyHint: true },
+  }, async (args) => withClaimedWorkspace(gateway, args.context_id,
+    args.include_execution ? ["git.read", "execution.read"] : ["git.read"], ({ workspace, lease }) => {
+      const info = gitInfo(workspace.root);
+      const diff = gitDiff(workspace, { mode: args.mode, offset: args.offset, maxBytes: args.max_bytes },
+        args.path ? workspace.resolve(args.path).rel : undefined);
+      const execution = args.include_execution ? latestExecutionRecord(workspace.id, {
+        localSessionId: lease.binding.localSessionId, taskId: lease.binding.taskId, iteration: lease.binding.iteration,
+      }) : null;
+      return okStructured({ observedAt: new Date().toISOString(), atomicSnapshot: false, git: info, diff,
+        execution: execution ? { iteration: execution.iteration, exitStatus: execution.exitStatus, timestamp: execution.timestamp,
+          details: "Use execution_summary/execution_output for recorded details" } : null });
+    }));
 
   server.registerTool(
     "git_diff",

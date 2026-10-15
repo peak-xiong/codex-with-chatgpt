@@ -449,6 +449,19 @@ export class WorkspaceRegistry {
     return this.requireCurrentEntry(workspaceId, projectId, registrationId).registration;
   }
 
+  /** Inspect a trusted local root without registration, revocation or stale-state cleanup. */
+  inspect(root: string): WorkspaceRegistration | null {
+    const canonical = fs.realpathSync.native(root);
+    const entry = [...this.entries.values()].find((entry) => entry.root === canonical);
+    if (!entry) return null;
+    const status = this.entryStatus(entry);
+    if (status !== "current") {
+      throw new WorkspaceRegistryError(status === "stale" ? "WORKSPACE_STALE" : "WORKSPACE_STATUS_UNCERTAIN",
+        "workspace registration needs explicit repair");
+    }
+    return entry.registration;
+  }
+
   /** Resolve a live, broker-issued lease without accepting a path or raw ids. */
   resolve(lease: TurnLease): Workspace {
     const verified = this.broker.validateLease(lease);

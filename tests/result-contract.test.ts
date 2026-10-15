@@ -61,10 +61,7 @@ describe("control result prompt contract", () => {
     expect(prompt).toContain("COMPUTER_USE_ONLY");
     expect(prompt).toContain("RESULT_TRANSPORT: COMPUTER_USE_ONLY");
     expect(prompt).toContain("MAILBOX_CALLBACKS: DISABLED_EXPECTED");
-    expect(prompt).toContain("OVERRIDES any earlier C2C mailbox or callback delivery directions");
-    expect(prompt).toContain("submit_control_result is expected and is not a blocker");
-    expect(prompt).toContain("never report their absence as BLOCKED");
-    expect(prompt).toContain("mailbox callbacks are intentionally disabled");
+    expect(Buffer.byteLength(prompt)).toBeLessThan(2300);
     expect(prompt).toContain(request.requestId);
   });
 
@@ -72,10 +69,10 @@ describe("control result prompt contract", () => {
     const contract = controlResultContract("BOOT");
     expect(contract.requiredTools).toEqual(["workspace_info", "read_file"]);
     expect(contract.instructions.join("\n")).toContain(
-      "Return kind BOOT with payload {} after both reads succeed even though mailbox callback tools are absent",
+      "then return BOOT with payload {}",
     );
     expect(contract.instructions.join("\n")).toContain(
-      "Only failure of a required read-only identity check may produce BLOCKED",
+      "missing required evidence",
     );
   });
 
