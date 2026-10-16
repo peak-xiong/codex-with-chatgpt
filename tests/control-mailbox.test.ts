@@ -12,7 +12,6 @@ import {
   getControlResultStatus,
   openControlResultRequest,
   pruneControlMailbox,
-  recordControlHostFailure,
   reportControlProgress,
   requireBootControlResult,
   renewControlResultRequest,
@@ -137,30 +136,31 @@ describe("control result mailbox", () => {
       localSessionId: "session-legacy-failure",
       ...correlation(1),
     });
-    recordControlHostFailure(WORKSPACE_A, failed.requestId, "session-legacy-failure", correlation(1), {
+    const legacyFailure = {
       tabId: "tab-legacy-failure",
       generation: 1,
       observedUrl: "https://chatgpt.com/g/g-p-example/c/chat-example",
       observedAt: new Date().toISOString(),
       responseToRequestId: failed.requestId,
-      observationSequence: 4,
-      responseId: "response-legacy-failure",
-      state: "final",
+      state: "blocked",
       responseIsFinal: true,
       reason: "callback_missing",
       source: "host_observed",
-    });
-    const markerPath = path.join(mailbox, "cancelled", `${failed.requestId}.json`);
-    const marker = JSON.parse(fs.readFileSync(markerPath, "utf8")) as {
-      hostFailure: Record<string, unknown>;
     };
-    const {
-      observationSequence: _observationSequence,
-      responseId: _responseId,
-      ...oldFailure
-    } = marker.hostFailure;
-    marker.hostFailure = { ...oldFailure, state: "blocked" };
-    fs.writeFileSync(markerPath, JSON.stringify(marker));
+    const markerPath = path.join(mailbox, "cancelled", `${failed.requestId}.json`);
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    fs.writeFileSync(markerPath, JSON.stringify({
+      schemaVersion: 1,
+      requestId: failed.requestId,
+      workspaceId: WORKSPACE_A,
+      localSessionId: "session-legacy-failure",
+      taskId: "c2c_plan",
+      iteration: 1,
+      phase: "PLAN",
+      cancelledAt: new Date().toISOString(),
+      hostFailure: legacyFailure,
+    }));
+    fs.rmSync(path.join(mailbox, "active", "session-legacy-failure.json"), { force: true });
     expect(getControlResultStatus(
       WORKSPACE_A,
       failed.requestId,

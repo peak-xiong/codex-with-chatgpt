@@ -355,3 +355,9 @@
 发送消息。恢复测试使用独立本地 session，创建原 Project 内的新 Chat 后通过真实 MCP
 写回并确认结果。主会话也完成过精确缺失 tab 的原 Chat 重开和 BOOT 验证。详细状态机
 及重放约束见 [protocol.md](protocol.md#page-recovery)。
+
+## 2026-10-17 C2C-031 本地代码收口（验收待补）
+
+| ID | 问题 | 实现及本地状态 |
+| --- | --- | --- |
+| C2C-031 | Computer Use 终态缺少一致的双观察屏障，休眠 mailbox 结果和历史失败记录可能混入当前交付判断 | 页面依赖的成功与失败终态均要求精确 `result_candidate`、严格 `completionEvidence`、新 UI 观察及 Gateway 接受时间至少 1500 ms；生产消费者绑定 `computer_use`，休眠 mailbox 只作为显式测试/实验传输；旧终态仅保留精确读取和重放兼容。补充 read_many 输出 schema、CLI/BOOT 传输门禁、legacy 恢复及失败候选回归。`corepack pnpm typecheck` 与 `corepack pnpm build` 已通过；旧 host-failure 历史 fixture 定向回归通过。最终 `corepack pnpm exec vitest run --maxWorkers=1` 退出码 0：46 个文件、633 项通过，耗时 267.13 秒；无 Vitest worker timeout/unhandled error，日志见 `/tmp/c2c-completion-closure/full-suite-clean-rerun.log`。真实 ChatGPT 页面验收、安装及最终审查由主代理补录；本条目前不代表端到端验收完成。 |

@@ -75,8 +75,12 @@ describe("first Project provenance", () => {
       localSessionId: resumed.localSessionId, taskId: "plugin-task", iteration: 0, phase: "PLAN",
       generation: candidate.generation, compactionEpoch: 0, scopes: ["workspace.read"], plugins: ["GitHub"],
     };
+    const beforeInvalidTurn = restarted.stats();
     expect(() => restarted.issueTurn(turn)).toThrow();
-    expect(restarted.stats().capabilityCount).toBe(0);
+    expect(restarted.stats()).toMatchObject({
+      capabilityCount: beforeInvalidTurn.capabilityCount,
+      activeTurnCount: 0,
+    });
     const other = makeTmpDir("other-workspace"); dirs.push(other);
     const otherIdentity = { ...restarted.registerWorkspace(other), localSessionId: "session-other" };
     expect(() => restarted.surfaceClaim(otherIdentity, { ...input, tabId: "tab-other", projectSelection: projectSelection(url) })).toThrow(/different local project/);

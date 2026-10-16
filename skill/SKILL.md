@@ -48,12 +48,23 @@ cwd. Install once per OS user; do not maintain project-local copies.
 4. Record send_attempted before sending, then sent only after the exact prompt
    is visible. Locate its paired response and retain the stable locator. Read
    that container on later checks, not repeated full-page snapshots. Register
-   generating or final directly when first observed; response_created is optional.
+   generating or result_candidate directly when first observed;
+   response_created is optional. A successful final cannot skip result_candidate.
    The CLI normalizes opaque response IDs. Reuse the same observed locator.
 5. Parse the completed response's C2C_HOST_OBSERVED_RESULT, exact RESULT_REQUEST_ID
-   and one allowed {kind,payload}. Pass it to control observe with
-   delivery: computer_use. Consume wait.state, wait.delivery and wait.result;
-   then execute or report the failure locally.
+   and one allowed {kind,payload}. First submit result_candidate with
+   completionEvidence {responseActionsVisible:true,stopControlAbsent:true}; after
+   a fresh UI observation, submit final with the identical normalized result and
+   evidence. The Gateway requires at least 1500 ms between accepted observations.
+   For a page-dependent failure, use the same candidate/final sequence with
+   responseIsFinal:true, the exact reason/source and optional tool/errorCode, and
+   identical completionEvidence; omit terminalResult. Explicit
+   response_start_failed, page_lost and authority_invalid remain independent
+   immediate failures.
+   In Computer Use, callback_missing means the expected final result marker or
+   contract is absent or invalid; it does not mean an MCP callback tool failed.
+   Consume wait.result only when wait.outcome is delivered or blocked; then
+   execute or report the result locally.
 
 Use --request alone with the resolved --local-session for control status/wait/observe.
 The task/iteration/phase triple is an optional complete cross-check. A validation
@@ -163,17 +174,23 @@ execution-success claims.
 
 Computer Use is the only active result transport. Mailbox callbacks and
 c2c.result.write are dormant; absence is expected. Do not restore them or use
-control ack for a Computer Use result. Legacy cancelled + hostObservedResult
-storage remains compatible; use the public wait view.
+control ack for a Computer Use result. A dormant mailbox result whose stored
+status is received or acknowledged is not a Computer Use completion: wait reports
+outcome/state transport_mismatch, result null and delivery mcp; the CLI reports
+failure and exits nonzero. Never consume its raw status.result. Legacy cancelled
+records with hostObservedResult and exact terminal replay remain compatible; use the
+public wait view.
 
 Wait slices (at most 30 seconds) are observation intervals, not task deadlines.
 Fresh exact-response generating evidence renews live authorization for long tasks.
 Schedule checks before returned lease expiry. Unknown UI does not renew access.
 Expiry cannot authorize resurrecting a token, resending or rotating the page.
 A late exact response is retained as lateEvidence with wait.state: evidence_only;
-Codex reviews it locally without asking solely because it arrived late; it is
-not authorized delivery or BOOT proof. Preserve accepted
-results. Missing/malformed final markers are host failures, not delivery.
+it must match the exact prompt, page, response and increasing observation
+sequence, but does not need or create a delivery candidate. Codex reviews it
+locally without asking solely because it arrived late; it is not authorized
+delivery or BOOT proof. Preserve accepted results. Missing/malformed final
+markers are host failures, not delivery.
 BLOCKED/terminal failure closes only that attempt; no user interruption is needed.
 
 ## Maintenance and user action

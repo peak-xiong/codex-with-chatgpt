@@ -3,16 +3,16 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { submitControlResult } from "../src/control/mailbox.js";
 import { readMachineRuntime } from "../src/gateway/runtime.js";
-import { Workspace } from "../src/workspace/manager.js";
 import { machineConnectorFile } from "../src/gateway/connector-binding.js";
+import { Workspace } from "../src/workspace/manager.js";
 import {
   cleanup,
   isolateStateDir,
   makeTmpDir,
   startManagedMachineFixture,
   type ManagedMachineFixture,
+  observeComputerUseResultForTest,
   write,
   projectSelection,
 } from "./helpers.js";
@@ -95,8 +95,8 @@ it("preflight on a new installation reports setup without creating a state direc
   expect(fs.existsSync(absentState)).toBe(false);
 });
 
-it("preflight includes the exact active request without changing its registration or page lease", () => {
-  claimSurface("session-a");
+it("preflight includes the exact active request without changing its registration or page lease", async () => {
+  await claimSurface("session-a");
   const opened = runJson(["control", "open", "--local-session", "session-a", "--task", "preflight-active", "--iteration", "0", "--phase", "PLAN"]);
   expect(opened.command.status).toBe(0);
   const before = runJson(["preflight", "--local-session", "session-a"]);
@@ -122,7 +122,7 @@ afterEach(async () => {
   delete process.env.C2C_STATE_DIR;
 });
 
-function claimSurface(localSessionId: string, tabId = `tab-${localSessionId}`): void {
+async function claimSurface(localSessionId: string, tabId = `tab-${localSessionId}`): Promise<void> {
   const claimed = runJson([
     "surface",
     "claim",
@@ -140,7 +140,8 @@ function claimSurface(localSessionId: string, tabId = `tab-${localSessionId}`): 
   ]);
   expect(claimed.command.status).toBe(0);
   const lease = claimed.body.lease as { generation: number; tabId: string };
-  const bootRequestId = receiveBoot(localSessionId);
+  const chatUrl = `https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/${localSessionId}`;
+  const bootRequestId = await receiveBoot(localSessionId, lease, chatUrl);
   const committed = runJson([
     "surface",
     "commit",
@@ -160,7 +161,11 @@ function claimSurface(localSessionId: string, tabId = `tab-${localSessionId}`): 
   expect(committed.command.status).toBe(0);
 }
 
-function receiveBoot(localSessionId: string): string {
+async function receiveBoot(
+  localSessionId: string,
+  page: { generation: number; tabId: string },
+  chatUrl: string,
+): Promise<string> {
   const taskId = `boot-${localSessionId}`;
   const opened = runJson([
     "control",
@@ -178,22 +183,31 @@ function receiveBoot(localSessionId: string): string {
   ]);
   expect(opened.command.status, JSON.stringify(opened)).toBe(0);
   const request = opened.body.request as { requestId: string };
-  submitControlResult(new Workspace(workspace).id, {
-    requestId: request.requestId,
+  const registration = runJson(["preflight", "--local-session", localSessionId]).body.registration as {
+    workspaceId: string;
+    projectId: string;
+    registrationId: string;
+  };
+  await observeComputerUseResultForTest(readMachineRuntime()!, {
+    ...registration,
     localSessionId,
+  }, {
+    requestId: request.requestId,
     taskId,
     iteration: 0,
     phase: "BOOT",
-    kind: "BOOT",
-    payload: {},
-  });
+  }, {
+    ...page,
+    projectUrl: "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project",
+    chatUrl,
+  }, { kind: "BOOT", payload: {} });
   return request.requestId;
 }
 
 describe("control CLI correlation", () => {
-  it("binds one device app for all workspaces and gates an unconfigured dispatch before opening a request", () => {
+  it("binds one device app for all workspaces and gates an unconfigured dispatch before opening a request", async () => {
     const session = "session-device-binding";
-    claimSurface(session);
+    await claimSurface(session);
     const epoch = readMachineRuntime()!.bootEpoch;
     fs.unlinkSync(machineConnectorFile());
     const args = ["--local-session", session, "--task", "task-device-binding", "--iteration", "0", "--phase", "PLAN"];
@@ -213,9 +227,9 @@ describe("control CLI correlation", () => {
     expect(opened.body.deliveryPrompt).toContain(JSON.stringify(opened.body.connector));
   }, 90_000);
 
-  it("reconciles exact terminal page evidence through the authenticated machine client", () => {
+  it("reconciles exact terminal page evidence through the authenticated machine client", async () => {
     const localSessionId = "session-observe";
-    claimSurface(localSessionId, "browser-use:fc6c0073-5fb5-4a4e-81f7-307535575b6a");
+    await claimSurface(localSessionId, "browser-use:fc6c0073-5fb5-4a4e-81f7-307535575b6a");
     const args = ["--local-session", localSessionId, "--task", "task-observe", "--iteration", "0", "--phase", "PLAN"];
     const opened = runJson(["control", "open", ...args]);
     expect(opened.command.status).toBe(0);
@@ -252,43 +266,63 @@ describe("control CLI correlation", () => {
     expect(renewed.command.status, JSON.stringify(renewed)).toBe(0);
     expect(renewed.body).toMatchObject({ status: "pending", requestId: request.requestId, wait: { nextAction: "inspect_exact_response" } });
     expect(Date.parse((renewed.body.request as { expiresAt: string }).expiresAt)).toBeGreaterThan(Date.parse(request.expiresAt));
-    const observation = {
+    const candidate = {
       ...pageIdentity, observedAt: new Date().toISOString(), observationSequence: 5, responseId,
-      state: "final", responseIsFinal: true, reason: "capability_invalid",
+      state: "result_candidate", responseIsFinal: true, reason: "capability_invalid",
       source: "model_reported", errorCode: "TOKEN_REVOKED",
+      completionEvidence: { responseActionsVisible: true, stopControlAbsent: true },
+    };
+    const bad = runJson(["control", "observe", ...lookup, "--page-observation", JSON.stringify({ ...candidate, errorCode: "sk-fixture-private" })]);
+    expect(bad.command.status).toBe(1);
+    expect(bad.command.stdout + bad.command.stderr).not.toContain("sk-fixture-private");
+    const mixed = runJson(["control", "observe", ...lookup, "--page-observation", JSON.stringify({
+      ...candidate,
       terminalResult: {
         kind: "BLOCKED",
         payload: { reason: "The callback authorization ended", needs: ["End this attempt"] },
       },
+    })]);
+    expect(mixed.command.status).toBe(1);
+    expect(mixed.command.stdout + mixed.command.stderr).not.toContain("The callback authorization ended");
+    const stillPending = runJson(["control", "status", ...lookup]);
+    expect(stillPending.body.status).toBe("pending");
+
+    const acceptedCandidate = runJson(["control", "observe", ...lookup, "--page-observation", JSON.stringify(candidate)]);
+    expect(acceptedCandidate.command.status, JSON.stringify(acceptedCandidate)).toBe(0);
+    expect(acceptedCandidate.body).toMatchObject({
+      status: "pending",
+      wait: { outcome: "pending", nextAction: "confirm_response_final", result: null },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    const observation = {
+      ...candidate,
+      observedAt: new Date().toISOString(),
+      observationSequence: 6,
+      state: "final",
     };
-    const bad = runJson(["control", "observe", ...lookup, "--page-observation", JSON.stringify({ ...observation, errorCode: "sk-fixture-private" })]);
-    expect(bad.command.status).toBe(1);
-    expect(bad.command.stdout + bad.command.stderr).not.toContain("sk-fixture-private");
     const resolved = runJson(["control", "observe", ...lookup, "--page-observation", JSON.stringify(observation)]);
     expect(resolved.command.status, JSON.stringify(resolved)).toBe(0);
-    const { terminalResult, ...hostFailure } = observation;
+    const hostFailure = observation;
     expect(resolved.body).toMatchObject({
       status: "cancelled",
       result: null,
       hostFailure,
-      hostObservedResult: { provenance: "host_observed", result: terminalResult },
-      wait: { delivery: "computer_use", nextAction: "stop" },
+      wait: { state: "failed", delivery: "none", result: null, nextAction: "stop" },
     });
     const waited = runJson(["control", "wait", ...lookup, "--timeout-ms", "0"]);
-    expect(waited.command.status).toBe(0);
+    expect(waited.command.status).toBe(1);
     expect(waited.body).toMatchObject({
       status: "cancelled",
       result: null,
       hostFailure,
-      hostObservedResult: { provenance: "host_observed", result: terminalResult },
-      wait: { delivery: "computer_use", nextAction: "stop" },
+      wait: { state: "failed", delivery: "none", result: null, nextAction: "stop" },
     });
     expect(runJson(["control", "ack", ...lookup]).command.status).toBe(1);
     }, 90_000);
 
-  it("reuses one page across tasks and grants only selected observed app reads", () => {
+  it("reuses one page across tasks and grants only selected observed app reads", async () => {
     const localSessionId = "session-app-reads";
-    claimSurface(localSessionId);
+    await claimSurface(localSessionId);
     const current = runJson(["surface", "get", "--local-session", localSessionId]);
     const page = current.body.lease as { tabId: string; chatUrl: string; generation: number };
     for (const taskId of ["research-docs", "review-docs"]) {
@@ -316,9 +350,9 @@ describe("control CLI correlation", () => {
     }
   }, 90_000);
 
-  it("opens a profile-only bootstrap with an unknown actor and excludes repository scopes", () => {
+  it("opens a profile-only bootstrap with an unknown actor and excludes repository scopes", async () => {
     const localSessionId = "session-profile-discovery";
-    claimSurface(localSessionId);
+    await claimSurface(localSessionId);
     const current = runJson(["surface", "get", "--local-session", localSessionId]);
     const page = current.body.lease as { tabId: string; chatUrl: string; generation: number };
     const proof = {
@@ -341,8 +375,8 @@ describe("control CLI correlation", () => {
     expect(cancelled.command.status).toBe(0);
   });
 
-  it("rejects plugin dispatch without fresh observations before opening a mailbox", () => {
-    claimSurface("session-plugin-gate");
+  it("rejects plugin dispatch without fresh observations before opening a mailbox", async () => {
+    await claimSurface("session-plugin-gate");
     const failed = runJson(["control", "open", "--local-session", "session-plugin-gate", "--task", "plugin-task", "--iteration", "0", "--phase", "PLAN", "--plugins", "GitHub"]);
     expect(failed.command.status).toBe(1);
     const current = runJson(["surface", "get", "--local-session", "session-plugin-gate"]);
@@ -350,7 +384,7 @@ describe("control CLI correlation", () => {
     expect(current.body.control).toBeNull();
   });
 
-  it("supports a Project-only candidate until the first chat URL is observed", () => {
+  it("supports a Project-only candidate until the first chat URL is observed", async () => {
     const claimed = runJson([
       "surface",
       "claim",
@@ -368,7 +402,10 @@ describe("control CLI correlation", () => {
     expect((claimed.body.lease as Record<string, unknown>).chatUrl).toBeUndefined();
 
     const generation = (claimed.body.lease as { generation: number }).generation;
-    const bootRequestId = receiveBoot("session-project-candidate");
+    const bootRequestId = await receiveBoot("session-project-candidate", {
+      generation,
+      tabId: "tab-project-candidate",
+    }, "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/project-first-chat");
     const committed = runJson([
       "surface",
       "commit",
@@ -395,8 +432,8 @@ describe("control CLI correlation", () => {
     );
   });
 
-  it("binds control cancellation to the capability's exact correlation", () => {
-    claimSurface("session-cancel-binding");
+  it("binds control cancellation to the capability's exact correlation", async () => {
+    await claimSurface("session-cancel-binding");
     const opened = runJson([
       "control",
       "open",
@@ -486,8 +523,8 @@ describe("control CLI correlation", () => {
     expect(cancelledStatus.body.status).toBe("cancelled");
   }, 60_000);
 
-  it("opens RESEARCH requests with the Computer Use result contract", () => {
-    claimSurface("session-research");
+  it("opens RESEARCH requests with the Computer Use result contract", async () => {
+    await claimSurface("session-research");
     const disabledMailbox = runJson([
       "control", "open", "-w", workspace, "--local-session", "session-research",
       "--task", "c2c_research1", "--iteration", "0", "--phase", "RESEARCH",
@@ -558,8 +595,8 @@ describe("control CLI correlation", () => {
 
   });
 
-  it("keeps one question and answer bound through open, wait, and acknowledge", () => {
-    claimSurface("session-a");
+  it("keeps one question and answer bound through open, observe, and wait", async () => {
+    await claimSurface("session-a");
     const opened = runJson([
       "control",
       "open",
@@ -575,7 +612,7 @@ describe("control CLI correlation", () => {
       "PLAN",
     ]);
     expect(opened.command.status, JSON.stringify(opened)).toBe(0);
-    const request = opened.body.request as { requestId: string; workspaceId: string };
+    const request = opened.body.request as { requestId: string };
 
     const overlapping = runJson([
       "control",
@@ -687,7 +724,25 @@ describe("control CLI correlation", () => {
     expect(bareAck.command.status).toBe(1);
     expect(bareAck.command.stdout + bareAck.command.stderr).toContain("--task");
 
-    submitControlResult(request.workspaceId, planResult(request.requestId));
+    const page = opened.body.surface as { tabId: string; chatUrl: string; generation: number };
+    const submitted = planResult(request.requestId);
+    const registration = runJson(["preflight", "--local-session", "session-a"]).body.registration as {
+      workspaceId: string;
+      projectId: string;
+      registrationId: string;
+    };
+    await observeComputerUseResultForTest(readMachineRuntime()!, {
+      ...registration,
+      localSessionId: "session-a",
+    }, {
+      requestId: request.requestId,
+      taskId: "c2c_0123456789abcdef",
+      iteration: 0,
+      phase: "PLAN",
+    }, {
+      ...page,
+      projectUrl: page.chatUrl.replace(/\/c\/[^/]+$/, "/project"),
+    }, { kind: "PLAN", payload: submitted.payload });
     const waited = runJson([
       "control",
       "wait",
@@ -707,8 +762,11 @@ describe("control CLI correlation", () => {
       "0",
     ]);
     expect(waited.command.status).toBe(0);
-    expect(waited.body.status).toBe("received");
-    expect((waited.body.result as { requestId: string }).requestId).toBe(request.requestId);
+    expect(waited.body.status).toBe("cancelled");
+    expect(waited.body.result).toBeNull();
+    expect(waited.body.wait).toMatchObject({ outcome: "delivered", delivery: "computer_use" });
+    expect((waited.body.wait.result as { kind: string; payload: { goal: string } }).payload.goal)
+      .toBe(submitted.payload.goal);
 
     const acknowledged = runJson([
       "control",
@@ -726,8 +784,8 @@ describe("control CLI correlation", () => {
       "--phase",
       "PLAN",
     ]);
-    expect(acknowledged.command.status).toBe(0);
-    expect(acknowledged.body.status).toBe("acknowledged");
+    expect(acknowledged.command.status).toBe(1);
+    expect(acknowledged.command.stdout + acknowledged.command.stderr).toContain("mailbox is the active transport");
 
     const next = runJson([
       "control",
@@ -747,8 +805,8 @@ describe("control CLI correlation", () => {
     expect((next.body.request as { requestId: string }).requestId).not.toBe(request.requestId);
   }, 60_000);
 
-  it("cancels the exact mailbox request after a gateway restart invalidates its context", async () => {
-    claimSurface("session-cancel");
+  it("cancels the exact request after a gateway restart invalidates its context", async () => {
+    await claimSurface("session-cancel");
     const opened = runJson([
       "control",
       "open",
@@ -808,8 +866,8 @@ describe("control CLI correlation", () => {
     expect(status.body.status).toBe("cancelled");
   });
 
-  it("does not cancel the mailbox while gateway ownership is uncertain", () => {
-    claimSurface("session-cancel-uncertain");
+  it("does not cancel the request while gateway ownership is uncertain", async () => {
+    await claimSurface("session-cancel-uncertain");
     const opened = runJson([
       "control",
       "open",
@@ -910,7 +968,7 @@ describe("control CLI correlation", () => {
     expect(fs.existsSync(path.join(stateDir, "workspace-data", "executions"))).toBe(false);
   });
 
-  it("keeps Project/chat routing behind surface commit", () => {
+  it("keeps Project/chat routing behind surface commit", async () => {
     const otherWorkspace = makeTmpDir("cli-route-lockdown-other");
     try {
       const routeOptions = [
@@ -945,7 +1003,7 @@ describe("control CLI correlation", () => {
         expect(saved.body.session).toBeNull();
       }
 
-      claimSurface("route-lockdown");
+      await claimSurface("route-lockdown");
       const before = runJson(["session", "get", "-w", workspace, "--local-session", "route-lockdown"]);
       const updated = runJson([
         "session",

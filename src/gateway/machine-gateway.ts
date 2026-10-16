@@ -14,6 +14,11 @@ import {
   type TurnLease,
   type TurnReleaseReceipt,
 } from "./turn-capability.js";
+import { ControlMailboxError } from "../control/result-schema.js";
+import {
+  ACTIVE_CONTROL_RESULT_TRANSPORT,
+  type ControlResultTransport,
+} from "../control/result-transport.js";
 import {
   WorkspaceRegistry,
   type WorkspaceRegistration,
@@ -80,7 +85,13 @@ import {
   projectIdFromChatUrl,
   projectIdFromUrl,
 } from "../session/state.js";
-import { CONTROL_PAGE_CHECK_INTERVAL_MS, parseControlPageObservation, type ControlPageObservation } from "../control/wait-policy.js";
+import {
+  CONTROL_PAGE_CHECK_INTERVAL_MS,
+  controlWaitPolicy,
+  isExactLegacyControlPageObservationReplay,
+  parseControlPageObservation,
+  type ControlPageObservation,
+} from "../control/wait-policy.js";
 
 export type SurfaceGenerationValidator = (binding: TurnCapabilityBinding) => void;
 
@@ -117,6 +128,8 @@ export interface MachineGatewayOptions {
   readonly surfaceValidator?: SurfaceGenerationValidator;
   /** Machine-owned checkout membership index; omitted for isolated in-memory use. */
   readonly workspaceMembershipFile?: string;
+  /** Active completion source; mailbox is available only for explicit experiments. */
+  readonly resultTransport?: ControlResultTransport;
 }
 
 export interface MachineGatewayStats extends TurnCapabilityStats {
@@ -241,12 +254,14 @@ export class MachineGateway {
   private readonly broker: TurnCapabilityBroker;
   private readonly registry: WorkspaceRegistry;
   private readonly surfaceValidator?: SurfaceGenerationValidator;
+  readonly resultTransport: ControlResultTransport;
   /** Synchronous per-session critical sections for final surface validation and mailbox publication. */
   private readonly controlSubmissionSessions = new Set<string>();
   private readonly controlCompletionFences = new Map<string, string>();
 
   constructor(options: MachineGatewayOptions = {}) {
     const { broker, surfaceValidator, workspaceMembershipFile } = options;
+    this.resultTransport = options.resultTransport ?? ACTIVE_CONTROL_RESULT_TRANSPORT;
     this.broker = broker ?? new TurnCapabilityBroker();
     this.registry = new WorkspaceRegistry(
       this.broker,
@@ -354,6 +369,7 @@ export class MachineGateway {
       identity.localSessionId,
       lease.generation,
       lease.tabId,
+      this.resultTransport,
     );
     const committed = commitVerifiedSurfaceRoute({
       lease,
@@ -361,7 +377,7 @@ export class MachineGateway {
       ...routeOptions,
       requireProjectSelection: true,
     });
-    if (boot.status === "received" || boot.status === "acknowledged") {
+    if (this.resultTransport === "mailbox" && (boot.status === "received" || boot.status === "acknowledged")) {
       acknowledgeControlResult(identity.workspaceId, bootRequestId, identity.localSessionId, {
         taskId: boot.request!.taskId,
         iteration: boot.request!.iteration,
@@ -585,6 +601,7 @@ export class MachineGateway {
       signal,
       // Computer Use is the producer; repeated mailbox reads cannot observe the page.
       CONTROL_PAGE_CHECK_INTERVAL_MS,
+      this.resultTransport,
     );
   }
 
@@ -594,6 +611,16 @@ export class MachineGateway {
     expected: ControlResultCorrelation,
   ): ControlStatus {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
+    const status = getControlResultStatus(identity.workspaceId, requestId, identity.localSessionId, expected);
+    if (controlWaitPolicy(status, this.resultTransport).outcome === "transport_mismatch") {
+      throw new ControlMailboxError(
+        "CONTROL_RESULT_TRANSPORT_MISMATCH",
+        "control result was recorded by the inactive transport and cannot be acknowledged",
+      );
+    }
+    if (this.resultTransport !== "mailbox") {
+      throw new ControlMailboxError("MAILBOX_RESULT_NOT_READY", "control ack is available only when mailbox is the active transport");
+    }
     return acknowledgeControlResult(identity.workspaceId, requestId, identity.localSessionId, expected);
   }
 
@@ -632,11 +659,37 @@ export class MachineGateway {
     // `| undefined` keeps the parameter order stable: `input` is required and
     // must not follow an optional argument.
     expected: ControlResultCorrelation | undefined,
-    input: ControlPageObservation,
+    input: unknown,
   ): ControlStatus {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
-    const observation = parseControlPageObservation(input);
     const status = this.getControlResultStatus(identity, requestId, expected);
+    let observation: ControlPageObservation;
+    try {
+      observation = parseControlPageObservation(input);
+    } catch (error) {
+      if (status.status === "cancelled" && status.pageObservation &&
+          isExactLegacyControlPageObservationReplay(status.pageObservation, input)) {
+        try {
+          return observeControlResultRequest(identity.workspaceId, requestId, identity.localSessionId, expected, input);
+        } finally {
+          this.broker.revokeRequest({ ...identity, ...correlationFromStoredRequest(requestId, status.request), requestId });
+        }
+      }
+      if (status.lateEvidence?.state === "final" && status.status !== "pending" &&
+          isExactLegacyControlPageObservationReplay({
+            latest: status.lateEvidence,
+            lastDefinitive: status.lateEvidence,
+          }, input)) return status;
+      throw error;
+    }
+    if (this.resultTransport === "mailbox" &&
+        ((observation.state === "result_candidate" && "delivery" in observation) ||
+          (observation.state === "final" && "delivery" in observation))) {
+      throw new ControlMailboxError(
+        "CONTROL_RESULT_TRANSPORT_MISMATCH",
+        "Computer Use result observations cannot complete a mailbox transport request",
+      );
+    }
     if (status.lateEvidence && status.status !== "pending" && canonicalJson(status.lateEvidence) === canonicalJson(observation)) return status;
     if (status.status !== "pending" && status.status !== "cancelled" && status.status !== "expired") return status;
     // `expected` is optional on this path. When the caller omits it, address the broker
@@ -662,7 +715,11 @@ export class MachineGateway {
       });
     }
     if (status.status === "expired") return status;
-    if (status.status === "cancelled" && status.hostFailure !== undefined) {
+    if (status.status === "cancelled" && status.hostFailure && !status.hostObservedResult &&
+        observation.state === "final" && "delivery" in observation) {
+      return recordLateControlEvidence(identity.workspaceId, requestId, identity.localSessionId, correlation, observation);
+    }
+    if (status.status === "cancelled" && (status.hostFailure !== undefined || status.hostObservedResult !== undefined)) {
       try {
         return observeControlResultRequest(
           identity.workspaceId,

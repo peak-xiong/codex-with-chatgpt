@@ -8,13 +8,14 @@ import {
   isolateStateDir,
   makeTmpDir,
   startManagedMachineFixture,
+  observeComputerUseResultForTest,
   type ManagedMachineFixture,
 } from "./helpers.js";
 import { threadSessionFile } from "../src/session/state.js";
-import { Workspace } from "../src/workspace/manager.js";
-import { submitControlResult } from "../src/control/mailbox.js";
+import { readMachineRuntime } from "../src/gateway/runtime.js";
 import { httpAuthFile, requireHttpAuthToken } from "../src/config/http-auth.js";
 import { machineConnectorFile } from "../src/gateway/connector-binding.js";
+import { Workspace } from "../src/workspace/manager.js";
 
 const projectRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const cliEntry = path.join(projectRoot, "src", "cli", "index.ts");
@@ -47,13 +48,14 @@ function runJson(stateDir: string, args: string[]): { command: CliResult; body: 
   return { command, body: JSON.parse(lines.at(-1) ?? "{}") as Record<string, any> };
 }
 
-function receiveBootForCliSurface(
+async function receiveBootForCliSurface(
   stateDir: string,
   workspace: string,
-  workspaceId: string,
+  registration: { workspaceId: string; projectId: string; registrationId: string },
   localSessionId: string,
+  page: { tabId: string; generation: number; projectUrl: string; chatUrl: string },
   taskSuffix = localSessionId,
-): string {
+): Promise<string> {
   const taskId = `boot-${taskSuffix}`;
   const opened = runJson(stateDir, [
     "control", "open", "-w", workspace, "--local-session", localSessionId,
@@ -61,15 +63,17 @@ function receiveBootForCliSurface(
   ]);
   expect(opened.command.status, JSON.stringify(opened)).toBe(0);
   const requestId = opened.body.request.requestId as string;
-  submitControlResult(workspaceId, {
-    requestId,
+  const runtime = readMachineRuntime();
+  expect(runtime).not.toBeNull();
+  await observeComputerUseResultForTest(runtime!, {
+    ...registration,
     localSessionId,
+  }, {
+    requestId,
     taskId,
     iteration: 0,
     phase: "BOOT",
-    kind: "BOOT",
-    payload: {},
-  });
+  }, page, { kind: "BOOT", payload: {} });
   return requestId;
 }
 
@@ -207,11 +211,12 @@ describe("machine CLI lifecycle", () => {
     expect(claimed.command.status).toBe(0);
     const ownedPagePreflight = runJson(stateDir, ["preflight", "--local-session", "session-cli-machine"]);
     expect(ownedPagePreflight.body).toMatchObject({ nextStep: "inspect-owned-page" });
-    const bootRequestId = receiveBootForCliSurface(
+    const bootRequestId = await receiveBootForCliSurface(
       stateDir,
       workspace,
-      identity.workspaceId,
+      identity,
       "session-cli-machine",
+      claimed.body.lease,
     );
     const committed = runJson(stateDir, [
       "surface",
@@ -251,11 +256,12 @@ describe("machine CLI lifecycle", () => {
       "--replace-generation", String(claimed.body.lease.generation), "--replace-tab-id", "tab-cli-machine"]);
     expect(reclaimed.command.status).toBe(0);
     expect(reclaimed.body.lease.generation).toBe(claimed.body.lease.generation + 1);
-    const reclaimBootRequestId = receiveBootForCliSurface(
+    const reclaimBootRequestId = await receiveBootForCliSurface(
       stateDir,
       workspace,
-      identity.workspaceId,
+      identity,
       "session-cli-machine",
+      reclaimed.body.lease,
       `session-cli-machine-generation-${reclaimed.body.lease.generation}`,
     );
     const reclaimedCommit = runJson(stateDir, [
@@ -509,10 +515,14 @@ describe("machine CLI lifecycle", () => {
     }
   });
 
-  it("reconciles the machine surface before reporting session get", () => {
+  it("reconciles the machine surface before reporting session get", async () => {
     const registered = runJson(stateDir, ["machine", "workspace", "register", "-w", workspace]);
     expect(registered.command.status).toBe(0);
-    const registration = registered.body.registration as { workspaceId: string };
+    const registration = registered.body.registration as {
+      workspaceId: string;
+      projectId: string;
+      registrationId: string;
+    };
     const localSessionId = "session-cli-reconcile";
     const projectUrl = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
     const chatUrl = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/session-cli-reconcile";
@@ -523,11 +533,12 @@ describe("machine CLI lifecycle", () => {
       "--tab-id", "tab-cli-reconcile", "--project-url", projectUrl, "--chat-url", chatUrl,
     ]);
     expect(claimed.command.status).toBe(0);
-    const bootRequestId = receiveBootForCliSurface(
+    const bootRequestId = await receiveBootForCliSurface(
       stateDir,
       workspace,
-      registration.workspaceId,
+      registration,
       localSessionId,
+      { tabId: "tab-cli-reconcile", generation: claimed.body.lease.generation, projectUrl, chatUrl },
     );
     const committed = runJson(stateDir, [
       "surface", "commit", "-w", workspace, "--local-session", localSessionId,

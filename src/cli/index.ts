@@ -58,7 +58,11 @@ import {
 import { saveExecutionOutput } from "../execution/output.js";
 import { controlDeliveryPrompt, controlResultContract } from "../control/result-contract.js";
 import { ACTIVE_CONTROL_RESULT_TRANSPORT } from "../control/result-transport.js";
-import { CONTROL_PAGE_CHECK_INTERVAL_MS, parseControlPageObservation, controlWaitPolicy } from "../control/wait-policy.js";
+import {
+  CONTROL_PAGE_CHECK_INTERVAL_MS,
+  controlStatusForTransport,
+  controlWaitPolicy,
+} from "../control/wait-policy.js";
 import {
   appendExecutionRecord,
   parseExecutionExitStatus,
@@ -479,11 +483,16 @@ program.command("preflight")
       const auth = httpAuthStatus();
       const snapshot = gateway.state === "healthy" ? await machinePreflight(gateway.runtime, root, sessionIdentity.id) : null;
       const control = snapshot?.surface?.control;
-      const wait = control ? controlWaitPolicy(control) : null;
+      const wait = control ? controlWaitPolicy(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : null;
+      const surface = snapshot?.surface ? {
+        ...snapshot.surface,
+        control: control ? controlStatusForTransport(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : control,
+      } : null;
       const pairing = snapshot?.surface ? planProjectPairing(snapshot.surface, opts.projectUrl) : null;
       const nextAction = gateway.state !== "healthy" ? "start_gateway"
-        : control?.status === "pending" ? "resume_request"
-        : control?.status === "received" ? "consume_result"
+        : wait?.outcome === "transport_mismatch" ? "transport_mismatch"
+        : wait?.outcome === "pending" ? "resume_request"
+        : wait?.outcome === "delivered" || wait?.outcome === "blocked" ? "consume_result"
         : control?.status === "expired" ? "inspect_expired_response"
         : !endpoint ? "configure_endpoint"
         : !auth.configured ? "configure_auth"
@@ -512,7 +521,7 @@ program.command("preflight")
         gateway: machineRuntimeObservationView(gateway), connector,
         auth: { configured: auth.configured, permissionsSafe: auth.permissionsSafe },
         endpoint: { configured: endpoint !== null, mcpUrl: publicMcpUrl(endpoint), reachability: "unverified", requires: "actual ChatGPT MCP invocation" },
-        registration: snapshot?.registration ?? null, surface: snapshot?.surface ?? null,
+        registration: snapshot?.registration ?? null, surface,
         pairing, wait, nextAction, nextStep,
       };
       if (opts.json) say(JSON.stringify(payload));
@@ -1329,7 +1338,9 @@ surface
       const machine = await machineSurfaceContext(workspace, localSessionId);
       const { projectUrl, lease, binding, control } = await getMachineSurface(machine.runtime, machine.identity);
       const pairing = planProjectPairing({ projectUrl, lease, binding, control }, opts.projectUrl);
-      if (opts.json) say(JSON.stringify({ ok: true, localSessionId, projectUrl, lease, binding, control, pairing }));
+      const safeControl = control ? controlStatusForTransport(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : null;
+      const wait = control ? controlWaitPolicy(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : null;
+      if (opts.json) say(JSON.stringify({ ok: true, localSessionId, projectUrl, lease, binding, control: safeControl, wait, pairing }));
       else if (lease) {
         const route = lease.chatUrl ? `ChatGPT page：${lease.chatUrl}` : "ChatGPT Project candidate page";
         say(`${route}（generation ${lease.generation}）`);
@@ -1371,7 +1382,9 @@ surface
       const page = assessPageHealth(current, observation);
       const control = current.control;
       const controlReady = page.controlReady && control?.status !== "pending" && control?.status !== "received";
-      if (opts.json) say(JSON.stringify({ ok: true, localSessionId, ...page, controlReady, control }));
+      const safeControl = control ? controlStatusForTransport(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : null;
+      const wait = control ? controlWaitPolicy(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : null;
+      if (opts.json) say(JSON.stringify({ ok: true, localSessionId, ...page, controlReady, control: safeControl, wait }));
       else say(`${page.action}: ${page.reason}`);
     } catch (error) {
       handleCliError(error, opts.json);
@@ -1969,10 +1982,15 @@ addControlLookupOptions(control.command("status"), "optional")
         requestId: opts.request,
         ...parseControlCorrelation(opts),
       });
-      const payload = { ok: status.status !== "not_found", ...status, wait: controlWaitPolicy(status) };
+      const wait = controlWaitPolicy(status, ACTIVE_CONTROL_RESULT_TRANSPORT);
+      const payload = {
+        ok: status.status !== "not_found" && wait.outcome !== "transport_mismatch",
+        ...controlStatusForTransport(status, ACTIVE_CONTROL_RESULT_TRANSPORT),
+        wait,
+      };
       if (opts.json) say(JSON.stringify(payload));
-      else say(`状态：${status.status}`);
-      if (status.status === "not_found") process.exitCode = 1;
+      else say(`状态：${status.status}; ${wait.outcome}; ${wait.nextAction}`);
+      if (status.status === "not_found" || wait.outcome === "transport_mismatch") process.exitCode = 1;
     } catch (error) {
       handleCliError(error, opts.json);
     }
@@ -2003,13 +2021,16 @@ addControlLookupOptions(
         ...parseControlCorrelation(opts),
         timeoutMs,
       });
-      const received = status.status === "received" || status.status === "acknowledged";
-      const wait = controlWaitPolicy(status);
-      const computerUseDelivered = wait.delivery === "computer_use";
-      if (opts.json) say(JSON.stringify({ ok: received || computerUseDelivered, ...status, wait }));
-      else if (status.result) say(JSON.stringify(status.result, null, 2));
+      const wait = controlWaitPolicy(status, ACTIVE_CONTROL_RESULT_TRANSPORT);
+      const delivered = wait.outcome === "delivered" || wait.outcome === "blocked";
+      if (opts.json) say(JSON.stringify({
+        ok: delivered,
+        ...controlStatusForTransport(status, ACTIVE_CONTROL_RESULT_TRANSPORT),
+        wait,
+      }));
+      else if (wait.result) say(JSON.stringify(wait.result, null, 2));
       else say(`状态：${status.status}; ${wait.outcome}; ${wait.nextAction}`);
-      if (!received && !computerUseDelivered) process.exitCode = 1;
+      if (!delivered) process.exitCode = 1;
     } catch (error) {
       handleCliError(error, opts.json);
     }
@@ -2026,15 +2047,19 @@ addControlLookupOptions(control.command("observe"), "optional")
       let rawObservation: unknown;
       try { rawObservation = JSON.parse(opts.pageObservation); }
       catch { throw new Error("page-observation must be valid JSON; raw page text is not accepted"); }
-      const observation = parseControlPageObservation(rawObservation);
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession), false);
       const status = await observeMailboxPage(identity.runtime, identity.identity, {
-        requestId: opts.request, ...parseControlCorrelation(opts), observation,
+        requestId: opts.request, ...parseControlCorrelation(opts), observation: rawObservation,
       });
-      const wait = controlWaitPolicy(status);
-      if (opts.json) say(JSON.stringify({ ok: true, ...status, wait }));
+      const wait = controlWaitPolicy(status, ACTIVE_CONTROL_RESULT_TRANSPORT);
+      if (opts.json) say(JSON.stringify({
+        ok: wait.outcome !== "transport_mismatch",
+        ...controlStatusForTransport(status, ACTIVE_CONTROL_RESULT_TRANSPORT),
+        wait,
+      }));
       else say(`状态：${status.status}; ${wait.outcome}; ${wait.nextAction}`);
+      if (wait.outcome === "transport_mismatch") process.exitCode = 1;
     } catch (error) {
       handleCliError(error, opts.json);
     }

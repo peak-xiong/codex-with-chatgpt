@@ -31,6 +31,7 @@ const projectUrl = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/p
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   observationWriteFault.failOnce = false;
   while (cleanups.length > 0) cleanup(cleanups.pop()!);
   delete process.env.C2C_STATE_DIR;
@@ -38,6 +39,7 @@ afterEach(() => {
 
 describe("terminal observation recovery", () => {
   it("revokes authority immediately and repairs cleanup after partial terminal writes", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("terminal-observation-recovery");
     cleanups.push(root);
@@ -90,14 +92,25 @@ describe("terminal observation recovery", () => {
       responseId: "response-terminal-recovery",
       state: "response_created",
     });
-    const terminal = {
+    const failureCandidate = {
       ...base,
       observationSequence: 4,
       responseId: "response-terminal-recovery",
-      state: "final" as const,
+      state: "result_candidate" as const,
       responseIsFinal: true as const,
       reason: "callback_missing" as const,
       source: "host_observed" as const,
+      errorCode: "UNKNOWN" as const,
+      completionEvidence: { responseActionsVisible: true as const, stopControlAbsent: true as const },
+    };
+    expect(gateway.observeControlPage(identity, request.requestId, turn, failureCandidate))
+      .toMatchObject({ status: "pending" });
+    vi.setSystemTime(Date.now() + 1_500);
+    const terminal = {
+      ...failureCandidate,
+      observedAt: new Date().toISOString(),
+      observationSequence: 5,
+      state: "final" as const,
     };
 
     observationWriteFault.failOnce = true;
@@ -153,14 +166,25 @@ describe("terminal observation recovery", () => {
       responseId: "response-terminal-active-cleanup",
       state: "response_created",
     });
-    const nextTerminal = {
+    const nextFailureCandidate = {
       ...nextBase,
       observationSequence: 4,
       responseId: "response-terminal-active-cleanup",
-      state: "final" as const,
+      state: "result_candidate" as const,
       responseIsFinal: true as const,
       reason: "callback_missing" as const,
       source: "host_observed" as const,
+      errorCode: "UNKNOWN" as const,
+      completionEvidence: { responseActionsVisible: true as const, stopControlAbsent: true as const },
+    };
+    expect(gateway.observeControlPage(identity, nextRequest.requestId, nextTurn, nextFailureCandidate))
+      .toMatchObject({ status: "pending" });
+    vi.setSystemTime(Date.now() + 1_500);
+    const nextTerminal = {
+      ...nextFailureCandidate,
+      observedAt: new Date().toISOString(),
+      observationSequence: 5,
+      state: "final" as const,
     };
 
     const originalRemove = fs.rmSync.bind(fs);
@@ -251,7 +275,7 @@ describe("terminal observation recovery", () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("boot-ack-cleanup-recovery");
     cleanups.push(root);
-    const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
+    const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface, resultTransport: "mailbox" });
     const identity = { ...gateway.registerWorkspace(root), localSessionId: "session-boot-cleanup" };
     const chatUrl = projectUrl.replace("/project", "/c/boot-cleanup");
     const page = gateway.surfaceClaim(identity, {

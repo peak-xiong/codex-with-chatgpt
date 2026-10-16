@@ -12,10 +12,10 @@ import {
 import {
   advanceControlPageObservation,
   CONTROL_PAGE_CHECK_INTERVAL_MS,
-  controlWaitPolicy, parseControlPageObservation, type ControlHostFailure,
+  controlWaitPolicy, parseControlPageObservation, parseStoredControlPageObservation, type ControlHostFailure,
 } from "../src/control/wait-policy.js";
 import {
-  canonicalJson, MAX_CONTROL_RESULT_BYTES, type ControlResultSubmission,
+  canonicalJson, MAX_CONTROL_RESULT_BYTES, sha256Hex, type ControlResultSubmission,
 } from "../src/control/result-schema.js";
 import { MachineGateway, requireCurrentTurnSurface } from "../src/gateway/machine-gateway.js";
 import { createMcpServer } from "../src/mcp/server.js";
@@ -70,8 +70,9 @@ function fixture(
     ...pageIdentity, observationSequence: createResponse ? 4 : 3, responseId: `response-${request.requestId}`,
     state: "final", responseIsFinal: true, reason: "platform_blocked",
     source: "model_reported", tool: "report_control_progress", errorCode: "SAFETY_CHECK_BLOCKED",
+    completionEvidence,
   };
-  return { gateway, identity, request, grant, observation, page };
+  return { gateway, identity, request, grant, observation, page, turnCorrelation };
 }
 
 function planSubmissionAtBytes(targetBytes: number): ControlResultSubmission {
@@ -140,6 +141,110 @@ function generatingObservation(f: ReturnType<typeof fixture>) {
   };
 }
 
+const completionEvidence = { responseActionsVisible: true as const, stopControlAbsent: true as const };
+
+function computerUseCandidate(f: ReturnType<typeof fixture>, terminalResult: ControlResultSubmission) {
+  const status = f.gateway.getControlResultStatus(f.identity, f.request.requestId, f.turnCorrelation);
+  return {
+    tabId: f.observation.tabId,
+    generation: f.observation.generation,
+    observedUrl: f.observation.observedUrl,
+    observedAt: new Date().toISOString(),
+    responseToRequestId: f.request.requestId,
+    observationSequence: (status.pageObservation?.latest.observationSequence ?? 0) + 1,
+    responseId: `response-${f.request.requestId}`,
+    state: "result_candidate" as const,
+    responseIsFinal: true as const,
+    delivery: "computer_use" as const,
+    terminalResult,
+    completionEvidence,
+  };
+}
+
+type HostFailureCompletionFields = Pick<Extract<ControlHostFailure, { state: "final" }>,
+  "reason" | "source" | "tool" | "errorCode">;
+
+function hostFailureCandidate(
+  f: ReturnType<typeof fixture>,
+  overrides: Partial<HostFailureCompletionFields> = {},
+) {
+  const status = f.gateway.getControlResultStatus(f.identity, f.request.requestId, f.turnCorrelation);
+  return {
+    ...f.observation,
+    ...overrides,
+    observedAt: new Date().toISOString(),
+    observationSequence: (status.pageObservation?.latest.observationSequence ?? 0) + 1,
+    state: "result_candidate" as const,
+    completionEvidence,
+  };
+}
+
+function finalForHostFailureCandidate(candidate: ReturnType<typeof hostFailureCandidate>) {
+  return {
+    ...candidate,
+    observedAt: new Date().toISOString(),
+    observationSequence: candidate.observationSequence + 1,
+    state: "final" as const,
+  };
+}
+
+function completeHostFailure(
+  f: ReturnType<typeof fixture>,
+  overrides: Partial<HostFailureCompletionFields> = {},
+) {
+  if (!vi.isFakeTimers()) vi.useFakeTimers({ toFake: ["Date"] });
+  const acceptedAt = Date.now();
+  const candidate = hostFailureCandidate(f, overrides);
+  f.gateway.observeControlPage(f.identity, f.request.requestId, f.turnCorrelation, candidate);
+  vi.setSystemTime(acceptedAt + 1_500);
+  const final = finalForHostFailureCandidate(candidate);
+  const status = f.gateway.observeControlPage(f.identity, f.request.requestId, f.turnCorrelation, final);
+  return { candidate, final, status };
+}
+
+function finalForCandidate(candidate: ReturnType<typeof computerUseCandidate>) {
+  return {
+    ...candidate,
+    observedAt: new Date().toISOString(),
+    observationSequence: candidate.observationSequence + 1,
+    state: "final" as const,
+  };
+}
+
+function completeComputerUse(f: ReturnType<typeof fixture>, terminalResult: ControlResultSubmission) {
+  if (!vi.isFakeTimers()) vi.useFakeTimers({ toFake: ["Date"] });
+  const acceptedAt = Date.now();
+  const candidate = computerUseCandidate(f, terminalResult);
+  f.gateway.observeControlPage(f.identity, f.request.requestId, f.turnCorrelation, candidate);
+  vi.setSystemTime(acceptedAt + 1_500);
+  const final = finalForCandidate(candidate);
+  return {
+    candidate,
+    final,
+    status: f.gateway.observeControlPage(
+      f.identity,
+      f.request.requestId,
+      f.turnCorrelation,
+      final,
+    ),
+  };
+}
+
+function writeLegacyPageObservation(f: ReturnType<typeof fixture>, observation: unknown) {
+  const state = { latest: observation, lastDefinitive: observation };
+  const stored = {
+    schemaVersion: 1,
+    requestId: f.request.requestId,
+    workspaceId: f.identity.workspaceId,
+    localSessionId: f.identity.localSessionId,
+    ...state,
+    observationHash: sha256Hex(canonicalJson(state)),
+  };
+  const file = path.join(getControlMailboxDir(f.identity.workspaceId), "observations", `${f.request.requestId}.json`);
+  fs.writeFileSync(file, JSON.stringify(stored));
+  return file;
+}
+
 beforeEach(() => { cleanups.push(isolateStateDir()); });
 afterEach(() => {
   vi.useRealTimers();
@@ -151,7 +256,7 @@ afterEach(() => {
 describe("state-driven mailbox waiting", () => {
   it("does not leave a newly opened orphan request when page renewal fails", () => {
     const f = fixture();
-    f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, f.observation);
+    completeHostFailure(f);
     vi.spyOn(f.gateway, "surfaceRenew").mockImplementation(() => { throw new Error("injected renewal failure"); });
     expect(() => f.gateway.openControlResultRequest(f.identity, { ...correlation, iteration: 1 })).toThrow(/injected renewal failure/);
     expect(getActiveControlResultStatus(f.identity.workspaceId, f.identity.localSessionId)).toBeNull();
@@ -163,20 +268,144 @@ describe("state-driven mailbox waiting", () => {
     expect("responseId" in first && first.responseId).toMatch(/^response-[a-f0-9]{64}$/);
     expect(parseControlPageObservation(first)).toEqual(first);
     expect(() => parseControlPageObservation({ ...first, responseId: "bad\nlocator" })).toThrow(/invalid/);
-  });
-  it("accepts an already-completed paired response without a synthetic response_created event", () => {
-    const f = fixture("direct-final", undefined, correlation, false);
-    const status = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, {
-      ...generatingObservation(f), state: "final", responseIsFinal: true, delivery: "computer_use",
-      terminalResult: { kind: "BLOCKED", payload: { reason: "Required evidence missing", needs: ["Supply the evidence"] } },
+
+    const rawCandidate = {
+      ...generatingObservation(f),
+      state: "result_candidate" as const,
+      responseIsFinal: true as const,
+      delivery: "computer_use" as const,
+      terminalResult: { kind: "BLOCKED" as const, payload: { reason: "  normalized reason  ", needs: [" A need "] } },
+      completionEvidence,
+    };
+    const candidate = parseControlPageObservation(rawCandidate);
+    const final = parseControlPageObservation({
+      ...rawCandidate,
+      state: "final",
+      observationSequence: rawCandidate.observationSequence + 1,
+      observedAt: new Date(Date.parse(rawCandidate.observedAt) + 1).toISOString(),
     });
+    expect(candidate.state).toBe("result_candidate");
+    expect(final.state).toBe("final");
+    if (candidate.state === "result_candidate" && final.state === "final" && "delivery" in final) {
+      expect(final.terminalResult).toEqual(candidate.terminalResult);
+      expect(candidate.terminalResult.payload).toMatchObject({ reason: "normalized reason", needs: ["A need"] });
+    }
+    expect(() => parseControlPageObservation({ ...rawCandidate, completionEvidence: { ...completionEvidence, stopControlAbsent: false } }))
+      .toThrow(/invalid control page observation/);
+  });
+  it("rejects a direct final and accepts an already-completed paired response through the stability barrier", () => {
+    const f = fixture("direct-final", undefined, correlation, false);
+    const result = { kind: "BLOCKED" as const, payload: { reason: "Required evidence missing", needs: ["Supply the evidence"] } };
+    const candidate = computerUseCandidate(f, result);
+    expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, finalForCandidate(candidate)))
+      .toThrow(/exact response lifecycle/);
+    const { status } = completeComputerUse(f, result);
     expect(controlWaitPolicy(status)).toMatchObject({ state: "blocked", delivery: "computer_use", result: { kind: "BLOCKED" } });
+  });
+
+  it("requires a fresh final UI sample and a gateway-measured 1500ms candidate window", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = fixture("stable-sample");
+    const result = { kind: "BLOCKED" as const, payload: { reason: "Evidence missing", needs: ["Provide evidence"] } };
+    const acceptedAt = new Date().toISOString();
+    const first = advanceControlPageObservation(
+      f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).pageObservation ?? null,
+      computerUseCandidate(f, result),
+      acceptedAt,
+    );
+    const candidate = first.state.latest;
+    if (candidate.state !== "result_candidate") throw new Error("expected a result candidate");
+
+    const sameUiSample = {
+      ...candidate,
+      state: "final" as const,
+      observationSequence: candidate.observationSequence + 1,
+    };
+    expect(() => advanceControlPageObservation(first.state, sameUiSample,
+      new Date(Date.parse(acceptedAt) + 1_500).toISOString())).toThrow(/newer UI observation/);
+
+    const freshFinal = {
+      ...sameUiSample,
+      observedAt: new Date(Date.parse(candidate.observedAt) + 1).toISOString(),
+    };
+    expect(() => advanceControlPageObservation(first.state, freshFinal,
+      new Date(Date.parse(acceptedAt) + 1_499).toISOString())).toThrow(/fresh stability recheck/);
+    expect(advanceControlPageObservation(first.state, freshFinal,
+      new Date(Date.parse(acceptedAt) + 1_500).toISOString()).terminal).toEqual(freshFinal);
+  });
+
+  it("requires candidate/final identity and result agreement, and resets the gate when generation resumes", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = fixture("candidate-identity");
+    const result = { kind: "BLOCKED" as const, payload: { reason: "Missing evidence", needs: ["Provide it"] } };
+    const acceptedAt = Date.now();
+    const candidate = computerUseCandidate(f, result);
+    const initial = f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).pageObservation ?? null;
+    const candidateState = advanceControlPageObservation(initial, candidate, new Date(acceptedAt).toISOString()).state;
+    const final = {
+      ...candidate,
+      state: "final" as const,
+      observationSequence: candidate.observationSequence + 1,
+      observedAt: new Date(acceptedAt + 1).toISOString(),
+    };
+    const changedResult = {
+      ...final,
+      terminalResult: { kind: "BLOCKED" as const, payload: { reason: "Different result", needs: ["Provide it"] } },
+    };
+    expect(() => advanceControlPageObservation(candidateState, changedResult, new Date(acceptedAt + 1_500).toISOString()))
+      .toThrow(/exact completion candidate/);
+    expect(() => advanceControlPageObservation(candidateState, { ...final, responseId: "replacement" },
+      new Date(acceptedAt + 1_500).toISOString())).toThrow(/replacement response or URL/);
+    expect(() => advanceControlPageObservation(candidateState, { ...final, observedUrl: `${projectUrl}/other` },
+      new Date(acceptedAt + 1_500).toISOString())).toThrow(/replacement response or URL/);
+
+    const { responseIsFinal: _responseIsFinal, delivery: _delivery, terminalResult: _terminalResult,
+      completionEvidence: _completionEvidence, state: _candidateState, ...response } = candidate;
+    const generating = {
+      ...response,
+      state: "generating" as const,
+      observationSequence: candidate.observationSequence + 1,
+      observedAt: new Date(acceptedAt + 100).toISOString(),
+    };
+    const generatingState = advanceControlPageObservation(candidateState, generating,
+      new Date(acceptedAt + 100).toISOString()).state;
+    expect(() => advanceControlPageObservation(generatingState, {
+      ...final,
+      observationSequence: generating.observationSequence + 1,
+    }, new Date(acceptedAt + 1_700).toISOString())).toThrow(/exact response lifecycle/);
+    const resumedCandidate = {
+      ...candidate,
+      observedAt: new Date(acceptedAt + 200).toISOString(),
+      observationSequence: generating.observationSequence + 1,
+    };
+    const resumedState = advanceControlPageObservation(generatingState, resumedCandidate,
+      new Date(acceptedAt + 200).toISOString()).state;
+    const resumedFinal = {
+      ...resumedCandidate,
+      state: "final" as const,
+      observedAt: new Date(acceptedAt + 1_701).toISOString(),
+      observationSequence: resumedCandidate.observationSequence + 1,
+    };
+    expect(advanceControlPageObservation(resumedState, resumedFinal,
+      new Date(acceptedAt + 1_700).toISOString()).terminal).toEqual(resumedFinal);
+  });
+
+  it("keeps candidate evidence isolated to its exact local session", () => {
+    const f = fixture("candidate-session-a");
+    const candidate = computerUseCandidate(f, {
+      kind: "BLOCKED", payload: { reason: "Missing input", needs: ["Provide input"] },
+    });
+    f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, candidate);
+    expect(() => f.gateway.getControlResultStatus(
+      { ...f.identity, localSessionId: "candidate-session-b" }, f.request.requestId, correlation,
+    )).toThrow(/another local session/);
+    expect(getActiveControlResultStatus(f.identity.workspaceId, "candidate-session-b")).toBeNull();
   });
 
   it("renews an idle page before opening work, preserving its generation beyond the old expiry", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const f = fixture();
-    f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, f.observation);
+    completeHostFailure(f);
     vi.setSystemTime(Date.parse(f.page.leaseExpiresAt) - 10_000);
     const next = { ...correlation, iteration: 1 };
     const { request } = f.gateway.openControlResultRequest(f.identity, next);
@@ -187,9 +416,16 @@ describe("state-driven mailbox waiting", () => {
     f.gateway.observeControlPage(f.identity, request.requestId, next, { ...base, observationSequence: 1, state: "send_attempted" });
     f.gateway.observeControlPage(f.identity, request.requestId, next, { ...base, observationSequence: 2, state: "sent" });
     vi.setSystemTime(Date.now() + 11_000);
-    const status = f.gateway.observeControlPage(f.identity, request.requestId, next, { ...base,
-      observedAt: new Date().toISOString(), observationSequence: 3, state: "final", responseId: "idle-result",
-      responseIsFinal: true, delivery: "computer_use", terminalResult: { kind: "BLOCKED", payload: { reason: "Missing input", needs: ["Supply input"] } },
+    const result = { kind: "BLOCKED" as const, payload: { reason: "Missing input", needs: ["Supply input"] } };
+    const candidate = {
+      ...base, observationSequence: 3, state: "result_candidate" as const, responseId: "idle-result",
+      responseIsFinal: true as const, delivery: "computer_use" as const,
+      terminalResult: result, completionEvidence,
+    };
+    f.gateway.observeControlPage(f.identity, request.requestId, next, candidate);
+    vi.setSystemTime(Date.now() + 1_500);
+    const status = f.gateway.observeControlPage(f.identity, request.requestId, next, {
+      ...candidate, observedAt: new Date().toISOString(), observationSequence: 4, state: "final",
     });
     expect(controlWaitPolicy(status).delivery).toBe("computer_use");
     expect(f.gateway.surfaceGet(f.identity).lease?.generation).toBe(f.page.generation);
@@ -210,11 +446,13 @@ describe("state-driven mailbox waiting", () => {
   it("keeps a late exact response as evidence without reviving its expired capability or delivering BOOT", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const f = fixture();
+    const result = { kind: "BLOCKED" as const, payload: { reason: "Missing evidence", needs: ["Supply evidence"] } };
+    const candidate = computerUseCandidate(f, result);
+    f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, candidate);
     vi.setSystemTime(Date.parse(f.request.expiresAt) + 1);
-    const observation = { ...generatingObservation(f), state: "final" as const, responseIsFinal: true as const,
-      delivery: "computer_use" as const,
-      terminalResult: { kind: "BLOCKED" as const, payload: { reason: "Missing evidence", needs: ["Supply evidence"] } } };
-    expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, { ...observation, tabId: "wrong-tab" })).toThrow(/original request/);
+    const observation = finalForCandidate(candidate);
+    expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, { ...observation, tabId: "wrong-tab" }))
+      .toThrow(/exact prompt, page, response, and sequence/);
     const status = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, observation);
     expect(status).toMatchObject({ status: "expired", lateEvidence: observation });
     expect(status.hostObservedResult).toBeUndefined();
@@ -224,12 +462,35 @@ describe("state-driven mailbox waiting", () => {
     expect(f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, observation)).toEqual(status);
   });
 
+  it("retains a first-seen late final as evidence without requiring a candidate or stable delivery window", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = fixture("late-first-seen");
+    vi.setSystemTime(Date.parse(f.request.expiresAt) + 1);
+    const candidateShape = computerUseCandidate(f, {
+      kind: "BLOCKED", payload: { reason: "Missing evidence", needs: ["Supply evidence"] },
+    });
+    const final = {
+      ...candidateShape,
+      state: "final" as const,
+      observedAt: new Date().toISOString(),
+    };
+    const status = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, final);
+    expect(status).toMatchObject({ status: "expired", lateEvidence: final });
+    expect(status.hostObservedResult).toBeUndefined();
+    expect(controlWaitPolicy(status)).toMatchObject({
+      state: "evidence_only", delivery: "none", result: null, nextAction: "review_late_evidence",
+    });
+  });
+
   it("records a revoked request's late result without treating it as delivery or blocking the next task", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     const f = fixture();
+    const result = { kind: "BLOCKED" as const, payload: { reason: "Evidence missing", needs: ["Supply it"] } };
+    const candidate = computerUseCandidate(f, result);
+    f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, candidate);
     f.gateway.cancelTurn(f.grant.token);
-    const observation = { ...generatingObservation(f), state: "final" as const, responseIsFinal: true as const,
-      delivery: "computer_use" as const,
-      terminalResult: { kind: "BLOCKED" as const, payload: { reason: "Evidence missing", needs: ["Supply it"] } } };
+    vi.setSystemTime(Date.now() + 1_500);
+    const observation = finalForCandidate(candidate);
     const status = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, observation);
     expect(status).toMatchObject({ status: "cancelled", hostFailure: { reason: "capability_invalid" }, lateEvidence: observation });
     expect(controlWaitPolicy(status)).toMatchObject({ state: "evidence_only", delivery: "none" });
@@ -277,13 +538,16 @@ describe("state-driven mailbox waiting", () => {
       payload: { reason: "Cannot complete this request", needs: ["Clarify the permitted task"] },
     });
     const status = await waitForControlResult("workspace-a", request.requestId, 0, "session-a", correlation);
-    expect(controlWaitPolicy(status)).toMatchObject({ outcome: "blocked", nextAction: "persist_then_ack" });
+    expect(controlWaitPolicy(status, "mailbox")).toMatchObject({ outcome: "blocked", nextAction: "persist_then_ack" });
     expect(acknowledgeControlResult("workspace-a", request.requestId, "session-a", correlation).status).toBe("acknowledged");
   });
 
   it("keeps the same request, token and page alive for 90 minutes and receives the real MCP callback", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
-    const f = fixture();
+    const f = fixture("session-a", new MachineGateway({
+      surfaceValidator: requireCurrentTurnSurface,
+      resultTransport: "mailbox",
+    }));
     const otherIdentity = { ...f.identity, localSessionId: "session-b" };
     const other = f.gateway.openControlResultRequest(otherIdentity, correlation);
     const start = Date.parse(f.request.createdAt);
@@ -315,7 +579,7 @@ describe("state-driven mailbox waiting", () => {
       expect(receipt.isError, JSON.stringify(receipt)).not.toBe(true);
       expect(receipt.structuredContent).toMatchObject({ accepted: true, requestId: f.request.requestId, kind: "BLOCKED" });
       const received = f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation);
-      expect(controlWaitPolicy(received)).toMatchObject({ outcome: "blocked", nextAction: "persist_then_ack" });
+      expect(controlWaitPolicy(received, "mailbox")).toMatchObject({ outcome: "blocked", nextAction: "persist_then_ack" });
       expect(f.gateway.acknowledgeControlResult(f.identity, f.request.requestId, correlation).status).toBe("acknowledged");
     } finally { await client.close(); await server.close(); }
   }, 120_000);
@@ -449,6 +713,7 @@ describe("state-driven mailbox waiting", () => {
       responseIsFinal: true,
       reason: "callback_missing",
       source: "host_observed",
+      completionEvidence,
     })).toThrow(/sequence conflicts/);
     expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, {
       ...generating,
@@ -458,7 +723,7 @@ describe("state-driven mailbox waiting", () => {
       ...generating,
       observationSequence: generating.observationSequence + 1,
       responseId: "response-replacement",
-    })).toThrow(/replacement or older response/);
+    })).toThrow(/replacement response or URL/);
     expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation))
       .toMatchObject({ status: "pending", request: { expiresAt: firstExpiry } });
   });
@@ -480,6 +745,54 @@ describe("state-driven mailbox waiting", () => {
     fs.writeFileSync(observationPath, JSON.stringify(stored));
     expect(() => f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation))
       .toThrow(/observation integrity hash/);
+  });
+
+  it("reads and exactly replays historical final observations without completionEvidence", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = fixture("legacy-final-read");
+    const { final } = completeComputerUse(f, {
+      kind: "BLOCKED", payload: { reason: "Evidence missing", needs: ["Provide evidence"] },
+    });
+    const { completionEvidence: _completionEvidence, ...legacyFinal } = final;
+    const file = writeLegacyPageObservation(f, legacyFinal);
+    const activePath = path.join(getControlMailboxDir(f.identity.workspaceId), "active", `${f.identity.localSessionId}.json`);
+    fs.mkdirSync(path.dirname(activePath), { recursive: true });
+    fs.writeFileSync(activePath, JSON.stringify(f.request));
+
+    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).pageObservation?.latest)
+      .toEqual(legacyFinal);
+    expect(parseStoredControlPageObservation(legacyFinal)).toEqual(legacyFinal);
+    expect(() => parseControlPageObservation(legacyFinal)).toThrow(/invalid control page observation/);
+    const replay = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, legacyFinal);
+    expect(replay.status).toBe("cancelled");
+    expect(replay.result).toBeNull();
+    expect(fs.existsSync(activePath)).toBe(false);
+    expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it("keeps historical failure observations with terminalResult readable for audit", () => {
+    const f = fixture("legacy-mixed-failure");
+    const failure = completeHostFailure(f).status;
+    const final = f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation)
+      .pageObservation?.lastDefinitive;
+    if (!final || final.state !== "final") throw new Error("expected a stored failure final");
+    const { completionEvidence: _completionEvidence, ...legacyFinal } = final;
+    const mixed = {
+      ...legacyFinal,
+      terminalResult: {
+        kind: "BLOCKED" as const,
+        payload: { reason: "Historical mixed record", needs: ["Review the old record"] },
+      },
+    };
+    writeLegacyPageObservation(f, mixed);
+    const stored = f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation);
+    expect(stored.pageObservation?.latest).toMatchObject({
+      state: "final", reason: "platform_blocked", terminalResult: { kind: "BLOCKED" },
+    });
+    expect(stored.hostFailure).toEqual(failure.hostFailure);
+    expect(stored.hostObservedResult).toBeUndefined();
+    expect(() => parseControlPageObservation(mixed)).toThrow(/invalid control page observation/);
+    expect(f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, mixed).status).toBe("cancelled");
   });
 
   it("does not let a renewal mask tampering with the original request", () => {
@@ -597,18 +910,21 @@ describe("exact response terminal observations", () => {
       requestId: f.request.requestId, localSessionId: f.identity.localSessionId, ...correlation, status: "SEARCHING",
     });
     const waiter = f.gateway.waitForControlResult(f.identity, f.request.requestId, 1_000, correlation);
-    const status = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, f.observation);
+    const { final, status } = completeHostFailure(f);
     expect(status).toMatchObject({ status: "cancelled", result: null, progress: { status: "SEARCHING" }, hostFailure: { source: "model_reported", reason: "platform_blocked" } });
     expect((await waiter).status).toBe("cancelled");
     expect(f.gateway.turnStatus(f.grant.token).status).toBe("revoked");
     expect(() => acknowledgeControlResult(f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation)).toThrow(/before receipt/);
     expect(f.gateway.getControlResultStatus(otherIdentity, other.request.requestId, correlation).status).toBe("pending");
     expect(readSession(f.identity.workspaceId, f.identity.localSessionId)?.checkpoint?.completedSubtasks).toBe("Keep completed work");
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).hostFailure).toEqual(f.observation);
+    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).hostFailure).toEqual(final);
   });
 
   it.each(["final", "generating"] as const)("preserves a receipt racing a %s observation", (state) => {
-    const f = fixture();
+    const f = fixture("session-a", new MachineGateway({
+      surfaceValidator: requireCurrentTurnSurface,
+      resultTransport: "mailbox",
+    }));
     const read = f.gateway.getControlResultStatus.bind(f.gateway);
     vi.spyOn(f.gateway, "getControlResultStatus").mockImplementationOnce((...args) => {
       const pending = read(...args);
@@ -627,26 +943,79 @@ describe("exact response terminal observations", () => {
     expect(f.gateway.acknowledgeControlResult(f.identity, f.request.requestId, correlation).status).toBe("acknowledged");
   });
 
-  it("automatically resolves a finished response with no callback without manufacturing a receipt", () => {
+  it("requires page-dependent failure finals to pass the exact candidate barrier", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     const f = fixture();
-    const status = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, {
-      ...f.observation, reason: "callback_missing", source: "host_observed", tool: "submit_control_result", errorCode: "UNKNOWN",
+    const generating = generatingObservation(f);
+    f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, generating);
+    const candidate = hostFailureCandidate(f, {
+      reason: "callback_missing",
+      source: "host_observed",
+      tool: "submit_control_result",
+      errorCode: "UNKNOWN",
+    });
+    const directFinal = finalForHostFailureCandidate(candidate);
+    expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, directFinal))
+      .toThrow(/exact response lifecycle/);
+    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
+
+    const mixed = {
+      ...candidate,
       terminalResult: {
-        kind: "BLOCKED",
+        kind: "BLOCKED" as const,
         payload: { reason: "The final callback was unavailable", needs: ["End this attempt"] },
       },
+    };
+    expect(() => parseControlPageObservation(mixed)).toThrow(/invalid control page observation/);
+    const acceptedCandidate = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, candidate);
+    expect(acceptedCandidate).toMatchObject({ status: "pending", pageObservation: { lastDefinitive: { state: "result_candidate" } } });
+    expect(controlWaitPolicy(acceptedCandidate)).toMatchObject({ outcome: "pending", nextAction: "confirm_response_final" });
+
+    const wrongResponse = { ...finalForHostFailureCandidate(candidate), responseId: "replacement-response" };
+    expect(() => recordControlHostFailure(
+      f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation, wrongResponse,
+    )).toThrow(/replacement response or URL/);
+    const earlyFinal = {
+      ...finalForHostFailureCandidate(candidate),
+      observedAt: new Date(Date.parse(candidate.observedAt) + 1).toISOString(),
+    };
+    expect(() => recordControlHostFailure(
+      f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation, earlyFinal,
+    )).toThrow(/fresh stability recheck/);
+    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
+
+    vi.setSystemTime(Date.now() + 1_500);
+    const resumed = generatingObservation(f);
+    f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, resumed);
+    const oldCandidateFinal = {
+      ...earlyFinal,
+      observationSequence: resumed.observationSequence + 1,
+      observedAt: new Date(Date.parse(resumed.observedAt) + 1).toISOString(),
+    };
+    expect(() => recordControlHostFailure(
+      f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation, oldCandidateFinal,
+    )).toThrow(/exact response lifecycle/);
+    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
+
+    const resumedCandidate = hostFailureCandidate(f, {
+      reason: "callback_missing",
+      source: "host_observed",
+      tool: "submit_control_result",
+      errorCode: "UNKNOWN",
     });
+    f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, resumedCandidate);
+    vi.setSystemTime(Date.now() + 1_500);
+    const final = finalForHostFailureCandidate(resumedCandidate);
+    const status = recordControlHostFailure(
+      f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation, final,
+    );
     expect(status).toMatchObject({
       status: "cancelled",
       result: null,
       hostFailure: { reason: "callback_missing", source: "host_observed" },
-      hostObservedResult: {
-        provenance: "host_observed",
-        result: { kind: "BLOCKED", payload: { reason: "The final callback was unavailable" } },
-      },
     });
-    expect(controlWaitPolicy(status)).toMatchObject({ nextAction: "stop", delivery: "computer_use" });
-    expect(f.gateway.turnStatus(f.grant.token).status).toBe("revoked");
+    expect(status.hostObservedResult).toBeUndefined();
+    expect(controlWaitPolicy(status)).toMatchObject({ outcome: "terminal", nextAction: "stop", delivery: "none" });
   });
 
   it("accepts a verified Computer Use result as the active delivery path", () => {
@@ -656,11 +1025,7 @@ describe("exact response terminal observations", () => {
       new MachineGateway({ surfaceValidator: requireCurrentTurnSurface }),
       planCorrelation,
     );
-    const { reason: _reason, source: _source, tool: _tool, errorCode: _errorCode, ...response } = f.observation;
-    const status = f.gateway.observeControlPage(f.identity, f.request.requestId, planCorrelation, {
-      ...response,
-      delivery: "computer_use",
-      terminalResult: {
+    const { status } = completeComputerUse(f, {
         kind: "PLAN",
         payload: {
           goal: "Compare Computer Use delivery",
@@ -669,7 +1034,6 @@ describe("exact response terminal observations", () => {
           tests: ["Verify exact response correlation"],
           successCriteria: ["The host reports Computer Use delivery"],
         },
-      },
     });
     expect(status).toMatchObject({
       status: "cancelled",
@@ -690,12 +1054,7 @@ describe("exact response terminal observations", () => {
     const boundary = fixture("session-boundary", new MachineGateway({ surfaceValidator: requireCurrentTurnSurface }), planCorrelation);
     const accepted = planSubmissionAtBytes(MAX_CONTROL_RESULT_BYTES);
     expect(Buffer.byteLength(canonicalJson(accepted), "utf8")).toBe(MAX_CONTROL_RESULT_BYTES);
-    expect(boundary.gateway.observeControlPage(
-      boundary.identity,
-      boundary.request.requestId,
-      planCorrelation,
-      { ...boundary.observation, terminalResult: accepted },
-    )).toMatchObject({
+    expect(completeComputerUse(boundary, accepted).status).toMatchObject({
       status: "cancelled",
       result: null,
       hostObservedResult: { result: { kind: "PLAN" } },
@@ -706,22 +1065,18 @@ describe("exact response terminal observations", () => {
     const planCorrelation = { taskId: "terminal-size-test", iteration: 0, phase: "PLAN" as const };
     const f = fixture("session-oversized", new MachineGateway({ surfaceValidator: requireCurrentTurnSurface }), planCorrelation);
     const oversized = planSubmissionAtBytes(MAX_CONTROL_RESULT_BYTES + 1);
-    const oversizedObservation = { ...f.observation, terminalResult: oversized };
+    const oversizedObservation = computerUseCandidate(f, oversized);
     expect(Buffer.byteLength(canonicalJson(oversized), "utf8")).toBe(MAX_CONTROL_RESULT_BYTES + 1);
     expect(() => parseControlPageObservation(oversizedObservation)).toThrow(/exceeds 16384 bytes/);
-    expect(() => recordControlHostFailure(
-      f.identity.workspaceId,
-      f.request.requestId,
-      f.identity.localSessionId,
-      planCorrelation,
-      oversizedObservation,
+    expect(() => f.gateway.observeControlPage(
+      f.identity, f.request.requestId, planCorrelation, oversizedObservation,
     )).toThrow(/exceeds 16384 bytes/);
 
     const multibyte = planSubmissionAtBytes(MAX_CONTROL_RESULT_BYTES);
     if (multibyte.kind !== "PLAN") throw new Error("expected PLAN fixture");
     multibyte.payload.goal = `${multibyte.payload.goal.slice(0, -1)}界`;
     expect(Buffer.byteLength(canonicalJson(multibyte), "utf8")).toBe(MAX_CONTROL_RESULT_BYTES + 2);
-    expect(() => parseControlPageObservation({ ...f.observation, terminalResult: multibyte }))
+    expect(() => parseControlPageObservation(computerUseCandidate(f, multibyte)))
       .toThrow(/exceeds 16384 bytes/);
 
     const pending = f.gateway.getControlResultStatus(f.identity, f.request.requestId, planCorrelation);
@@ -750,33 +1105,28 @@ describe("exact response terminal observations", () => {
 
   it("rejects a host-observed kind that the request phase does not allow", () => {
     const f = fixture();
-    expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, {
-      ...f.observation,
-      terminalResult: {
+    expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation,
+      computerUseCandidate(f, {
         kind: "PLAN",
         payload: {
           goal: "Wrong phase", rationale: "RESEARCH cannot accept PLAN",
           actions: [{ change: "Do nothing", why: "The phase is wrong" }], tests: [],
           successCriteria: ["The observation is rejected"],
         },
-      },
-    })).toThrow(/not allowed/i);
+      }))).toThrow(/not allowed/i);
     expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation))
       .toMatchObject({ status: "pending", result: null });
   });
 
   it("lets an already-started MCP completion settle before a host terminal fallback", () => {
-    const f = fixture();
+    const f = fixture("session-a", new MachineGateway({
+      surfaceValidator: requireCurrentTurnSurface,
+      resultTransport: "mailbox",
+    }));
     const lease = f.gateway.claimTurn(f.grant.token, ["c2c.result.write"]);
     const fence = f.gateway.beginCompletion(f.grant.token);
     f.gateway.releaseTurn(f.grant.token, lease.lease);
-    const observed = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, {
-      ...f.observation,
-      terminalResult: {
-        kind: "BLOCKED",
-        payload: { reason: "The page did not see the receipt", needs: ["Reconcile the mailbox"] },
-      },
-    });
+    const observed = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, f.observation);
     expect(observed).toMatchObject({ status: "pending", result: null });
     expect(observed.hostObservedResult).toBeUndefined();
     f.gateway.completeControlResult(f.grant.token, fence, {

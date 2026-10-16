@@ -4,10 +4,15 @@ import { createHash, randomBytes } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { observeMachineRuntime } from "../src/gateway/runtime.js";
+import type { MachineRuntimeState } from "../src/gateway/runtime.js";
+import { observeMailboxPage, type MailboxIdentity } from "../src/gateway/control-client.js";
 import { bindMachineConnector, connectorMachine } from "../src/gateway/connector-binding.js";
 import { machineHttpPort } from "../src/process/machine-daemon.js";
+import { vi } from "vitest";
 import type { MachineGateway, MachineSurfaceIdentity } from "../src/gateway/machine-gateway.js";
 import { submitControlResult } from "../src/control/mailbox.js";
+import type { ControlResultCorrelation, ControlResultSubmission } from "../src/control/result-schema.js";
+import { CONTROL_RESULT_FINAL_STABILITY_MS } from "../src/control/wait-policy.js";
 import type { SurfaceLease } from "../src/session/surface-ownership.js";
 
 export function projectSelection(projectUrl: string) {
@@ -26,16 +31,125 @@ export function receiveBootResult(
     iteration: 0,
     phase: "BOOT",
   });
-  submitControlResult(identity.workspaceId, {
-    requestId: request.requestId,
-    localSessionId: identity.localSessionId,
-    taskId,
-    iteration: 0,
-    phase: "BOOT",
-    kind: "BOOT",
-    payload: {},
-  });
+  if (gateway.resultTransport === "mailbox") {
+    submitControlResult(identity.workspaceId, {
+      requestId: request.requestId,
+      localSessionId: identity.localSessionId,
+      taskId,
+      iteration: 0,
+      phase: "BOOT",
+      kind: "BOOT",
+      payload: {},
+    });
+    return request.requestId;
+  }
+
+  const wasUsingFakeTimers = vi.isFakeTimers();
+  if (!wasUsingFakeTimers) vi.useFakeTimers({ toFake: ["Date"] });
+  const initialTime = Date.now();
+  try {
+    gateway.issueTurn({
+      ...identity,
+      taskId,
+      iteration: 0,
+      phase: "BOOT",
+      requestId: request.requestId,
+      scopes: ["c2c.result.write"],
+      compactionEpoch: 0,
+      generation: lease.generation,
+    });
+    const projectUrl = lease.projectUrl;
+    const chatUrl = lease.chatUrl ?? projectUrl;
+    const responseId = `boot-response-${lease.generation}`;
+    const base = {
+      tabId: lease.tabId,
+      generation: lease.generation,
+      responseToRequestId: request.requestId,
+      observedAt: new Date().toISOString(),
+    };
+    gateway.observeControlPage(identity, request.requestId, { taskId, iteration: 0, phase: "BOOT" }, {
+      ...base, observedUrl: projectUrl, observationSequence: 1, state: "send_attempted",
+    });
+    gateway.observeControlPage(identity, request.requestId, { taskId, iteration: 0, phase: "BOOT" }, {
+      ...base, observedUrl: projectUrl, observationSequence: 2, state: "sent",
+    });
+    const responseBase = { ...base, observedUrl: chatUrl, responseId };
+    gateway.observeControlPage(identity, request.requestId, { taskId, iteration: 0, phase: "BOOT" }, {
+      ...responseBase, observationSequence: 3, state: "response_created",
+    });
+    const result = { kind: "BOOT" as const, payload: {} };
+    const completionEvidence = { responseActionsVisible: true as const, stopControlAbsent: true as const };
+    gateway.observeControlPage(identity, request.requestId, { taskId, iteration: 0, phase: "BOOT" }, {
+      ...responseBase,
+      observationSequence: 4,
+      state: "result_candidate",
+      responseIsFinal: true,
+      delivery: "computer_use",
+      terminalResult: result,
+      completionEvidence,
+    });
+    vi.setSystemTime(initialTime + 1_500);
+    gateway.observeControlPage(identity, request.requestId, { taskId, iteration: 0, phase: "BOOT" }, {
+      ...responseBase,
+      observedAt: new Date().toISOString(),
+      observationSequence: 5,
+      state: "final",
+      responseIsFinal: true,
+      delivery: "computer_use",
+      terminalResult: result,
+      completionEvidence,
+    });
+  } finally {
+    vi.setSystemTime(initialTime);
+    if (!wasUsingFakeTimers) vi.useRealTimers();
+  }
   return request.requestId;
+}
+
+/** Submit a synthetic Computer Use response through the managed Gateway boundary. */
+export async function observeComputerUseResultForTest(
+  runtime: MachineRuntimeState,
+  identity: MailboxIdentity,
+  request: { requestId: string } & ControlResultCorrelation,
+  page: { tabId: string; generation: number; projectUrl: string; chatUrl: string },
+  result: ControlResultSubmission,
+): Promise<void> {
+  const responseId = `response-${request.requestId}`;
+  const sendUrl = request.phase === "BOOT" ? page.projectUrl : page.chatUrl;
+  const observe = (
+    observationSequence: number,
+    state: "send_attempted" | "sent" | "response_created" | "result_candidate" | "final",
+    observedUrl: string,
+    includeResult = false,
+  ) => observeMailboxPage(runtime, identity, {
+    requestId: request.requestId,
+    taskId: request.taskId,
+    iteration: request.iteration,
+    phase: request.phase,
+    observation: {
+      tabId: page.tabId,
+      generation: page.generation,
+      observedUrl,
+      observedAt: new Date().toISOString(),
+      responseToRequestId: request.requestId,
+      observationSequence,
+      state,
+      ...(observationSequence >= 3 ? { responseId } : {}),
+      ...(includeResult ? {
+        responseIsFinal: true,
+        delivery: "computer_use",
+        terminalResult: result,
+        completionEvidence: { responseActionsVisible: true, stopControlAbsent: true },
+      } : {}),
+    },
+  });
+
+  await observe(1, "send_attempted", sendUrl);
+  await observe(2, "sent", sendUrl);
+  await observe(3, "response_created", page.chatUrl);
+  await observe(4, "result_candidate", page.chatUrl, true);
+  await new Promise((resolve) => setTimeout(resolve, CONTROL_RESULT_FINAL_STABILITY_MS));
+  await observe(5, "final", page.chatUrl, true);
 }
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");

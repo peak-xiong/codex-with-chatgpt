@@ -13,6 +13,7 @@ import { CONTROL_PHASES } from "../src/control/result-schema.js";
 import { MachineGateway, requireCurrentTurnSurface } from "../src/gateway/machine-gateway.js";
 import { nullLogger } from "../src/logger/index.js";
 import { createMcpServer } from "../src/mcp/server.js";
+import { readManyOutputSchema } from "../src/mcp/server.js";
 import { Workspace } from "../src/workspace/manager.js";
 import { cleanup, isolateStateDir, makeTmpDir, projectSelection, write } from "./helpers.js";
 
@@ -60,12 +61,57 @@ async function connectedClient(
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   while (cleanups.length > 0) cleanup(cleanups.pop()!);
   delete process.env.C2C_STATE_DIR;
 });
 
 describe("machine MCP capability correlation", () => {
+  it("publishes output schemas for all twelve read-only tools and validates mixed read_many results", async () => {
+    cleanups.push(isolateStateDir());
+    const root = makeTmpDir("mcp-read-many-output-schema");
+    cleanups.push(root);
+    write(root, "first.txt", "a".repeat(300));
+    write(root, "last.txt", "b".repeat(950));
+    const gateway = new MachineGateway();
+    const registration = gateway.registerWorkspace(root);
+    const turn = correlation();
+    const request = openControlResultRequest(registration.workspaceId, turn);
+    const grant = gateway.issueTurn({ ...registration, ...turn, requestId: request.requestId,
+      scopes: ["workspace.read", "workspace.search", "git.read", "execution.read"],
+      compactionEpoch: 0, generation: 1 });
+    const connection = await connectedClient(gateway);
+    try {
+      const { tools } = await connection.client.listTools();
+      const readOnlyTools = [
+        "workspace_info", "list_directory", "read_file", "read_image", "search_workspace", "git_status",
+        "read_many", "review_context", "git_diff", "test_status", "execution_summary", "execution_output",
+      ];
+      for (const name of readOnlyTools) {
+        const tool = tools.find((candidate) => candidate.name === name);
+        expect(tool?.outputSchema, `${name} outputSchema`).toBeDefined();
+      }
+
+      const result = await connection.client.callTool({ name: "read_many", arguments: {
+        context_id: grant.token,
+        files: [{ path: "first.txt" }, { path: "missing.txt" }, { path: "last.txt" }],
+        max_bytes: 2048,
+      } });
+      expect(result.isError).not.toBe(true);
+      expect(readManyOutputSchema.parse(result.structuredContent)).toMatchObject({
+        atomicSnapshot: false,
+        items: [
+          { index: 0, file: { path: "first.txt", content: "a".repeat(300) } },
+          { index: 1, error: "FILE_NOT_FOUND" },
+          { index: 2, error: "BATCH_LIMIT_REACHED" },
+        ],
+      });
+    } finally {
+      await connection.close();
+    }
+  });
+
   it("review_context includes only the capability's exact execution iteration", async () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("mcp-review-context"); cleanups.push(root);
@@ -229,7 +275,7 @@ describe("machine MCP capability correlation", () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("mcp-boot-receipt");
     cleanups.push(root);
-    const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
+    const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface, resultTransport: "mailbox" });
     const registration = gateway.registerWorkspace(root);
     const identity = { ...registration, localSessionId: "session-mcp-boot" };
     const projectUrl = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
@@ -277,6 +323,7 @@ describe("machine MCP capability correlation", () => {
   });
 
   it("commits an exact candidate after a verified Computer Use BOOT result", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("computer-use-boot");
     cleanups.push(root);
@@ -308,9 +355,17 @@ describe("machine MCP capability correlation", () => {
     gateway.observeControlPage(identity, request.requestId, turn, {
       ...page, observationSequence: 3, state: "response_created", responseId: "response-computer-use-boot",
     });
+    const terminalResult = { kind: "BOOT" as const, payload: {} };
+    const completionEvidence = { responseActionsVisible: true as const, stopControlAbsent: true as const };
+    gateway.observeControlPage(identity, request.requestId, turn, {
+      ...page, observationSequence: 4, state: "result_candidate", responseId: "response-computer-use-boot",
+      responseIsFinal: true, delivery: "computer_use", terminalResult, completionEvidence,
+    });
+    vi.setSystemTime(Date.now() + 1_500);
     expect(gateway.observeControlPage(identity, request.requestId, turn, {
-      ...page, observationSequence: 4, state: "final", responseId: "response-computer-use-boot",
-      responseIsFinal: true, delivery: "computer_use", terminalResult: { kind: "BOOT", payload: {} },
+      ...page, observedAt: new Date().toISOString(), observationSequence: 5, state: "final",
+      responseId: "response-computer-use-boot", responseIsFinal: true, delivery: "computer_use",
+      terminalResult, completionEvidence,
     })).toMatchObject({
       status: "cancelled",
       hostObservedResult: { result: { kind: "BOOT" } },
@@ -325,7 +380,7 @@ describe("machine MCP capability correlation", () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("mcp-progress-binding");
     cleanups.push(root);
-    const gateway = new MachineGateway();
+    const gateway = new MachineGateway({ resultTransport: "mailbox" });
     const registration = gateway.registerWorkspace(root);
     const turn = correlation();
     const request = openControlResultRequest(registration.workspaceId, turn);
@@ -356,7 +411,7 @@ describe("machine MCP capability correlation", () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("mcp-refusal");
     cleanups.push(root);
-    const gateway = new MachineGateway();
+    const gateway = new MachineGateway({ resultTransport: "mailbox" });
     const registration = gateway.registerWorkspace(root);
     const turn = { ...correlation(), phase };
     const request = openControlResultRequest(registration.workspaceId, turn);
@@ -385,7 +440,7 @@ describe("machine MCP capability correlation", () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("mcp-revoked-refusal");
     cleanups.push(root);
-    const gateway = new MachineGateway();
+    const gateway = new MachineGateway({ resultTransport: "mailbox" });
     const registration = gateway.registerWorkspace(root);
     const request = openControlResultRequest(registration.workspaceId, correlation());
     const grant = gateway.issueTurn({
@@ -411,7 +466,7 @@ describe("machine MCP capability correlation", () => {
 
   it("keeps dormant mailbox callbacks testable without exposing them in production", async () => {
     cleanups.push(isolateStateDir());
-    const gateway = new MachineGateway();
+    const gateway = new MachineGateway({ resultTransport: "mailbox" });
     const registrations = [0, 1].map((index) => {
       const root = makeTmpDir(`mcp-local-research-${index}`);
       cleanups.push(root);
@@ -473,7 +528,7 @@ describe("machine MCP capability correlation", () => {
 
   it("documents git_diff pagination with its output field names", async () => {
     cleanups.push(isolateStateDir());
-    const gateway = new MachineGateway();
+    const gateway = new MachineGateway({ resultTransport: "mailbox" });
     const connection = await connectedClient(gateway, "mailbox");
     try {
       const { tools } = await connection.client.listTools();
@@ -491,7 +546,7 @@ describe("machine MCP capability correlation", () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("mcp-execution-summary");
     cleanups.push(root);
-    const gateway = new MachineGateway();
+    const gateway = new MachineGateway({ resultTransport: "mailbox" });
     const registration = gateway.registerWorkspace(root);
     const request = openControlResultRequest(registration.workspaceId, {
       ...correlation(),
@@ -561,7 +616,7 @@ describe("machine MCP capability correlation", () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("mcp-request-replay");
     cleanups.push(root);
-    const gateway = new MachineGateway();
+    const gateway = new MachineGateway({ resultTransport: "mailbox" });
     const registration = gateway.registerWorkspace(root);
     const firstRequest = openControlResultRequest(registration.workspaceId, {
       ...correlation(),

@@ -99,6 +99,7 @@ describe("machine gateway session concurrency", () => {
       port: 0,
       connectStdio: false,
       persistRuntime: false,
+      resultTransport: "mailbox",
     });
 
     const registration = await registerWorkspace(server.runtime, root);

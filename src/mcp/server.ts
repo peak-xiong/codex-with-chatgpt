@@ -214,6 +214,21 @@ const readFileOutputSchema = {
   content: z.string(),
 };
 
+export const readManyOutputSchema = z.object({
+  observedAt: z.string().datetime(),
+  atomicSnapshot: z.literal(false),
+  items: z.array(z.union([
+    z.object({
+      index: z.number().int().nonnegative(),
+      file: z.object(readFileOutputSchema).strict(),
+    }).strict(),
+    z.object({
+      index: z.number().int().nonnegative(),
+      error: z.string(),
+    }).strict(),
+  ])),
+}).strict();
+
 const readImageOutputSchema = {
   path: z.string(),
   format: z.enum(["png", "jpeg", "gif", "webp"]),
@@ -405,7 +420,10 @@ export interface McpServerOptions {
 
 export function createMcpServer(ctx: McpContext, options: McpServerOptions = {}): McpServer {
   const { gateway } = ctx;
-  const resultTransport = options.resultTransport ?? ACTIVE_CONTROL_RESULT_TRANSPORT;
+  const resultTransport = options.resultTransport ?? gateway.resultTransport ?? ACTIVE_CONTROL_RESULT_TRANSPORT;
+  if (resultTransport !== gateway.resultTransport) {
+    throw new Error("MCP result transport must match the machine gateway configuration");
+  }
   const server = new McpServer(
     { name: PRODUCT_NAME, version: VERSION },
     { capabilities: { tools: {} }, instructions: UNTRUSTED_NOTE }
@@ -571,6 +589,7 @@ export function createMcpServer(ctx: McpContext, options: McpServerOptions = {})
       context_id: contextIdSchema, files: readManyFilesSchema,
       max_bytes: z.number().int().min(1024).max(READ_MANY_MAX_BYTES).default(READ_MANY_MAX_BYTES),
     },
+    outputSchema: readManyOutputSchema.shape,
     annotations: { readOnlyHint: true },
   }, async (args) => withClaimedWorkspace(gateway, args.context_id, ["workspace.read"],
     async ({ workspace }) => okStructured(await readMany(workspace, args.files, args.max_bytes))));

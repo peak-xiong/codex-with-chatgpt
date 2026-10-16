@@ -19,7 +19,6 @@ import type {
 import type {
   ControlResultCorrelation,
 } from "../control/result-schema.js";
-import type { ControlPageObservation } from "../control/wait-policy.js";
 import type {
   ControlStatus,
   OpenControlResultRequestStatus,
@@ -379,7 +378,7 @@ export function cancelMailboxRequest(
 export function observeMailboxPage(
   runtime: MachineRuntimeState,
   identity: MailboxIdentity,
-  input: MailboxInspectionInput & { observation: ControlPageObservation },
+  input: MailboxInspectionInput & { observation: unknown },
   timeoutMs = DEFAULT_ADMIN_TIMEOUT_MS,
 ): Promise<ControlStatus> {
   return adminFetch(runtime, "POST", "/admin/mailbox/observe", {

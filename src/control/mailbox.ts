@@ -8,13 +8,23 @@ import {
   controlTerminalObservationSchema,
   controlWaitPolicy,
   CONTROL_PAGE_CHECK_INTERVAL_MS,
+  isExactLegacyControlPageObservationReplay,
+  legacyFinalHostFailureSchema,
+  parseLateControlPageObservation,
   parseControlPageObservation,
+  parseStoredControlPageObservation,
+  storedControlHostFailureSchema,
   type ControlHostFailure,
   type ControlHostObservedResult,
   type ControlPageObservation,
   type ControlPageObservationState,
+  type StoredControlPageObservation,
   type ControlTerminalObservation,
 } from "./wait-policy.js";
+import {
+  ACTIVE_CONTROL_RESULT_TRANSPORT,
+  type ControlResultTransport,
+} from "./result-transport.js";
 import {
   ensureDir,
   getStateDir,
@@ -77,7 +87,7 @@ export interface ControlStatus {
   hostObservedResult?: ControlHostObservedResult;
   pageObservation?: ControlPageObservationState;
   /** Correlated page evidence after authority ended; never an authorized delivery. */
-  lateEvidence?: ControlPageObservation;
+  lateEvidence?: StoredControlPageObservation;
 }
 
 /**
@@ -238,14 +248,14 @@ function parseStoredHostFailure(
   value: unknown,
   requestId: string,
 ): ControlHostFailure | null {
-  const current = controlHostFailureSchema.safeParse(value);
+  const current = storedControlHostFailureSchema.safeParse(value);
   if (current.success) return current.data;
   if (!isRecord(value) || value.state !== "blocked") return null;
 
   // Older terminal records predate ordered response observations. Normalize
   // them only for retained terminal-state reads; the synthetic identity never
   // participates in routing, renewal, or BOOT authorization.
-  const legacy = controlHostFailureSchema.safeParse({
+  const legacy = legacyFinalHostFailureSchema.safeParse({
     ...value,
     state: "final",
     responseId: `legacy-${requestId}`,
@@ -699,18 +709,16 @@ function readPageObservation(
     "stored page observation",
   );
   if (value === null) return null;
+  const observationKeys = [
+    "schemaVersion", "requestId", "workspaceId", "localSessionId", "latest", "lastDefinitive",
+  ];
+  const hasGatewayTimes = isRecord(value) &&
+    value.latestAcceptedAt !== undefined && value.lastDefinitiveAcceptedAt !== undefined;
   if (
-    !isRecord(value) ||
-    value.schemaVersion !== 1 ||
-    !hasExactKeys(value, [
-      "schemaVersion",
-      "requestId",
-      "workspaceId",
-      "localSessionId",
-      "latest",
-      "lastDefinitive",
-      "observationHash",
-    ])
+    !isRecord(value) || value.schemaVersion !== 1 ||
+    (hasGatewayTimes
+      ? !hasExactKeys(value, [...observationKeys, "latestAcceptedAt", "lastDefinitiveAcceptedAt", "observationHash"])
+      : !hasExactKeys(value, [...observationKeys, "observationHash"]))
   ) {
     integrityError("stored page observation schema is invalid");
   }
@@ -724,13 +732,13 @@ function readPageObservation(
   ) {
     integrityError("stored page observation does not match the exact control request");
   }
-  let latest: ControlPageObservation;
+  let latest: StoredControlPageObservation;
   let lastDefinitive: ControlPageObservationState["lastDefinitive"];
   try {
-    latest = parseControlPageObservation(value.latest);
+    latest = parseStoredControlPageObservation(value.latest);
     lastDefinitive = value.lastDefinitive === null
       ? null
-      : parseControlPageObservation(value.lastDefinitive) as ControlPageObservationState["lastDefinitive"];
+      : parseStoredControlPageObservation(value.lastDefinitive) as ControlPageObservationState["lastDefinitive"];
   } catch {
     return integrityError("stored page observation payload is invalid");
   }
@@ -741,7 +749,20 @@ function readPageObservation(
   ) {
     integrityError("stored page observation lifecycle is invalid");
   }
-  const state = { latest, lastDefinitive };
+  if (hasGatewayTimes && (
+    !isCanonicalTimestamp(value.latestAcceptedAt) ||
+    (value.lastDefinitiveAcceptedAt !== null && !isCanonicalTimestamp(value.lastDefinitiveAcceptedAt))
+  )) {
+    integrityError("stored page observation gateway acceptance time is invalid");
+  }
+  const state: ControlPageObservationState = {
+    latest,
+    lastDefinitive,
+    ...(hasGatewayTimes ? {
+      latestAcceptedAt: value.latestAcceptedAt as string,
+      lastDefinitiveAcceptedAt: value.lastDefinitiveAcceptedAt as string | null,
+    } : {}),
+  };
   const observationHash = sha256Hex(canonicalJson(state));
   if (value.observationHash !== observationHash) {
     integrityError("stored page observation integrity hash does not match its content");
@@ -1145,9 +1166,11 @@ export function getControlResultStatus(
   const progress = readProgress(resolvedWorkspaceId, request);
   const pageObservation = readPageObservation(resolvedWorkspaceId, request);
   const evidenceValue = readStoredJson(lateEvidenceFile(resolvedWorkspaceId, resolvedRequestId), "late page evidence");
-  const lateEvidence = evidenceValue === null ? undefined : parseControlPageObservation(evidenceValue);
+  const lateEvidence = evidenceValue === null ? undefined : parseStoredControlPageObservation(evidenceValue);
   if (lateEvidence && (lateEvidence.state !== "final" || lateEvidence.responseToRequestId !== request.requestId ||
-      lateEvidence.tabId !== request.surfaceTabId || lateEvidence.generation !== request.surfaceGeneration)) {
+      lateEvidence.tabId !== request.surfaceTabId || lateEvidence.generation !== request.surfaceGeneration ||
+      ("terminalResult" in lateEvidence && lateEvidence.terminalResult !== undefined &&
+        !request.allowedKinds.includes(lateEvidence.terminalResult.kind)))) {
     integrityError("late evidence does not match the original request");
   }
   const observed = { ...(pageObservation ? { pageObservation } : {}), ...(lateEvidence ? { lateEvidence } : {}) };
@@ -1176,6 +1199,7 @@ export function requireBootControlResult(
   localSessionId: string,
   surfaceGeneration: number,
   surfaceTabId: string,
+  resultTransport: ControlResultTransport = ACTIVE_CONTROL_RESULT_TRANSPORT,
 ): ControlStatus {
   const resolvedWorkspaceId = validateControlId(workspaceId, "workspace id");
   const resolvedRequestId = validateControlId(requestId, "request id");
@@ -1202,12 +1226,8 @@ export function requireBootControlResult(
     resolvedLocalSessionId,
     expected,
   );
-  const mailboxBoot = (status.status === "received" || status.status === "acknowledged") &&
-    status.result?.kind === "BOOT";
-  const computerUseBoot = status.status === "cancelled" &&
-    status.hostFailure === undefined &&
-    status.hostObservedResult?.result.kind === "BOOT";
-  if (!mailboxBoot && !computerUseBoot) {
+  const wait = controlWaitPolicy(status, resultTransport);
+  if ((wait.outcome !== "delivered" && wait.outcome !== "blocked") || wait.result?.kind !== "BOOT") {
     throw new ControlMailboxError(
       "MAILBOX_RESULT_NOT_READY",
       "surface commit requires a successful BOOT result from the active result transport",
@@ -1223,19 +1243,29 @@ function lateEvidenceFile(workspaceId: string, requestId: string): string {
 /** Preserve a verified exact response without renewing authority or publishing a receipt. */
 export function recordLateControlEvidence(
   workspaceId: string, requestId: string, localSessionId: string,
-  expected: ControlResultCorrelation, input: ControlPageObservation,
+  expected: ControlResultCorrelation, input: unknown,
 ): ControlStatus {
   return withFileLock(requestLockFile(workspaceId, requestId), () => {
     const status = getControlResultStatus(workspaceId, requestId, localSessionId, expected);
     // A receipt or terminal outcome racing this observation wins unchanged.
-    if (status.status !== "pending" && status.status !== "expired") return status;
-    const observation = parseControlPageObservation(input);
+    if (status.status !== "pending" && status.status !== "expired" &&
+        !(status.status === "cancelled" && status.hostFailure && !status.hostObservedResult)) return status;
+    if (status.lateEvidence?.state === "final" && isExactLegacyControlPageObservationReplay({
+      latest: status.lateEvidence,
+      lastDefinitive: status.lateEvidence,
+    }, input)) return status;
+    const observation = parseLateControlPageObservation(status.pageObservation ?? null, input);
     if (!status.request || observation.state !== "final" ||
         observation.responseToRequestId !== requestId || observation.tabId !== status.request.surfaceTabId ||
         observation.generation !== status.request.surfaceGeneration) {
       throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "late response does not match its original request");
     }
-    if (observation.terminalResult && !status.request.allowedKinds.includes(observation.terminalResult.kind)) {
+    const observedAt = Date.parse(observation.observedAt);
+    if (observedAt < Date.now() - 60_000 || observedAt > Date.now() + 5_000 ||
+        observedAt < Date.parse(status.request.createdAt)) {
+      throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "late response observation is stale");
+    }
+    if ("terminalResult" in observation && !status.request.allowedKinds.includes(observation.terminalResult.kind)) {
       throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "late result kind is not allowed by the original phase");
     }
     if (status.lateEvidence) {
@@ -1244,7 +1274,6 @@ export function recordLateControlEvidence(
       }
       return status;
     }
-    advanceControlPageObservation(status.pageObservation ?? null, observation);
     writeSecureJson(lateEvidenceFile(workspaceId, requestId), observation);
     return getControlResultStatus(workspaceId, requestId, localSessionId, expected);
   });
@@ -1258,6 +1287,7 @@ export async function waitForControlResult(
   expected?: ControlResultCorrelation,
   signal?: AbortSignal,
   pollIntervalMs = 250,
+  resultTransport: ControlResultTransport = ACTIVE_CONTROL_RESULT_TRANSPORT,
 ): Promise<ControlStatus> {
   const throwIfAborted = (): void => {
     if (signal?.aborted) {
@@ -1293,7 +1323,11 @@ export async function waitForControlResult(
     throwIfAborted();
     const status = getControlResultStatus(workspaceId, requestId, localSessionId, expected);
     if (status.status !== "pending") return status;
-    deadline ??= Date.now() + Math.min(CONTROL_PAGE_CHECK_INTERVAL_MS, Math.max(0, timeoutMs), controlWaitPolicy(status).checkPageAfterMs);
+    deadline ??= Date.now() + Math.min(
+      CONTROL_PAGE_CHECK_INTERVAL_MS,
+      Math.max(0, timeoutMs),
+      controlWaitPolicy(status, resultTransport).checkPageAfterMs,
+    );
     const remaining = Math.min(deadline, Date.parse(status.request!.expiresAt)) - Date.now();
     if (remaining <= 0) return status;
     await waitForPoll(Math.min(pollIntervalMs, remaining));
@@ -1392,22 +1426,16 @@ function terminalObservationRecords(observation: ControlTerminalObservation): {
   failure?: ControlHostFailure;
   hostObservedResult?: ControlHostObservedResult;
 } {
-  const terminalResultInput = observation.state === "final"
-    ? observation.terminalResult
-    : undefined;
-  const isComputerUseResult = observation.state === "final" && "delivery" in observation;
-  const failureInput = observation.state === "final"
-    ? (({ terminalResult: _terminalResult, ...failure }) => failure)(observation)
-    : observation;
-  const failure = isComputerUseResult ? undefined : controlHostFailureSchema.parse(failureInput);
-  const hostObservedResult = terminalResultInput
-    ? controlHostObservedResultSchema.parse({
+  if (observation.state === "final" && "delivery" in observation) {
+    return {
+      hostObservedResult: controlHostObservedResultSchema.parse({
         provenance: "host_observed",
         observedAt: observation.observedAt,
-        result: parseControlResultSubmission(terminalResultInput),
-      })
-    : undefined;
-  return { failure, ...(hostObservedResult ? { hostObservedResult } : {}) };
+        result: parseControlResultSubmission(observation.terminalResult),
+      }),
+    };
+  }
+  return { failure: controlHostFailureSchema.parse(observation) };
 }
 
 /**
@@ -1421,16 +1449,12 @@ export function observeControlResultRequest(
   // Typed `| undefined` rather than `?` so the parameter order stays as it was:
   // `observation` is required and must not jump ahead of an optional argument.
   expected: ControlResultCorrelation | undefined,
-  observation: ControlPageObservation,
+  observation: unknown,
   renewAuthorization?: () => string,
 ): ControlStatus {
   const resolvedWorkspaceId = validateControlId(workspaceId, "workspace id");
   const resolvedRequestId = validateControlId(requestId, "request id");
   const resolvedLocalSessionId = validateLocalSessionId(localSessionId);
-  const parsed = parseControlPageObservation(observation);
-  if (parsed.responseToRequestId !== resolvedRequestId) {
-    throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "page observation belongs to another response");
-  }
   return withFileLock(sessionLifecycleLockFile(resolvedWorkspaceId, resolvedLocalSessionId), () =>
     withFileLock(requestLockFile(resolvedWorkspaceId, resolvedRequestId), () => {
       const status = getControlResultStatus(
@@ -1439,6 +1463,23 @@ export function observeControlResultRequest(
         resolvedLocalSessionId,
         expected,
       );
+      if (status.status === "cancelled" && status.pageObservation &&
+          isExactLegacyControlPageObservationReplay(status.pageObservation, observation)) {
+        clearActiveRequest(resolvedWorkspaceId, resolvedLocalSessionId, resolvedRequestId);
+        return getControlResultStatus(
+          resolvedWorkspaceId,
+          resolvedRequestId,
+          resolvedLocalSessionId,
+          expected,
+        );
+      }
+      const parsed = parseControlPageObservation(observation);
+      if (parsed.responseToRequestId !== resolvedRequestId) {
+        throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "page observation belongs to another response");
+      }
+      if ("terminalResult" in parsed && !status.request?.allowedKinds.includes(parsed.terminalResult.kind)) {
+        throw new ControlMailboxError("MAILBOX_KIND_NOT_ALLOWED", "result kind is not allowed for this request phase");
+      }
       if (status.status === "cancelled") {
         if (!status.hostFailure && !status.hostObservedResult) {
           clearActiveRequest(resolvedWorkspaceId, resolvedLocalSessionId, resolvedRequestId);
@@ -1449,7 +1490,7 @@ export function observeControlResultRequest(
             expected,
           );
         }
-        const replay = advanceControlPageObservation(status.pageObservation ?? null, parsed);
+        const replay = advanceControlPageObservation(status.pageObservation ?? null, parsed, new Date().toISOString());
         if (!replay.terminal) {
           throw new ControlMailboxError(
             "MAILBOX_CORRELATION_MISMATCH",
@@ -1478,7 +1519,7 @@ export function observeControlResultRequest(
         );
       }
       if (status.status !== "pending") return status;
-      const advanced = advanceControlPageObservation(status.pageObservation ?? null, parsed);
+      const advanced = advanceControlPageObservation(status.pageObservation ?? null, parsed, new Date().toISOString());
       if (advanced.idempotentReplay) return status;
 
       if (parsed.state === "generating") {
@@ -1556,39 +1597,7 @@ export function recordControlHostFailure(
   if (parsed.data.state === "final" && "delivery" in parsed.data) {
     throw new ControlMailboxError("INVALID_RESULT", "computer use results are not host failures");
   }
-  const terminalResultInput = parsed.data.state === "final"
-    ? parsed.data.terminalResult
-    : undefined;
-  const failureInput = parsed.data.state === "final"
-    ? (({ terminalResult: _terminalResult, ...failure }) => failure)(parsed.data)
-    : parsed.data;
-  const terminalResult = terminalResultInput
-    ? parseControlResultSubmission(terminalResultInput)
-    : undefined;
-  const failure = controlHostFailureSchema.parse(failureInput);
-  if (failure.responseToRequestId !== requestId) {
-    throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "observation belongs to another response");
-  }
-  return withFileLock(sessionLifecycleLockFile(workspaceId, localSessionId), () =>
-    withFileLock(requestLockFile(workspaceId, requestId), () => {
-      const status = getControlResultStatus(workspaceId, requestId, localSessionId, expected);
-      if (status.status !== "pending") return status;
-      if (terminalResult && !status.request!.allowedKinds.includes(terminalResult.kind)) {
-        throw new ControlMailboxError(
-          "MAILBOX_KIND_NOT_ALLOWED",
-          `${terminalResult.kind} is not allowed for ${status.request!.phase}`,
-        );
-      }
-      const hostObservedResult = terminalResult ? controlHostObservedResultSchema.parse({
-        provenance: "host_observed",
-        observedAt: failure.observedAt,
-        result: terminalResult,
-      }) : undefined;
-      writeTerminalMarker(workspaceId, status.request!, "cancelled", failure, hostObservedResult);
-      clearActiveRequest(workspaceId, localSessionId, requestId);
-      return getControlResultStatus(workspaceId, requestId, localSessionId, expected);
-    }),
-  );
+  return observeControlResultRequest(workspaceId, requestId, localSessionId, expected, parsed.data);
 }
 
 /** Extend only pending work under the same locks used by receipts and cancellation. */

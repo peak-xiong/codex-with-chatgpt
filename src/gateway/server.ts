@@ -15,7 +15,6 @@ import {
   type ControlResultCorrelation,
 } from "../control/result-schema.js";
 import { browserTabIdSchema } from "../session/browser-tab-id.js";
-import { parseControlPageObservation } from "../control/wait-policy.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { createMcpServer } from "../mcp/server.js";
 import { createMcpHttpHandler } from "../mcp/http.js";
@@ -339,6 +338,7 @@ export async function startMachineGatewayServer(
     connectStdio = false,
     connectHttp = false,
     exitOnShutdown = false,
+    resultTransport,
     associationId = resolveMachineAssociation().associationId,
     associationNonce = newAssociationNonce(),
   } = options;
@@ -350,6 +350,7 @@ export async function startMachineGatewayServer(
     broker,
     surfaceValidator: requireCurrentTurnSurface,
     workspaceMembershipFile: machineWorkspaceMembershipFile(),
+    resultTransport,
   });
   const identity = resolveMachineIdentity();
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
@@ -605,7 +606,7 @@ export async function startMachineGatewayServer(
       const { workspaceId, projectId, registrationId, localSessionId, requestId, observation } = input;
       res.json(gateway.observeControlPage(
         { workspaceId, projectId, registrationId, localSessionId }, requestId,
-        lookupCorrelation(input), parseControlPageObservation(observation),
+        lookupCorrelation(input), observation,
       ));
     } catch (error) {
       const response = errorResponse(error);

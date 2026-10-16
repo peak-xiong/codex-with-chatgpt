@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { controlWaitPolicy } from "../src/control/wait-policy.js";
 import { MachineGateway, requireCurrentTurnSurface } from "../src/gateway/machine-gateway.js";
 import { TurnCapabilityError, type TurnCapabilityBinding } from "../src/gateway/turn-capability.js";
@@ -150,6 +150,7 @@ describe("machine gateway surface invalidation", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     while (cleanups.length > 0) cleanup(cleanups.pop()!);
     delete process.env.C2C_STATE_DIR;
   });
@@ -245,6 +246,8 @@ describe("machine gateway surface invalidation", () => {
   });
 
   it.each(["tab-boot-receipt", "browser-use:fc6c0073-5fb5-4a4e-81f7-307535575b6a"])("accepts an exact Computer Use BOOT result for %s and rejects raw page evidence", (tabId) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(START);
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("gateway-surface-boot-receipt");
     cleanups.push(root);
@@ -283,16 +286,27 @@ describe("machine gateway surface invalidation", () => {
       excerpt: "The page says BOOT succeeded",
     } as never)).toThrow(/raw page text/);
 
-    const observed = gateway.observeControlPage(identity, boot.request.requestId, {
-      taskId: "task-boot-receipt", iteration: 0, phase: "BOOT",
-    }, {
+    const completionCandidate = {
       ...base,
       observationSequence: 4,
       responseId: "response-boot-receipt",
+      state: "result_candidate" as const,
+      responseIsFinal: true as const,
+      delivery: "computer_use" as const,
+      terminalResult: { kind: "BOOT" as const, payload: {} },
+      completionEvidence: { responseActionsVisible: true as const, stopControlAbsent: true as const },
+    };
+    expect(gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-boot-receipt", iteration: 0, phase: "BOOT",
+    }, completionCandidate)).toMatchObject({ status: "pending" });
+    vi.setSystemTime(Date.now() + 1_500);
+    const observed = gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-boot-receipt", iteration: 0, phase: "BOOT",
+    }, {
+      ...completionCandidate,
+      observedAt: new Date().toISOString(),
+      observationSequence: 5,
       state: "final",
-      responseIsFinal: true,
-      delivery: "computer_use",
-      terminalResult: { kind: "BOOT", payload: {} },
     });
     expect(observed).toMatchObject({
       status: "cancelled",
@@ -320,6 +334,8 @@ describe("machine gateway surface invalidation", () => {
   });
 
   it("rejects a failed host observation that merely includes a BOOT-shaped result", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(START);
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("gateway-surface-failed-boot");
     cleanups.push(root);
@@ -344,23 +360,53 @@ describe("machine gateway surface invalidation", () => {
     gateway.observeControlPage(identity, boot.request.requestId, {
       taskId: "task-failed-boot", iteration: 0, phase: "BOOT",
     }, { ...base, observationSequence: 3, responseId: "response-failed-boot", state: "response_created" });
-    const failed = gateway.observeControlPage(identity, boot.request.requestId, {
-      taskId: "task-failed-boot", iteration: 0, phase: "BOOT",
-    }, {
+    const failureCandidate = {
       ...base,
       observationSequence: 4,
       responseId: "response-failed-boot",
-      state: "final",
-      responseIsFinal: true,
-      reason: "callback_missing",
-      source: "host_observed",
+      state: "result_candidate" as const,
+      responseIsFinal: true as const,
+      reason: "callback_missing" as const,
+      source: "host_observed" as const,
+      errorCode: "UNKNOWN" as const,
+      completionEvidence: { responseActionsVisible: true as const, stopControlAbsent: true as const },
+    };
+    expect(() => gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-failed-boot", iteration: 0, phase: "BOOT",
+    }, {
+      ...failureCandidate,
       terminalResult: { kind: "BOOT", payload: {} },
+    } as never)).toThrow(/invalid control page observation/);
+    expect(() => gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-failed-boot", iteration: 0, phase: "BOOT",
+    }, { ...failureCandidate, state: "final" })).toThrow(/exact response lifecycle/);
+    expect(gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-failed-boot", iteration: 0, phase: "BOOT",
+    }, failureCandidate)).toMatchObject({ status: "pending" });
+    vi.setSystemTime(Date.now() + 1_499);
+    expect(() => gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-failed-boot", iteration: 0, phase: "BOOT",
+    }, {
+      ...failureCandidate,
+      observedAt: new Date().toISOString(),
+      observationSequence: 5,
+      state: "final",
+    })).toThrow(/fresh stability recheck/);
+    vi.setSystemTime(Date.now() + 1);
+    const failed = gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-failed-boot", iteration: 0, phase: "BOOT",
+    }, {
+      ...failureCandidate,
+      observedAt: new Date().toISOString(),
+      observationSequence: 5,
+      state: "final",
     });
     expect(failed).toMatchObject({
       status: "cancelled",
+      result: null,
       hostFailure: { reason: "callback_missing" },
-      hostObservedResult: { result: { kind: "BOOT" } },
     });
+    expect(failed.hostObservedResult).toBeUndefined();
     expect(controlWaitPolicy(failed)).toMatchObject({ state: "failed", delivery: "none", result: null });
     expect(() => gateway.surfaceCommit(identity, candidate, {
       bootRequestId: boot.request.requestId,

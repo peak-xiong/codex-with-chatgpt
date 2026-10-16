@@ -1185,9 +1185,11 @@ that ChatGPT is still generating.
 | `leaseRemainingMs` | Remaining activity lease, not a total task budget |
 | `elapsedMs` | Time since original request creation, for diagnostics only |
 | `checkPageAfterMs` | At most 30 seconds; earlier at half the remaining activity lease |
-| `outcome` | `pending`, `delivered`, `blocked` or `terminal` |
+| `outcome` | `pending`, `delivered`, `blocked`, `transport_mismatch` or `terminal` |
 | `delivery` | `computer_use` or `none` in the active mode; `mcp` exists only for dormant mailbox tests |
-| `nextAction` | `mark_send_attempted`, `confirm_send`, `inspect_response_start`, `inspect_exact_response` or `stop`; `persist_then_ack` is dormant |
+| `state` | `pending`, `delivered`, `blocked`, `failed`, `evidence_only`, `transport_mismatch` or the stored terminal status |
+| `result` | Non-null only for a result delivered by the configured transport |
+| `nextAction` | Includes `confirm_response_final` while a candidate awaits recheck; `mark_send_attempted`, `confirm_send`, `inspect_response_start`, `inspect_exact_response`, `stop` and dormant `persist_then_ack` are also used |
 
 `control wait` caps each slice at 30 seconds even if a larger `--timeout-ms`
 is supplied. Exit code 0 means a Computer Use result was validated, including a
@@ -1210,7 +1212,7 @@ Each request has a monotonically increasing `observationSequence` and one exact
 response identity. The normal ordered lifecycle is:
 
 ```text
-send_attempted -> sent -> [response_created] -> generating* -> final
+send_attempted -> sent -> [response_created] -> generating* -> result_candidate -> final
        \-----------------> response_start_failed
                        \-> response_start_failed
 ```
@@ -1221,8 +1223,9 @@ check without advancing the last definitive state or changing its required
 next action. `page_lost` and `authority_invalid` may terminate from any stage. An
 exact replay is idempotent; a conflicting sequence, lower sequence, skipped
 transition, or different `responseId` is rejected. Brackets denote an optional
-event: the first paired response may already be generating or final, so `sent`
-can advance directly to either. This does not permit skipping proof of sending.
+event: `response_created` may be omitted and the first paired response may
+already be generating or a result candidate. `sent` cannot advance directly to
+a successful final. This does not permit skipping proof of sending.
 Opaque response locators are normalized deterministically by the CLI; reuse the
 same observed locator or the returned normalized ID on subsequent checks.
 
@@ -1248,9 +1251,13 @@ this example is neither a probe nor evidence:
   "responseToRequestId": "request-id",
   "observationSequence": 5,
   "responseId": "host-response-id",
-  "state": "final",
+  "state": "result_candidate",
   "responseIsFinal": true,
   "delivery": "computer_use",
+  "completionEvidence": {
+    "responseActionsVisible": true,
+    "stopControlAbsent": true
+  },
   "terminalResult": {
     "kind": "PLAN",
     "payload": {
@@ -1263,6 +1270,50 @@ this example is neither a probe nor evidence:
   }
 }
 ```
+
+The first submitted result uses `state: "result_candidate"` and the exact
+normalized `terminalResult` and `completionEvidence` shown above. After a new UI
+observation, submit the same object as `state: "final"`, with a strictly later
+`observedAt` and greater `observationSequence`. Both events must match the same
+request, `tabId`, `generation`, canonical `observedUrl`, and `responseId`; the
+result and both strict-boolean completion fields must be identical. The Gateway
+measures the minimum 1500 ms stability window using its own event acceptance
+timestamps, not host-supplied `observedAt`. Replaying an event or advancing only
+its sequence cannot satisfy the window. If generation resumes, submit
+`generating` first; that clears the candidate barrier, and a later final needs a
+new candidate. A `BLOCKED` result follows the same candidate/final barrier.
+
+Page-dependent failures follow the same two-observation barrier. Their candidate
+uses `state: "result_candidate"`, `responseIsFinal: true`, the exact failure
+`reason` and `source`, optional `tool` and `errorCode`, and the same strict
+`completionEvidence`; it has no `delivery` or `terminalResult`. For example:
+
+```json
+{
+  "tabId": "owned-tab-id",
+  "generation": 1,
+  "observedUrl": "https://chatgpt.com/g/g-p-example/c/chat-example",
+  "observedAt": "2026-01-01T00:00:00.000Z",
+  "responseToRequestId": "request-id",
+  "observationSequence": 6,
+  "responseId": "host-response-id",
+  "state": "result_candidate",
+  "responseIsFinal": true,
+  "reason": "callback_missing",
+  "source": "host_observed",
+  "errorCode": "UNKNOWN",
+  "completionEvidence": {
+    "responseActionsVisible": true,
+    "stopControlAbsent": true
+  }
+}
+```
+
+After at least 1500 ms by Gateway acceptance time and a strictly later UI
+observation, submit the identical failure fields as `state: "final"`. Resumed
+generation clears either success or failure candidates. Explicit
+`response_start_failed`, `page_lost`, and `authority_invalid` remain independent
+terminal failures and do not use this page-completion barrier.
 
 The CLI cannot operate CUA; the host must actually inspect the page before
 calling it. The Gateway validates the exact request/session/task/phase, saved
@@ -1309,7 +1360,10 @@ restores an expired lease without changing generation or resending. Changed rout
 competing owners or expired/revoked capabilities cannot use this recovery.
 
 A final exact response after authority ends may be retained as `lateEvidence`
-only when it matches the recorded prompt's page, tab, generation and sequence.
+only when it matches the recorded prompt, response, page URL, tab, generation
+and strictly increasing sequence/observation time. It is recorded directly as
+evidence, without requiring or persisting a result candidate, and does not pass
+the delivery stability barrier.
 `wait.state: evidence_only`, `wait.delivery: none` and
 `wait.nextAction: review_late_evidence` distinguish this from delivery. It cannot
 authorize local reads, commit BOOT or produce an MCP receipt.
@@ -1319,9 +1373,33 @@ For a successful `final`, require `responseIsFinal: true`,
 It accepts only one current schema-valid `{kind,payload}` allowed by the original
 phase. It must come from the exact response, never an older quoted reply.
 
-For a final response with no valid marker, classify the host failure `reason` as
-`model_refusal`, `tool_unavailable`, `platform_blocked`, `capability_invalid`, or
-`callback_missing`. A still-generating or missing response is not completion
+A new page-dependent host failure uses the candidate/final fields above and must
+not include `terminalResult`; a failed attempt cannot also publish a consumable
+result. Explicit `response_start_failed`, `page_lost`, and `authority_invalid`
+remain independent terminal failures. Historical stored terminal observations,
+including old finals without `completionEvidence` and old `final` failures that
+also contain `terminalResult`, remain readable for audit and exact idempotent
+replay only. That compatibility does not permit those shapes on new writes or
+turn them into a newly authorized delivery. Exact replay may finish active
+request cleanup but does not create a result or renew authority.
+
+Transport is part of result validity. In production, `computer_use` is the
+active transport. A stored dormant mailbox result in `received` or
+`acknowledged` state is exposed by the public wait projection as
+`outcome: "transport_mismatch"`, `state: "transport_mismatch"`, and
+`result: null`; its delivery may identify the stored mailbox as `mcp`, but its
+payload is not exposed as a consumable result. CLI status/wait JSON reports
+`ok: false`, plain wait output does not print the mailbox payload, and these
+commands exit nonzero. BOOT commit checks the same configured-transport wait
+policy and rejects the mismatch. Consumers must use `wait.outcome` and
+`wait.result`, not the raw mailbox `status` or stored `result` field. Mailbox
+behavior remains available only to explicit mailbox-mode tests/configuration.
+
+Classify page-dependent final failures with `reason` values `model_refusal`,
+`tool_unavailable`, `platform_blocked`, `capability_invalid`, or
+`callback_missing`. In Computer Use, `callback_missing` means the expected final
+result marker or contract is absent or invalid; it does not mean an MCP callback
+tool is unavailable. A still-generating or missing response is not completion
 evidence. Other `source` values are
 `model_reported`, `platform_error` or `mcp_error`; choose the latter two only
 when the actual error was observed, not quoted by ChatGPT. Optional `tool` is
