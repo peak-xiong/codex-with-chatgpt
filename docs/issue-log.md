@@ -11,7 +11,7 @@
 | ID | 优先级 | 状态与证据 |
 | --- | --- | --- |
 | C2C-033 | P1 | **实现与自动验收完成（2026-10-18）：**成功 terminal marker 写入后 final 观察失败的恢复缺陷已故障注入复现并修复；恢复/迁移定向 32 项、类型检查、构建均退出码 0。最终全量退出码 0，46 个文件、625 项通过，耗时 294.01 秒；实际 runner 状态持久化在 `/tmp/c2c-global-audit/vitest-full-rerun-exit.json`，完整日志为同目录 `vitest-full-rerun.log`。恢复后的 BOOT 可提交绑定；错配重放、缺少完成证据仍拒绝，另一 session 保持活动。本轮未重新部署或进行真实网页验收。 |
-| C2C-034 | 审计 | **整改与自动验收完成（2026-10-18），Git 交付待执行：**原 15 项及复核新增 C2C-050 共 16 项已修复；独立复核无剩余合并阻断。最终 `pnpm typecheck`、`pnpm build`、`pnpm exec vitest run --maxWorkers=1` 均真实退出 0，48 个文件、666 项通过，Vitest 耗时 305.68 秒；原始日志和 status/signal/error 位于 `/tmp/c2c-global-closure/final/`。仍仅使用 `codex/global-audit` 分支，未重新部署或执行真实网页验收。 |
+| C2C-034 | 审计 | **整改、自动验收与 Git 交付完成（2026-10-18）：**原 15 项及复核新增 C2C-050 共 16 项已修复；独立复核无剩余合并阻断。最终 `pnpm typecheck`、`pnpm build`、`pnpm exec vitest run --maxWorkers=1` 均真实退出 0，48 个文件、666 项通过，Vitest 耗时 305.68 秒；原始日志和 status/signal/error 位于 `/tmp/c2c-global-closure/final/`。仍仅使用 `codex/global-audit` 分支，未重新部署或执行真实网页验收。 |
 | C2C-035 | P1 | **完成（2026-10-18）：**普通读取强拒实际 Git metadata 和内部状态；目录与 Node/rg 搜索共用规范路径可见性。覆盖普通、linked、non-Git、separate-git-dir、MCP scopes 及合法源码读取。 |
 | C2C-036 | P1 | **完成（2026-10-18）：**inventory 和内容 diff 均显式禁用 external diff/textconv；临时仓库无害 marker 回归通过。 |
 | C2C-037 | P1 | **完成（2026-10-18）：**统一脱敏 `c2c_mcp_` 裸值、URL 路径、结构化日志及执行命令/输出。 |
@@ -30,6 +30,8 @@
 | C2C-050 | P1 | **完成（2026-10-18）：**文件/目录互换敏感泄漏先复现再修复，batch 保留必要排除和相关被拒 rename 双端。独立复核指出的 scoped child、无关修改预算回归也先复现后修复；必要排除超预算仍拒绝，最终 Git 24/24 及独立复核通过。 |
 
 本轮未部署、重启或发送网页消息；原工作区既有文档修改保留。上述完成状态由本轮源码、故障注入、定向及完整测试独立核验；历史章节中的部署与网页验收仅描述当时事实。
+
+本轮 Git 交付（2026-10-18）：整改提交 `744214b564168d54bb41d43b0b2cd424ff462290` 已从唯一审计分支快进合并到 `main`；两个 ref 已原子推送至 `peak-xiong/codex-with-chatgpt`，GitHub refs API 独立核验均为该提交。原工作区仍在 `codex/machine-gateway-foundation`，既有三份文档 SHA-256 与开始时一致。此后仅补交这条交付记录，不改应用代码或重复部署。
 
 上一轮 Git 交付（2026-10-18）：终态恢复与初次全仓审计提交 `69574c25301a71770d433fd9921328882eb086a0` 已从 `codex/global-audit` 快进合并到 `main` 并推送。该交付当时仍有 15 项开放问题；本轮整改状态以上表为准。本次没有创建或更改外部 PR。
 
