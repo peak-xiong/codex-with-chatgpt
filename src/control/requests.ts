@@ -1219,6 +1219,84 @@ function storedTerminalObservationRecords(
   return { failure };
 }
 
+function recoverMarkedControlRequestObservation(
+  workspaceId: string,
+  requestId: string,
+  localSessionId: string,
+  expected: ControlResultCorrelation | undefined,
+  observation: ControlPageObservation,
+  status: ControlRequestSnapshot,
+): ControlRequestSnapshot | null {
+  if (status.status !== "cancelled" || status.hostFailure || status.hostObservedResult || !status.request) return null;
+  const marker = readTerminalState(workspaceId, status.request);
+  if (!marker?.hostObservedResult || marker.hostFailure) return null;
+
+  if (
+    observation.responseToRequestId !== requestId ||
+    !observationMatchesRequestSurface(observation, status.request)
+  ) {
+    throw new ControlRequestError(
+      "CONTROL_REQUEST_CORRELATION_MISMATCH",
+      "final observation does not match the interrupted Computer Use request",
+    );
+  }
+  const replay = advanceControlPageObservation(status.pageObservation ?? null, observation, new Date().toISOString());
+  if (
+    !replay.terminal || replay.terminal.state !== "final" || !("delivery" in replay.terminal) ||
+    replay.terminal.delivery !== "computer_use" || !("completionEvidence" in replay.terminal)
+  ) {
+    throw new ControlRequestError(
+      "CONTROL_REQUEST_CORRELATION_MISMATCH",
+      "final observation does not complete the exact stored Computer Use candidate",
+    );
+  }
+  const records = terminalObservationRecords(replay.terminal);
+  if (
+    records.failure !== undefined ||
+    canonicalJson(records.hostObservedResult ?? null) !== canonicalJson(marker.hostObservedResult)
+  ) {
+    throw new ControlRequestError(
+      "CONTROL_REQUEST_CORRELATION_MISMATCH",
+      "final observation does not match the interrupted Computer Use result",
+    );
+  }
+
+  if (!replay.idempotentReplay) writePageObservation(workspaceId, status.request, replay.state);
+  clearActiveRequest(workspaceId, localSessionId, requestId);
+  return getControlRequestStatus(workspaceId, requestId, localSessionId, expected);
+}
+
+/** Recover a marker-first success only by persisting its exact, validated final observation. */
+export function recoverControlRequestObservation(
+  workspaceId: string,
+  requestId: string,
+  localSessionId: string,
+  expected: ControlResultCorrelation | undefined,
+  observation: ControlPageObservation,
+): ControlRequestSnapshot | null {
+  const resolvedWorkspaceId = validateControlId(workspaceId, "workspace id");
+  const resolvedRequestId = validateControlId(requestId, "request id");
+  const resolvedLocalSessionId = validateLocalSessionId(localSessionId);
+  return withFileLock(sessionLifecycleLockFile(resolvedWorkspaceId, resolvedLocalSessionId), () =>
+    withFileLock(requestLockFile(resolvedWorkspaceId, resolvedRequestId), () => {
+      const status = getControlRequestStatus(
+        resolvedWorkspaceId,
+        resolvedRequestId,
+        resolvedLocalSessionId,
+        expected,
+      );
+      return recoverMarkedControlRequestObservation(
+        resolvedWorkspaceId,
+        resolvedRequestId,
+        resolvedLocalSessionId,
+        expected,
+        observation,
+        status,
+      );
+    }),
+  );
+}
+
 /**
  * Persist one exact page lifecycle event and apply its control effect under the
  * same request/session locks used by observation and cancellation.
@@ -1262,6 +1340,15 @@ export function observeControlRequest(
         throw new ControlRequestError("CONTROL_REQUEST_KIND_NOT_ALLOWED", "result kind is not allowed for this request phase");
       }
       if (status.status === "cancelled") {
+        const recovered = recoverMarkedControlRequestObservation(
+          resolvedWorkspaceId,
+          resolvedRequestId,
+          resolvedLocalSessionId,
+          expected,
+          parsed,
+          status,
+        );
+        if (recovered) return recovered;
         if (!status.hostFailure && !status.hostObservedResult) {
           clearActiveRequest(resolvedWorkspaceId, resolvedLocalSessionId, resolvedRequestId);
           return getControlRequestStatus(

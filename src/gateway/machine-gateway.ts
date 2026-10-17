@@ -30,6 +30,7 @@ import {
   getControlRequestStatus,
   openControlRequestWithStatus,
   observeControlRequest,
+  recoverControlRequestObservation,
   requireBootControlResult,
   retireControlRequestSession,
   waitForControlRequest,
@@ -713,6 +714,22 @@ export class MachineGateway {
     if (status.status === "cancelled" && status.hostFailure && !status.hostObservedResult &&
         observation.state === "final" && "delivery" in observation) {
       return recordLateControlEvidence(identity.workspaceId, requestId, identity.localSessionId, correlation, observation);
+    }
+    if (status.status === "cancelled" && !status.hostFailure && !status.hostObservedResult &&
+        observation.state === "final" && "delivery" in observation) {
+      let recovered: ControlRequestSnapshot | null = null;
+      try {
+        recovered = recoverControlRequestObservation(
+          identity.workspaceId,
+          requestId,
+          identity.localSessionId,
+          expected,
+          observation,
+        );
+      } finally {
+        this.broker.revokeRequest({ ...identity, ...correlation, requestId });
+      }
+      if (recovered) return recovered;
     }
     if (status.status === "cancelled" && (status.hostFailure !== undefined || status.hostObservedResult !== undefined)) {
       try {

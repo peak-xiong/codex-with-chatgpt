@@ -23,6 +23,7 @@ vi.mock("../src/config/paths.js", async (importOriginal) => {
 });
 
 import { getActiveControlRequestStatus, getControlRequestsDir } from "../src/control/requests.js";
+import { controlWaitPolicy } from "../src/control/wait-policy.js";
 import { MachineGateway, requireCurrentTurnSurface } from "../src/gateway/machine-gateway.js";
 import { cleanup, isolateStateDir, makeTmpDir, projectSelection, receiveBootResult } from "./helpers.js";
 
@@ -38,6 +39,218 @@ afterEach(() => {
 });
 
 describe("terminal observation recovery", () => {
+  it.each([
+    {
+      kind: "REVIEW",
+      payload: {
+        summary: "Review complete",
+        findings: [{ severity: "low", issue: "No blocking findings", recommendation: "Keep the verified behavior" }],
+        actions: [{ change: "Keep the verified behavior", why: "The focused review found no blocker" }],
+        successCriteria: ["The final response is stable"],
+      },
+    },
+    {
+      kind: "DONE",
+      payload: {
+        summary: "Task complete",
+        verification: ["Focused checks passed"],
+      },
+    },
+  ] as const)("continues to deliver normal $kind Computer Use results", ({ kind, payload }) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    cleanups.push(isolateStateDir());
+    const root = makeTmpDir(`normal-${kind.toLowerCase()}-terminal`);
+    cleanups.push(root);
+    const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
+    const identity = { ...gateway.registerWorkspace(root), localSessionId: `session-normal-${kind.toLowerCase()}` };
+    const chatUrl = projectUrl.replace("/project", `/c/normal-${kind.toLowerCase()}`);
+    const page = gateway.surfaceClaim(identity, {
+      browserId: "iab",
+      surfaceId: "chatgpt",
+      tabId: `tab-normal-${kind.toLowerCase()}`,
+      projectUrl,
+      chatUrl,
+      projectSelection: projectSelection(projectUrl),
+    });
+    gateway.surfaceCommit(identity, page, {
+      bootRequestId: receiveBootResult(gateway, identity, page),
+      connectorName: "Codex with ChatGPT",
+    });
+
+    const turn = { taskId: `normal-${kind.toLowerCase()}`, iteration: 0, phase: "REVIEW" as const };
+    const { request } = gateway.openControlRequest(identity, turn);
+    const grant = gateway.issueTurn({
+      ...identity,
+      ...turn,
+      requestId: request.requestId,
+      scopes: ["workspace.read"],
+      compactionEpoch: 0,
+      generation: page.generation,
+    });
+    const base = {
+      tabId: page.tabId,
+      generation: page.generation,
+      observedUrl: chatUrl,
+      observedAt: new Date().toISOString(),
+      responseToRequestId: request.requestId,
+    };
+    const observe = (input: Record<string, unknown>) =>
+      gateway.observeControlPage(identity, request.requestId, turn, input);
+    observe({ ...base, observationSequence: 1, state: "send_attempted" });
+    observe({ ...base, observationSequence: 2, state: "sent" });
+    const responseBase = { ...base, responseId: `response-normal-${kind.toLowerCase()}` };
+    observe({ ...responseBase, observationSequence: 3, state: "response_created" });
+    const result = { kind, payload };
+    const completionEvidence = { responseActionsVisible: true, stopControlAbsent: true };
+    const candidate = {
+      ...responseBase,
+      observationSequence: 4,
+      state: "result_candidate",
+      responseIsFinal: true,
+      delivery: "computer_use",
+      terminalResult: result,
+      completionEvidence,
+    };
+    observe(candidate);
+    vi.setSystemTime(Date.now() + 1_500);
+    const final = observe({
+      ...candidate,
+      observedAt: new Date().toISOString(),
+      observationSequence: 5,
+      state: "final",
+    });
+
+    expect(final).toMatchObject({
+      status: "cancelled",
+      hostObservedResult: { provenance: "host_observed", result },
+      pageObservation: { lastDefinitive: { state: "final", terminalResult: result } },
+    });
+    expect(controlWaitPolicy(final)).toMatchObject({ outcome: "delivered", result, delivery: "computer_use" });
+    expect(gateway.turnStatus(grant.token).status).toBe("revoked");
+  });
+
+  it("recovers a BOOT success marker only after its exact final observation is persisted", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    cleanups.push(isolateStateDir());
+    const root = makeTmpDir("boot-success-marker-recovery");
+    cleanups.push(root);
+    const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
+    const identity = { ...gateway.registerWorkspace(root), localSessionId: "session-boot-success-recovery" };
+    const page = gateway.surfaceClaim(identity, {
+      browserId: "iab",
+      surfaceId: "chatgpt",
+      tabId: "tab-boot-success-recovery",
+      projectUrl,
+      chatUrl: projectUrl.replace("/project", "/c/boot-success-recovery"),
+      projectSelection: projectSelection(projectUrl),
+    });
+    const otherIdentity = { ...identity, localSessionId: "session-boot-success-recovery-other" };
+    const otherRequest = gateway.openControlRequest(otherIdentity, {
+      taskId: "other-session-boot-recovery",
+      iteration: 0,
+      phase: "RESEARCH",
+    });
+    const turn = { taskId: `boot-${page.generation}`, iteration: 0, phase: "BOOT" as const };
+    const { request } = gateway.openControlRequest(identity, turn);
+    const grant = gateway.issueTurn({
+      ...identity,
+      ...turn,
+      requestId: request.requestId,
+      scopes: ["workspace.read"],
+      compactionEpoch: 0,
+      generation: page.generation,
+    });
+    const chatUrl = projectUrl.replace("/project", "/c/boot-success-recovery");
+    const base = {
+      tabId: page.tabId,
+      generation: page.generation,
+      observedAt: new Date().toISOString(),
+      responseToRequestId: request.requestId,
+    };
+    const observe = (input: Record<string, unknown>) =>
+      gateway.observeControlPage(identity, request.requestId, turn, input);
+    observe({ ...base, observedUrl: projectUrl, observationSequence: 1, state: "send_attempted" });
+    observe({ ...base, observedUrl: projectUrl, observationSequence: 2, state: "sent" });
+    const responseBase = {
+      ...base,
+      observedUrl: chatUrl,
+      responseId: "response-boot-success-recovery",
+    };
+    observe({ ...responseBase, observationSequence: 3, state: "response_created" });
+    const result = { kind: "BOOT" as const, payload: {} };
+    const completionEvidence = { responseActionsVisible: true as const, stopControlAbsent: true as const };
+    const candidate = {
+      ...responseBase,
+      observationSequence: 4,
+      state: "result_candidate" as const,
+      responseIsFinal: true as const,
+      delivery: "computer_use" as const,
+      terminalResult: result,
+      completionEvidence,
+    };
+    observe(candidate);
+    vi.setSystemTime(Date.now() + 1_500);
+    const final = {
+      ...candidate,
+      observedAt: new Date().toISOString(),
+      observationSequence: 5,
+      state: "final" as const,
+    };
+
+    observationWriteFault.failOnce = true;
+    expect(() => observe(final)).toThrow(/injected observation write failure/);
+    expect(gateway.turnStatus(grant.token).status).toBe("revoked");
+    expect(() => gateway.claimTurn(grant.token, ["workspace.read"])).toThrow(/revoked/i);
+    const interrupted = getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId);
+    expect(interrupted).toMatchObject({
+      status: "cancelled",
+      requestId: request.requestId,
+      pageObservation: { lastDefinitive: { state: "result_candidate" } },
+    });
+    expect(interrupted?.hostObservedResult).toBeUndefined();
+
+    const oldFinal = { ...final } as Record<string, unknown>;
+    delete oldFinal.completionEvidence;
+    expect(() => observe(oldFinal)).toThrow(/invalid control page observation/);
+    expect(gateway.getControlRequestStatus(identity, request.requestId, turn).hostObservedResult).toBeUndefined();
+    expect(() => observe({ ...final, responseToRequestId: "another-request" }))
+      .toThrow(/does not match the interrupted Computer Use request/);
+    expect(() => observe({ ...final, responseId: "another-response" }))
+      .toThrow(/replacement response/);
+    expect(() => observe({
+      ...final,
+      terminalResult: { kind: "BLOCKED", payload: { reason: "Different result", needs: ["Reject mismatch"] } },
+    })).toThrow(/exact completion candidate/);
+    expect(() => observe({
+      ...final,
+      observedAt: new Date(Date.parse(final.observedAt) + 1).toISOString(),
+    })).toThrow(/does not match the interrupted Computer Use result/);
+    expect(gateway.getControlRequestStatus(identity, request.requestId, turn).hostObservedResult).toBeUndefined();
+    expect(() => gateway.observeControlPage(otherIdentity, request.requestId, turn, final))
+      .toThrow(/another local session/);
+
+    const restartedGateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
+    const restartedIdentity = {
+      ...restartedGateway.registerWorkspace(root),
+      localSessionId: identity.localSessionId,
+    };
+    const recovered = restartedGateway.observeControlPage(restartedIdentity, request.requestId, turn, final);
+    expect(recovered).toMatchObject({
+      status: "cancelled",
+      requestId: request.requestId,
+      hostObservedResult: { provenance: "host_observed", observedAt: final.observedAt, result },
+      pageObservation: { lastDefinitive: final },
+    });
+    expect(controlWaitPolicy(recovered)).toMatchObject({ outcome: "delivered", result, delivery: "computer_use" });
+    expect(getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId)).toBeNull();
+    expect(getActiveControlRequestStatus(identity.workspaceId, otherIdentity.localSessionId))
+      .toMatchObject({ status: "pending", requestId: otherRequest.request.requestId });
+    expect(restartedGateway.surfaceCommit(restartedIdentity, page, {
+      bootRequestId: request.requestId,
+      connectorName: "Codex with ChatGPT",
+    })).toMatchObject({ binding: { chatUrl } });
+  });
+
   it("revokes authority immediately and repairs cleanup after partial terminal writes", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     cleanups.push(isolateStateDir());
