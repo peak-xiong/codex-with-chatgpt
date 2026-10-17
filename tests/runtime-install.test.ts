@@ -662,6 +662,40 @@ exec "$C2C_TEST_REAL_GIT" "$@"
     expect(fs.realpathSync(runtimeLauncherPath(homeDir))).toBe(fs.realpathSync(runtimeEntryPath(stateRoot)));
   });
 
+  it("keeps current and launcher unchanged when build-stage cleanup fails before publish", () => {
+    const stateRoot = makeTmpDir("runtime-build-cleanup-failure-state");
+    const firstSource = makeSource("1.0.0");
+    const secondSource = makeSource("2.0.0");
+    const homeDir = makeTmpDir("runtime-build-cleanup-failure-home");
+    dirs.push(stateRoot, homeDir);
+    installRuntime({ stateRoot, checkoutRoot: firstSource, homeDir, runner: successfulInstall() });
+    const current = runtimeCurrentPath(stateRoot);
+    const launcher = runtimeLauncherPath(homeDir);
+    const previousCurrentTarget = fs.realpathSync(current);
+    const previousLauncherTarget = fs.realpathSync(launcher);
+    const originalRm = fs.rmSync.bind(fs);
+    let injected = false;
+    const rmSpy = vi.spyOn(fs, "rmSync").mockImplementation(((target, options) => {
+      if (!injected && path.basename(String(target)).startsWith(".build-")) {
+        injected = true;
+        throw new Error("simulated build-stage cleanup failure");
+      }
+      return originalRm(target, options);
+    }) as typeof fs.rmSync);
+
+    try {
+      expect(() =>
+        installRuntime({ stateRoot, checkoutRoot: secondSource, homeDir, runner: successfulInstall() }),
+      ).toThrow(/simulated build-stage cleanup failure/);
+      expect(injected).toBe(true);
+      expect(fs.realpathSync(current)).toBe(previousCurrentTarget);
+      expect(fs.realpathSync(launcher)).toBe(previousLauncherTarget);
+      expect(fs.readFileSync(path.join(current, "dist/cli/index.js"), "utf8")).toContain("1.0.0");
+    } finally {
+      rmSpy.mockRestore();
+    }
+  });
+
   it("restores an initially absent current runtime and launcher", () => {
     const stateRoot = makeTmpDir("runtime-transaction-empty-state");
     const sourceRoot = makeSource();

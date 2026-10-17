@@ -943,9 +943,9 @@ export function installRuntime(options: RuntimeInstallOptions = {}): RuntimeInst
         });
         const stagedPackage = validateRuntimeTree(stage);
         verifyRuntimeLaunch(stage, options.timeoutMs ?? RUNTIME_INSTALL_TIMEOUT_MS);
+        removePath(buildStage);
         publishStage(stage, current, installation);
         published = true;
-        removePath(buildStage);
         let launcher: { path: string; changed: boolean };
         try {
           launcher = ensureRuntimeLauncher(stateRoot, sourceRoot, homeDir);

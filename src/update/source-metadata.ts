@@ -14,6 +14,8 @@ export interface SourceMetadata {
   readonly ref: string | null;
   /** Remote tip observed while this runtime was installed. */
   readonly baselineRemoteRevision: string | null;
+  /** Whether the observed baseline was verified as an ancestor of revision. */
+  readonly baselineIncludedInRevision: boolean | null;
   /** Digest of the package inputs copied into the installed runtime. */
   readonly contentDigest: string;
 }
@@ -29,7 +31,7 @@ function validRef(value: unknown): value is string {
     !/[\u0000-\u001f\u007f]/.test(value);
 }
 
-/** Strip credentials and query fragments before a repository URL is persisted. */
+/** Remove credentials and query fragments while preserving SSH usernames. */
 export function sanitizeRepository(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const raw = value.trim();
@@ -39,21 +41,33 @@ export function sanitizeRepository(value: unknown): string | null {
     ? /^(?:(?<user>[^@/:\s]+)@)?(?<host>[^/:\s]+):(?<path>.+)$/.exec(raw)
     : null;
   if (scp?.groups) {
-    const user = scp.groups.user ? `${scp.groups.user}@` : "";
-    return `ssh://${user}${scp.groups.host}/${scp.groups.path}`;
+    try {
+      const parsed = new URL(`ssh://${scp.groups.host}/${scp.groups.path}`);
+      if (scp.groups.user) parsed.username = scp.groups.user;
+      return sanitizeParsedRepository(parsed);
+    } catch {
+      return null;
+    }
   }
 
   try {
-    const parsed = new URL(raw);
-    if (!["file:", "git:", "http:", "https:", "ssh:"].includes(parsed.protocol)) return null;
-    parsed.username = "";
-    parsed.password = "";
-    parsed.search = "";
-    parsed.hash = "";
-    return parsed.toString();
+    return sanitizeParsedRepository(new URL(raw));
   } catch {
     return null;
   }
+}
+
+function sanitizeParsedRepository(parsed: URL): string | null {
+  if (!["file:", "git:", "http:", "https:", "ssh:"].includes(parsed.protocol)) return null;
+  if (parsed.protocol === "ssh:") {
+    parsed.password = "";
+  } else {
+    parsed.username = "";
+    parsed.password = "";
+  }
+  parsed.search = "";
+  parsed.hash = "";
+  return parsed.toString();
 }
 
 function metadataPath(root: string): string {
@@ -73,10 +87,10 @@ function parseMetadata(value: unknown): SourceMetadata | null {
   // package matches its source. Treat it as stale so the installer rebuilds
   // it instead of failing the whole machine setup.
   if (!Object.hasOwn(raw, "contentDigest")) return null;
-  if (
-    Object.keys(value).sort().join(",") !==
-    "baselineRemoteRevision,contentDigest,ref,repository,revision,schemaVersion"
-  ) {
+  const keys = Object.keys(value).sort().join(",");
+  const legacyKeys = "baselineRemoteRevision,contentDigest,ref,repository,revision,schemaVersion";
+  const currentKeys = "baselineIncludedInRevision,baselineRemoteRevision,contentDigest,ref,repository,revision,schemaVersion";
+  if (keys !== legacyKeys && keys !== currentKeys) {
     throw new Error("runtime source metadata is malformed");
   }
   const nullableRevision = (field: string): string | null => {
@@ -91,6 +105,12 @@ function parseMetadata(value: unknown): SourceMetadata | null {
   }
   const ref = raw.ref === null ? null : raw.ref;
   if (ref !== null && !validRef(ref)) throw new Error("runtime source metadata ref is invalid");
+  const baselineIncludedInRevision = Object.hasOwn(raw, "baselineIncludedInRevision")
+    ? raw.baselineIncludedInRevision
+    : null;
+  if (baselineIncludedInRevision !== null && typeof baselineIncludedInRevision !== "boolean") {
+    throw new Error("runtime source metadata baselineIncludedInRevision is invalid");
+  }
   if (raw.schemaVersion !== 1) throw new Error("runtime source metadata version is invalid");
   if (typeof raw.contentDigest !== "string" || !/^[a-f0-9]{64}$/i.test(raw.contentDigest)) {
     throw new Error("runtime source metadata contentDigest is invalid");
@@ -101,6 +121,7 @@ function parseMetadata(value: unknown): SourceMetadata | null {
     repository,
     ref,
     baselineRemoteRevision: nullableRevision("baselineRemoteRevision"),
+    baselineIncludedInRevision,
     contentDigest: raw.contentDigest.toLowerCase(),
   };
 }
@@ -206,6 +227,18 @@ function gitWorktreeIsClean(root: string): boolean | null {
   return output.trim() === "";
 }
 
+function isAncestorRevision(root: string, ancestor: string, revision: string): boolean | null {
+  const result = spawnSync("git", ["merge-base", "--is-ancestor", ancestor, revision], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 8_000,
+    env: isolatedGitEnvironment(),
+  });
+  if (result.status === 0) return true;
+  if (result.status === 1) return false;
+  return null;
+}
+
 function canonicalPath(value: string): string {
   try {
     return fs.realpathSync(value);
@@ -276,12 +309,19 @@ export function collectSourceMetadata(
   if (repository && !ref) {
     throw new Error("runtime source remote default branch could not be determined");
   }
+  const baselineRemoteRevision = repository && ref ? remoteTip(repository, ref) : null;
+  const baselineIncludedInRevision =
+    baselineRemoteRevision && normalizedRevision
+      ? baselineRemoteRevision === normalizedRevision ||
+        isAncestorRevision(root, baselineRemoteRevision, normalizedRevision)
+      : null;
   return {
     schemaVersion: 1,
     revision: normalizedRevision,
     repository,
     ref,
-    baselineRemoteRevision: repository && ref ? remoteTip(repository, ref) : null,
+    baselineRemoteRevision,
+    baselineIncludedInRevision,
     contentDigest: computeContentDigest(contentRoot, contentInputs),
   };
 }

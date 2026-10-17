@@ -18,6 +18,38 @@ describe("sanitizeExecutionOutput", () => {
     }
   });
 
+  it("redacts quoted credential assignments and preserves structured JSON", () => {
+    const shell = sanitizeExecutionOutput("password='value with spaces' secret='another secret value'");
+    expect(shell.allowed).toBe(true);
+    if (shell.allowed) {
+      expect(shell.text).toBe("password='[REDACTED]' secret='[REDACTED]'");
+    }
+
+    const json = sanitizeExecutionOutput(
+      `{
+  "password" : ${JSON.stringify('pass with "quotes"')}, "secret"  : "secret value", "api_key" : "short key"
+}`
+    );
+    expect(json.allowed).toBe(true);
+    if (json.allowed) {
+      expect(JSON.parse(json.text)).toEqual({
+        password: "[REDACTED]",
+        secret: "[REDACTED]",
+        api_key: "[REDACTED]",
+      });
+    }
+  });
+
+  it("redacts the MCP transport token in bare output and URL paths", () => {
+    const token = `c2c_mcp_${"a".repeat(43)}`;
+    const result = sanitizeExecutionOutput(`token=${token} request /mcp/${token}`);
+    expect(result.allowed).toBe(true);
+    if (result.allowed) {
+      expect(result.text).not.toContain(token);
+      expect(result.text.match(/\[REDACTED\]/g)).toHaveLength(2);
+    }
+  });
+
   it("rejects private keys entirely", () => {
     const result = sanitizeExecutionOutput("oops\n-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----");
     expect(result.allowed).toBe(false);
@@ -108,6 +140,21 @@ describe("execution output store", () => {
       iteration: 1,
     });
     expect(item.command).not.toMatch(/c2c_at_/);
+    expect(item.command).toContain("[REDACTED]");
+  });
+
+  it("redacts the MCP transport token from stored execution commands", () => {
+    dirs.push(isolateStateDir());
+    const token = `c2c_mcp_${"b".repeat(43)}`;
+    const item = saveExecutionOutput("ws1", {
+      command: `curl https://example.invalid/mcp/${token}`,
+      raw: "ok",
+      exitCode: 0,
+      localSessionId: "session-a",
+      taskId: "c2c_aa",
+      iteration: 1,
+    });
+    expect(item.command).not.toContain(token);
     expect(item.command).toContain("[REDACTED]");
   });
 

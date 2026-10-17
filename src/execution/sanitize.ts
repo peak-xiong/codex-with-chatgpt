@@ -9,16 +9,6 @@ const HARD_REJECT: RegExp[] = [
   /-----BEGIN PGP PRIVATE KEY BLOCK-----/,
 ];
 
-const EXTRA_REDACT: RegExp[] = [
-  /\bghp_[A-Za-z0-9]{20,}\b/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
-  /\bsk-[A-Za-z0-9]{20,}\b/g,
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
-  /\bAKIA[0-9A-Z]{16}\b/g,
-  /\bAIza[0-9A-Za-z_-]{20,}\b/g,
-  /((?:api[_-]?key|secret|password|passwd|authorization)\s*[:=]\s*)\S+/gi,
-];
-
 export type SanitizeResult =
   | { allowed: true; text: string; truncated: boolean }
   | { allowed: false; reason: string };
@@ -28,16 +18,6 @@ function redactHomePaths(text: string): string {
     .replace(/\/Users\/[^/\s"'`]+/g, "/Users/[user]")
     .replace(/\/home\/[^/\s"'`]+/g, "/home/[user]")
     .replace(/C:\\Users\\[^\\\s"'`]+/gi, String.raw`C:\Users\[user]`);
-}
-
-function applyExtraRedact(text: string): string {
-  let out = text;
-  for (const pattern of EXTRA_REDACT) {
-    out = out.replace(pattern, (match, prefix) =>
-      typeof prefix === "string" ? `${prefix}[REDACTED]` : "[REDACTED]"
-    );
-  }
-  return out;
 }
 
 function truncate(text: string): { text: string; truncated: boolean } {
@@ -68,7 +48,6 @@ export function sanitizeExecutionOutput(raw: string): SanitizeResult {
     return { allowed: false, reason: "private_key" };
   }
   let text = redact(raw);
-  text = applyExtraRedact(text);
   text = redactHomePaths(text);
   const { text: limited, truncated } = truncate(text);
   return { allowed: true, text: limited, truncated };

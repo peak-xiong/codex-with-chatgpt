@@ -1,14 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import readline from "node:readline";
+import { StringDecoder } from "node:string_decoder";
 import { IgnoreRules } from "./ignore.js";
 import {
-  readJsonIfExists,
   registerProjectDataDir,
   registerWorkspaceDataDir,
 } from "../config/paths.js";
-import { projectDataDirectory, resolveProjectId } from "./identity.js";
+import { projectDataDirectory, projectIdMetadataPath, resolveProjectId } from "./identity.js";
+import { openWorkspaceFile, openWorkspaceFileSync, readDescriptorBoundedSync, SafeOpenError } from "./safe-open.js";
 
 export type WorkspaceErrorCode =
   | "INVALID_CONFIG"
@@ -22,6 +22,7 @@ export type WorkspaceErrorCode =
   | "UNSUPPORTED_IMAGE_FORMAT"
   | "FILE_TOO_LARGE"
   | "SEARCH_QUERY_TOO_LARGE"
+  | "SEARCH_FAILED"
   | "REGEX_ENGINE_UNAVAILABLE";
 
 export class WorkspaceError extends Error {
@@ -86,6 +87,36 @@ function stringRecord(value: unknown): Record<string, string> {
 const DEFAULT_MAX_LINES = 400;
 const HARD_MAX_LINES = 2000;
 const DEFAULT_MAX_BYTES = 256 * 1024;
+export const MAX_TEXT_SCAN_BYTES = 8 * 1024 * 1024;
+const TEXT_READ_CHUNK_BYTES = 64 * 1024;
+const PROJECT_METADATA_MAX_BYTES = 1024 * 1024;
+
+function readWorkspaceJson(root: string, file: string): unknown {
+  let fd: number;
+  try {
+    fd = openWorkspaceFileSync(root, file);
+  } catch {
+    return undefined;
+  }
+  try {
+    if (fs.fstatSync(fd).size > PROJECT_METADATA_MAX_BYTES) return undefined;
+    return JSON.parse(readDescriptorBoundedSync(fd, PROJECT_METADATA_MAX_BYTES).toString("utf8")) as unknown;
+  } catch {
+    return undefined;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function isMissingPath(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+function isPathWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || !(relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative));
+}
 
 export class Workspace {
   readonly root: string;
@@ -94,6 +125,8 @@ export class Workspace {
   readonly name: string;
   readonly ignoreRules: IgnoreRules;
   readonly projectConfig: ProjectConfig;
+  private readonly internalProjectDataDirectory: string;
+  private readonly gitMetadataDirectory: string | null;
 
   constructor(rootInput: string) {
     const resolved = path.resolve(rootInput);
@@ -109,16 +142,21 @@ export class Workspace {
     this.root = real;
     this.id = createHash("sha256").update(real).digest("hex").slice(0, 12);
     this.projectId = resolveProjectId(real);
+    const metadataPath = projectIdMetadataPath(real);
+    this.gitMetadataDirectory = metadataPath
+      ? fs.realpathSync.native(path.dirname(metadataPath))
+      : null;
     const dataDir = projectDataDirectory(real);
     registerProjectDataDir(this.projectId, dataDir);
     registerWorkspaceDataDir(this.id, path.join(dataDir, "workspaces", this.id));
+    this.internalProjectDataDirectory = fs.realpathSync.native(dataDir);
     this.ignoreRules = new IgnoreRules(real);
-    this.projectConfig = parseProjectConfig(readJsonIfExists<unknown>(path.join(real, ".c2c.json")));
+    this.projectConfig = parseProjectConfig(readWorkspaceJson(real, path.join(real, ".c2c.json")));
     this.name = this.projectConfig.name ?? path.basename(real);
   }
 
   private contains(candidate: string): boolean {
-    return candidate === this.root || candidate.startsWith(this.root + path.sep);
+    return isPathWithin(this.root, candidate);
   }
 
   /**
@@ -145,7 +183,10 @@ export class Workspace {
    * Resolve an untrusted path to a canonical absolute path inside the workspace.
    * Throws PATH_OUTSIDE_WORKSPACE or ACCESS_DENIED_SENSITIVE_FILE.
    */
-  resolve(requested: string, opts: { allowSensitive?: boolean } = {}): { abs: string; rel: string } {
+  resolveAfterIgnoreRefresh(
+    requested: string,
+    opts: { allowSensitive?: boolean } = {}
+  ): { abs: string; rel: string } {
     if (typeof requested !== "string" || requested.includes("\0")) {
       throw new WorkspaceError("INVALID_PATH", "Invalid path");
     }
@@ -159,36 +200,57 @@ export class Workspace {
 
     const abs = path.resolve(this.root, p);
     const canonical = this.canonicalize(abs);
+    const inGitMetadata = this.gitMetadataDirectory !== null && isPathWithin(this.gitMetadataDirectory, canonical);
+    if (inGitMetadata || isPathWithin(this.internalProjectDataDirectory, canonical)) {
+      throw new WorkspaceError(
+        "ACCESS_DENIED_SENSITIVE_FILE",
+        inGitMetadata
+          ? "ACCESS_DENIED_SENSITIVE_FILE: Git metadata cannot be read."
+          : "ACCESS_DENIED_SENSITIVE_FILE: internal workspace state cannot be read."
+      );
+    }
     if (!this.contains(canonical)) {
       throw new WorkspaceError(
         "PATH_OUTSIDE_WORKSPACE",
         `Path resolves outside the connected workspace: ${requested}`
       );
     }
-    const rel = path.relative(this.root, canonical).split(path.sep).join("/");
-    if (rel.startsWith("..")) {
+    const relative = path.relative(this.root, canonical);
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       throw new WorkspaceError("PATH_OUTSIDE_WORKSPACE", `Path resolves outside the connected workspace: ${requested}`);
     }
-    if (!opts.allowSensitive && rel !== "" && this.ignoreRules.isSensitive(rel)) {
+    const rel = relative.split(path.sep).join("/");
+    if (
+      rel.split("/").includes(".git") ||
+      (!opts.allowSensitive && rel !== "" && this.ignoreRules.isSensitive(rel))
+    ) {
       throw new WorkspaceError(
         "ACCESS_DENIED_SENSITIVE_FILE",
-        `ACCESS_DENIED_SENSITIVE_FILE: '${rel}' matches the sensitive-file policy and cannot be read.`
+        rel.split("/").includes(".git")
+          ? "ACCESS_DENIED_SENSITIVE_FILE: Git metadata cannot be read."
+          : `ACCESS_DENIED_SENSITIVE_FILE: '${rel}' matches the sensitive-file policy and cannot be read.`
       );
     }
     return { abs: canonical, rel };
   }
 
-  private async isBinary(abs: string): Promise<boolean> {
-    const fd = await fs.promises.open(abs, "r");
+  resolve(requested: string, opts: { allowSensitive?: boolean } = {}): { abs: string; rel: string } {
+    this.ignoreRules.refresh();
+    return this.resolveAfterIgnoreRefresh(requested, opts);
+  }
+
+  /** Resolve a path after the caller refreshed rules once for its whole operation. */
+  resolveVisibleAfterIgnoreRefresh(requested: string): { abs: string; rel: string } | null {
     try {
-      const buf = Buffer.alloc(8192);
-      const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
-      for (let i = 0; i < bytesRead; i++) {
-        if (buf[i] === 0) return true;
-      }
-      return false;
-    } finally {
-      await fd.close();
+      const resolved = this.resolveAfterIgnoreRefresh(requested);
+      if (
+        this.ignoreRules.isHidden(resolved.rel) ||
+        (resolved.rel !== "" && this.ignoreRules.isHidden(`${resolved.rel}/`))
+      ) return null;
+      return resolved;
+    } catch (error) {
+      if (error instanceof WorkspaceError) return null;
+      throw error;
     }
   }
 
@@ -196,67 +258,167 @@ export class Workspace {
     requested: string,
     opts: { startLine?: number; endLine?: number; maxLines?: number; maxBytes?: number } = {}
   ): Promise<ReadFileResult> {
-    const { abs, rel } = this.resolve(requested);
-    let stat: fs.Stats;
+    this.ignoreRules.refresh();
+    return this.readFileAfterIgnoreRefresh(requested, opts);
+  }
+
+  /** @internal Used by read_many after refreshing rules once for the whole batch. */
+  async readFileAfterIgnoreRefresh(
+    requested: string,
+    opts: { startLine?: number; endLine?: number; maxLines?: number; maxBytes?: number } = {}
+  ): Promise<ReadFileResult> {
+    const { abs, rel } = this.resolveAfterIgnoreRefresh(requested);
+    let handle: Awaited<ReturnType<typeof openWorkspaceFile>>;
     try {
-      stat = await fs.promises.stat(abs);
-    } catch {
-      throw new WorkspaceError("FILE_NOT_FOUND", `File not found: ${rel}`);
+      handle = await openWorkspaceFile(this.root, abs);
+    } catch (error) {
+      if (isMissingPath(error)) throw new WorkspaceError("FILE_NOT_FOUND", `File not found: ${rel}`);
+      if (error instanceof SafeOpenError) {
+        if (error.reason === "NOT_A_FILE") throw new WorkspaceError("NOT_A_FILE", `Not a regular file: ${rel}`);
+        throw new WorkspaceError("ACCESS_DENIED_SENSITIVE_FILE", "File identity changed while opening the workspace path.");
+      }
+      throw error;
     }
-    if (!stat.isFile()) {
-      throw new WorkspaceError("NOT_A_FILE", `Not a regular file: ${rel}`);
-    }
-    if (await this.isBinary(abs)) {
-      throw new WorkspaceError("BINARY_FILE", `Binary file (${stat.size} bytes): ${rel}. Content is not returned.`);
-    }
+    try {
+      const stat = await handle.stat();
+      const probe = Buffer.alloc(8192);
+      const { bytesRead: probeBytes } = await handle.read(probe, 0, probe.length, 0);
+      if (probe.subarray(0, probeBytes).includes(0)) {
+        throw new WorkspaceError("BINARY_FILE", `Binary file (${stat.size} bytes): ${rel}. Content is not returned.`);
+      }
+      if (stat.size > MAX_TEXT_SCAN_BYTES) {
+        throw new WorkspaceError("FILE_TOO_LARGE", `Text file exceeds the ${MAX_TEXT_SCAN_BYTES}-byte scan limit: ${rel}`);
+      }
 
-    const startLine = Math.max(1, Math.floor(opts.startLine ?? 1));
-    const maxLines = Math.min(HARD_MAX_LINES, Math.max(1, Math.floor(opts.maxLines ?? DEFAULT_MAX_LINES)));
-    const endLimit = opts.endLine
-      ? Math.min(Math.floor(opts.endLine), startLine + HARD_MAX_LINES - 1)
-      : startLine + maxLines - 1;
-    const maxBytes = Math.min(1024 * 1024, Math.max(1024, Math.floor(opts.maxBytes ?? DEFAULT_MAX_BYTES)));
+      const startLine = Math.max(1, Math.floor(opts.startLine ?? 1));
+      const maxLines = Math.min(HARD_MAX_LINES, Math.max(1, Math.floor(opts.maxLines ?? DEFAULT_MAX_LINES)));
+      const endLimit = opts.endLine
+        ? Math.min(Math.floor(opts.endLine), startLine + HARD_MAX_LINES - 1)
+        : startLine + maxLines - 1;
+      const maxBytes = Math.min(1024 * 1024, Math.max(1024, Math.floor(opts.maxBytes ?? DEFAULT_MAX_BYTES)));
 
-    const lines: string[] = [];
-    let totalLines = 0;
-    let collectedBytes = 0;
-    let byteTruncated = false;
-    let actualEnd = startLine - 1;
+      const lines: string[] = [];
+      let totalLines = 0;
+      let collectedBytes = 0;
+      let byteTruncated = false;
+      let actualEnd = startLine - 1;
+      let lineParts: string[] = [];
+      let lineBytes = 0;
+      let lineOverflow = false;
+      let lineHasData = false;
+      let pendingCarriageReturn = false;
+      const decoder = new StringDecoder("utf8");
 
-    const stream = fs.createReadStream(abs, { encoding: "utf8" });
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    for await (const line of rl) {
-      totalLines++;
-      if (totalLines >= startLine && totalLines <= endLimit && !byteTruncated) {
-        const cost = Buffer.byteLength(line, "utf8") + 1;
-        if (collectedBytes + cost > maxBytes) {
-          if (lines.length === 0) {
-            rl.close();
-            stream.destroy();
-            throw new WorkspaceError("FILE_TOO_LARGE", "First requested line exceeds the read byte budget; use a bounded local artifact.");
+      const collectCurrentLine = (): boolean => {
+        totalLines++;
+        if (totalLines >= startLine && totalLines <= endLimit && !byteTruncated) {
+          let line = lineOverflow ? "" : lineParts.join("");
+          if (line.endsWith("\r")) line = line.slice(0, -1);
+          const cost = Buffer.byteLength(line, "utf8") + 1;
+          if (lineOverflow || collectedBytes + cost > maxBytes) {
+            if (lines.length === 0) return false;
+            byteTruncated = true;
+          } else {
+            lines.push(line);
+            collectedBytes += cost;
+            actualEnd = totalLines;
           }
-          byteTruncated = true;
-        } else {
-          lines.push(line);
-          collectedBytes += cost;
-          actualEnd = totalLines;
+        }
+        lineParts = [];
+        lineBytes = 0;
+        lineOverflow = false;
+        lineHasData = false;
+        return true;
+      };
+
+      const appendLineText = (piece: string): boolean => {
+        if (piece.length === 0) return true;
+        lineHasData = true;
+        const isRequested = totalLines + 1 >= startLine && totalLines + 1 <= endLimit && !byteTruncated;
+        if (!isRequested || lineOverflow) return true;
+        const pieceBytes = Buffer.byteLength(piece, "utf8");
+        const assemblyLimit = maxBytes - collectedBytes - 1;
+        if (lineBytes + pieceBytes > assemblyLimit) {
+          lineParts = [];
+          lineOverflow = true;
+          return lines.length > 0;
+        }
+        lineParts.push(piece);
+        lineBytes += pieceBytes;
+        return true;
+      };
+
+      const feedText = (text: string): boolean => {
+        if (text.length === 0) return true;
+        let offset = 0;
+        if (pendingCarriageReturn) {
+          pendingCarriageReturn = false;
+          if (text[0] === "\n") offset = 1;
+          if (!collectCurrentLine()) return false;
+        }
+
+        let segmentStart = offset;
+        for (let index = offset; index < text.length; index++) {
+          const character = text[index];
+          if (character !== "\r" && character !== "\n") continue;
+          if (!appendLineText(text.slice(segmentStart, index))) return false;
+          if (character === "\r" && index === text.length - 1) {
+            pendingCarriageReturn = true;
+            segmentStart = index + 1;
+            break;
+          }
+          if (character === "\r" && text[index + 1] === "\n") index++;
+          if (!collectCurrentLine()) return false;
+          segmentStart = index + 1;
+        }
+        return appendLineText(text.slice(segmentStart));
+      };
+
+      const chunk = Buffer.alloc(TEXT_READ_CHUNK_BYTES);
+      let position = 0;
+      while (position <= MAX_TEXT_SCAN_BYTES) {
+        const length = Math.min(chunk.length, MAX_TEXT_SCAN_BYTES + 1 - position);
+        const { bytesRead } = await handle.read(chunk, 0, length, position);
+        if (bytesRead === 0) break;
+        position += bytesRead;
+        if (position > MAX_TEXT_SCAN_BYTES) {
+          throw new WorkspaceError("FILE_TOO_LARGE", `Text file exceeds the ${MAX_TEXT_SCAN_BYTES}-byte scan limit: ${rel}`);
+        }
+        if (!feedText(decoder.write(chunk.subarray(0, bytesRead)))) {
+          throw new WorkspaceError("FILE_TOO_LARGE", "First requested line exceeds the read byte budget; use a bounded local artifact.");
         }
       }
-    }
-    rl.close();
+      if (!feedText(decoder.end())) {
+        throw new WorkspaceError("FILE_TOO_LARGE", "First requested line exceeds the read byte budget; use a bounded local artifact.");
+      }
+      if (pendingCarriageReturn) {
+        pendingCarriageReturn = false;
+        if (!collectCurrentLine()) {
+          throw new WorkspaceError("FILE_TOO_LARGE", "First requested line exceeds the read byte budget; use a bounded local artifact.");
+        }
+      } else if (lineHasData && !collectCurrentLine()) {
+        throw new WorkspaceError("FILE_TOO_LARGE", "First requested line exceeds the read byte budget; use a bounded local artifact.");
+      }
+      const finalStat = await handle.stat();
+      if (finalStat.size > MAX_TEXT_SCAN_BYTES) {
+        throw new WorkspaceError("FILE_TOO_LARGE", `Text file exceeds the ${MAX_TEXT_SCAN_BYTES}-byte scan limit: ${rel}`);
+      }
 
-    const remaining = Math.max(0, totalLines - actualEnd);
-    return {
-      path: rel,
-      sizeBytes: stat.size,
-      totalLines,
-      startLine: Math.min(startLine, Math.max(totalLines, 1)),
-      endLine: actualEnd,
-      truncated: remaining > 0,
-      remainingLines: remaining,
-      nextStartLine: remaining > 0 ? actualEnd + 1 : null,
-      content: lines.join("\n"),
-    };
+      const remaining = Math.max(0, totalLines - actualEnd);
+      return {
+        path: rel,
+        sizeBytes: finalStat.size,
+        totalLines,
+        startLine: Math.min(startLine, Math.max(totalLines, 1)),
+        endLine: actualEnd,
+        truncated: remaining > 0,
+        remainingLines: remaining,
+        nextStartLine: remaining > 0 ? actualEnd + 1 : null,
+        content: lines.join("\n"),
+      };
+    } finally {
+      await handle.close();
+    }
   }
 
   async listDirectory(
@@ -278,7 +440,7 @@ export class Workspace {
     const offset = Math.max(0, Math.floor(opts.offset ?? 0));
 
     const all: DirEntry[] = [];
-    const walk = async (dirAbs: string, dirRel: string, level: number): Promise<void> => {
+    const walk = async (dirAbs: string, level: number): Promise<void> => {
       let entries: fs.Dirent[];
       try {
         entries = await fs.promises.readdir(dirAbs, { withFileTypes: true });
@@ -291,15 +453,16 @@ export class Workspace {
         return ad !== bd ? ad - bd : a.name.localeCompare(b.name);
       });
       for (const entry of entries) {
-        const childRel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
-        if (this.ignoreRules.isHidden(childRel) || this.ignoreRules.isHidden(childRel + "/")) continue;
+        const childPath = this.resolveVisibleAfterIgnoreRefresh(path.join(dirAbs, entry.name));
+        if (!childPath) continue;
+        const { abs: childAbs, rel: childRel } = childPath;
         if (entry.isDirectory()) {
           all.push({ path: childRel + "/", type: "dir" });
-          if (level < depth) await walk(path.join(dirAbs, entry.name), childRel, level + 1);
+          if (level < depth) await walk(childAbs, level + 1);
         } else if (entry.isFile()) {
           let size: number | undefined;
           try {
-            size = (await fs.promises.stat(path.join(dirAbs, entry.name))).size;
+            size = (await fs.promises.stat(childAbs)).size;
           } catch {
             size = undefined;
           }
@@ -308,7 +471,7 @@ export class Workspace {
         if (all.length >= offset + limit + 2000) return; // hard cap for huge trees
       }
     };
-    await walk(abs, rel, 1);
+    await walk(abs, 1);
 
     const page = all.slice(offset, offset + limit);
     return {
@@ -329,6 +492,7 @@ export class Workspace {
     packageManager: string | null;
     scripts: Record<string, string>;
   } {
+    this.ignoreRules.refresh();
     const has = (f: string): boolean => fs.existsSync(path.join(this.root, f));
     const languages = new Set<string>();
     const frameworks = new Set<string>();
@@ -339,7 +503,13 @@ export class Workspace {
     if (has("package.json")) {
       projectType = "node";
       languages.add("JavaScript");
-      const rawPackage = readJsonIfExists<unknown>(path.join(this.root, "package.json"));
+      let rawPackage: unknown;
+      try {
+        this.resolveAfterIgnoreRefresh("package.json");
+        rawPackage = readWorkspaceJson(this.root, path.join(this.root, "package.json"));
+      } catch {
+        rawPackage = undefined;
+      }
       const pkg = rawPackage && typeof rawPackage === "object" && !Array.isArray(rawPackage)
         ? rawPackage as Record<string, unknown>
         : {};

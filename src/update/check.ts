@@ -51,12 +51,19 @@ function checkSourceMetadata(metadata: SourceMetadata): GitUpdateCheck | null {
   if (!remote) return null;
   const local = metadata.revision.toLowerCase();
   const baseline = metadata.baselineRemoteRevision?.toLowerCase() ?? null;
+  let updateAvailable: boolean;
+  if (remote === local) {
+    updateAvailable = false;
+  } else if (remote === baseline) {
+    if (metadata.baselineIncludedInRevision === null) return null;
+    updateAvailable = !metadata.baselineIncludedInRevision;
+  } else {
+    updateAvailable = true;
+  }
   return {
     localCommit: local,
     remoteCommit: remote,
-    // A local checkout may have been installed before its remote branch caught
-    // up. Treat the install-time remote tip as the baseline until it moves.
-    updateAvailable: remote !== local && remote !== baseline,
+    updateAvailable,
   };
 }
 

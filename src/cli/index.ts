@@ -16,7 +16,8 @@ import {
 import {
   ensureSandboxIsolation,
   restoreCodexConfig,
-  snapshotCodexConfig,
+  type CodexConfigRollback,
+  type SandboxIsolationResult,
 } from "../config/sandbox-allow.js";
 import {
   restorePrivateFile,
@@ -249,9 +250,12 @@ function parseControlCorrelation(opts: {
 }
 
 function parseScopes(value?: string): string[] {
-  const scopes = (value === undefined ? [...TURN_SCOPES] : value.split(","))
+  const normalizedValue = value?.trim();
+  if (normalizedValue === "none") return [];
+  const scopes = (normalizedValue === undefined ? [...TURN_SCOPES] : normalizedValue.split(","))
     .map((scope) => scope.trim())
     .filter(Boolean);
+  if (scopes.includes("none")) throw new Error("scope 'none' cannot be combined with other scopes");
   if (scopes.length === 0) throw new Error("scopes must include at least one scope");
   const allowed = new Set<string>(TURN_SCOPES);
   const unknown = scopes.filter((scope) => !allowed.has(scope));
@@ -418,6 +422,14 @@ function runtimeInstallView(result: RuntimeInstallResult): Record<string, unknow
     packageVersion: result.packageVersion,
     launcherPath: result.launcherPath,
     launcherChanged: result.launcherChanged,
+  };
+}
+
+function sandboxIsolationView(result: SandboxIsolationResult): Omit<SandboxIsolationResult, "rollback"> {
+  return {
+    alreadyIsolated: result.alreadyIsolated,
+    removedRoots: result.removedRoots,
+    configPath: result.configPath,
   };
 }
 
@@ -613,9 +625,9 @@ machine
         const runtimeHomeDir = path.resolve(process.env.HOME ?? os.homedir());
         const previousRuntime = snapshotRuntimeInstallation({ homeDir: runtimeHomeDir });
         const previousSkill = snapshotGlobalSkill();
-        const previousCodexConfig = snapshotCodexConfig();
         let installedRuntime: RuntimeInstallResult | null = null;
         let skill: SkillInstallResult | null = null;
+        let codexConfigRollback: CodexConfigRollback | null = null;
         let requiresFreshRuntime = false;
         let gatewayStopped = false;
         let startAttempted = false;
@@ -629,7 +641,9 @@ machine
           if (requiresFreshRuntime && previousGateway.state === "healthy") {
             gatewayStopped = await stopMachineGateway({ machineLockHeld: true });
           }
-          const sandbox = ensureSandboxIsolation();
+          const sandboxResult = ensureSandboxIsolation();
+          codexConfigRollback = sandboxResult.rollback;
+          const sandbox = sandboxIsolationView(sandboxResult);
           startAttempted = true;
           const result = await ensureMachineGateway({
             requireFreshRuntime: requiresFreshRuntime,
@@ -671,11 +685,13 @@ machine
               label: "restore global Skill",
               run: () => restoreGlobalSkill(previousSkill),
             },
-            {
-              label: "restore Codex config",
-              run: () => restoreCodexConfig(previousCodexConfig),
-            },
           );
+          if (codexConfigRollback) {
+            rollbackSteps.push({
+              label: "restore Codex config",
+              run: () => restoreCodexConfig(codexConfigRollback!),
+            });
+          }
           if (gatewayStopped || previousGateway.state === "healthy") {
             rollbackSteps.push({
               label: "restore previous gateway",
@@ -1091,7 +1107,7 @@ machineContext
   .option("--request <id>", "exact control request id (required for every phase)")
   .option("--compaction-epoch <n>", "compaction epoch", "0")
   .option("--local-session <id>")
-  .option("--scopes <scope,...>")
+  .option("--scopes <scope,...>", "comma-separated scopes, or 'none' for no local scopes")
   .option("--model-id <id>")
   .option("--effort <name>")
   .option("--ttl-ms <ms>", "capability lifetime", String(DEFAULT_TURN_TTL_MS))
@@ -1785,7 +1801,7 @@ control
   .requiredOption("--phase <phase>")
   .option("--local-session <id>")
   .option("--ttl-ms <ms>", "request and capability activity lease; renewed by verified generating observations", String(DEFAULT_TURN_TTL_MS))
-  .option("--scopes <scope,...>")
+  .option("--scopes <scope,...>", "comma-separated scopes, or 'none' for no local scopes")
   .option("--model-id <id>")
   .option("--effort <name>")
   .option("--plugins <ids>", "comma-separated task-requested ChatGPT plugins")
@@ -2237,7 +2253,7 @@ program
   .option("--json", "machine-readable output", false)
   .action((opts: { json: boolean }) => {
     try {
-      const result = ensureSandboxIsolation();
+      const result = sandboxIsolationView(ensureSandboxIsolation());
       if (opts.json) say(JSON.stringify({ ok: true, ...result }));
       else if (result.removedRoots > 0) check("已移除旧版 C2C 机器状态写权限");
       else check("C2C 机器状态未向工作区开放写权限");

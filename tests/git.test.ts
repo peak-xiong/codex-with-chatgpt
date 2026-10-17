@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import fs from "node:fs";
 import path from "node:path";
 import { gitDiff, gitInfo, gitStatus } from "../src/workspace/git.js";
 import { IgnoreRules } from "../src/workspace/ignore.js";
@@ -117,6 +118,214 @@ describe("gitStatus", () => {
       const stringTargetStatus = gitStatus(isolatedRepo);
       expect(stringTargetStatus.hidden).toEqual({ changes: 4, conflicts: 2 });
       expect(stringTargetStatus.untracked).toContain("ordinary file.txt");
+    } finally {
+      cleanup(isolatedRepo);
+    }
+  });
+});
+
+describe("workspace-aware Git reads", () => {
+  it("uses workspace-relative status, diff modes, and GitDiffOptions.path in a nested workspace", () => {
+    const isolatedRepo = makeTmpDir("git-nested-workspace");
+    try {
+      makeGitRepo(isolatedRepo);
+      write(isolatedRepo, "app/change.txt", "baseline\n");
+      write(isolatedRepo, "app/app/deep.txt", "deep baseline\n");
+      write(isolatedRepo, "outside.txt", "outside baseline\n");
+      git(isolatedRepo, "add", "app", "outside.txt");
+      git(isolatedRepo, "commit", "-m", "nested workspace baseline");
+
+      write(isolatedRepo, "app/change.txt", "staged marker\n");
+      git(isolatedRepo, "add", "app/change.txt");
+      write(isolatedRepo, "app/change.txt", "unstaged marker\n");
+      write(isolatedRepo, "app/app/deep.txt", "deep marker\n");
+      write(isolatedRepo, "outside.txt", "outside marker\n");
+
+      const workspaceRoot = path.join(isolatedRepo, "app");
+      const target = { root: workspaceRoot, ignoreRules: new IgnoreRules(workspaceRoot) };
+      const status = gitStatus(target);
+      expect(status.isRepo).toBe(true);
+      expect(status.staged.map((entry) => entry.path)).toContain("change.txt");
+      expect(status.unstaged.map((entry) => entry.path)).toEqual(
+        expect.arrayContaining(["change.txt", "app/deep.txt"]),
+      );
+      expect(status.staged.map((entry) => entry.path)).not.toContain("outside.txt");
+      expect(status.unstaged.map((entry) => entry.path)).not.toContain("outside.txt");
+
+      const staged = gitDiff(target, { mode: "staged" });
+      expect(staged.diff).toContain("staged marker");
+      expect(staged.diff).not.toContain("unstaged marker");
+      expect(staged.diff).not.toContain("outside marker");
+
+      const unstaged = gitDiff(target, { mode: "unstaged" });
+      expect(unstaged.diff).toContain("unstaged marker");
+      expect(unstaged.diff).toContain("deep marker");
+      expect(unstaged.diff).not.toContain("outside marker");
+
+      const head = gitDiff(target, { mode: "head" });
+      expect(head.diff).toContain("staged marker");
+      expect(head.diff).toContain("unstaged marker");
+      expect(head.diff).toContain("deep marker");
+      expect(head.diff).not.toContain("outside marker");
+
+      const scoped = gitDiff(target, { mode: "head", path: "app/deep.txt" });
+      expect(scoped.diff).toContain("deep marker");
+      expect(scoped.diff).not.toContain("staged marker");
+
+      const invalidScope = gitDiff(target, { mode: "head", path: "../outside.txt" });
+      expect(invalidScope.isRepo).toBe(true);
+      expect(invalidScope.diff).toBe("");
+    } finally {
+      cleanup(isolatedRepo);
+    }
+  });
+
+  it("maps nested workspace paths before refreshed ignore checks exactly once per operation", () => {
+    const isolatedRepo = makeTmpDir("git-nested-ignore-refresh");
+    try {
+      makeGitRepo(isolatedRepo);
+      write(isolatedRepo, "app/app/hidden.txt", "baseline hidden payload\n");
+      git(isolatedRepo, "add", "app");
+      git(isolatedRepo, "commit", "-m", "nested ignore baseline");
+
+      const workspaceRoot = path.join(isolatedRepo, "app");
+      const ignoreRules = new IgnoreRules(workspaceRoot);
+      const refresh = vi.spyOn(ignoreRules, "refresh");
+      write(workspaceRoot, ".c2cignore", "app/hidden.txt\n");
+      write(isolatedRepo, "app/app/hidden.txt", "NESTED_SECRET_PAYLOAD\n");
+      const target = { root: workspaceRoot, ignoreRules };
+
+      const status = gitStatus(target);
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(status.hidden.changes).toBe(1);
+      expect(status.unstaged.map((entry) => entry.path)).not.toContain("app/hidden.txt");
+
+      const diff = gitDiff(target, { mode: "head" });
+      expect(refresh).toHaveBeenCalledTimes(2);
+      expect(diff.diff).not.toContain("NESTED_SECRET_PAYLOAD");
+    } finally {
+      cleanup(isolatedRepo);
+    }
+  });
+
+  it("rejects renames with sensitive or out-of-workspace endpoints", () => {
+    const isolatedRepo = makeTmpDir("git-nested-renames");
+    try {
+      makeGitRepo(isolatedRepo);
+      write(isolatedRepo, "outside-secret.txt", "OUTSIDE_SECRET_PAYLOAD\n");
+      write(isolatedRepo, "app/.npmrc", "NPM_SECRET_PAYLOAD\n");
+      write(isolatedRepo, "app/safe.txt", "safe rename payload\n");
+      write(isolatedRepo, "app/inside.txt", "inside rename payload\n");
+      git(isolatedRepo, "add", "outside-secret.txt", "app");
+      git(isolatedRepo, "commit", "-m", "rename boundary baseline");
+
+      git(isolatedRepo, "mv", "outside-secret.txt", "app/public.txt");
+      git(isolatedRepo, "mv", "app/safe.txt", "escaped-safe.txt");
+      git(isolatedRepo, "mv", "app/.npmrc", "app/renamed-public.txt");
+      git(isolatedRepo, "mv", "app/inside.txt", "app/renamed-inside.txt");
+
+      const workspaceRoot = path.join(isolatedRepo, "app");
+      const target = { root: workspaceRoot, ignoreRules: new IgnoreRules(workspaceRoot) };
+      const diff = gitDiff(target, { mode: "staged" });
+      expect(diff.diff).toContain("renamed-inside.txt");
+      for (const leaked of [
+        "OUTSIDE_SECRET_PAYLOAD",
+        "NPM_SECRET_PAYLOAD",
+        "outside-secret.txt",
+        "app/public.txt",
+        "escaped-safe.txt",
+        ".npmrc",
+        "renamed-public.txt",
+      ]) {
+        expect(diff.diff).not.toContain(leaked);
+      }
+
+      const status = gitStatus(target);
+      expect(status.staged.map((entry) => entry.path)).toContain(
+        "renamed-inside.txt -> inside.txt",
+      );
+      expect(status.staged.map((entry) => entry.path).join("\n")).not.toMatch(
+        /outside-secret|public\.txt|escaped-safe|npmrc|renamed-public/,
+      );
+    } finally {
+      cleanup(isolatedRepo);
+    }
+  });
+
+  it("uses linked-worktree Git roots while keeping status and diffs workspace-scoped", () => {
+    const mainRepo = makeTmpDir("git-linked-main");
+    const linkedRepo = makeTmpDir("git-linked-checkout");
+    try {
+      makeGitRepo(mainRepo);
+      write(mainRepo, "app/linked.txt", "linked baseline\n");
+      git(mainRepo, "add", "app/linked.txt");
+      git(mainRepo, "commit", "-m", "linked worktree fixture");
+      git(mainRepo, "worktree", "add", "--detach", linkedRepo, "HEAD");
+      write(linkedRepo, "app/linked.txt", "linked workspace change\n");
+      write(linkedRepo, "outside.txt", "linked outside change\n");
+
+      const workspaceRoot = path.join(linkedRepo, "app");
+      const target = { root: workspaceRoot, ignoreRules: new IgnoreRules(workspaceRoot) };
+      const status = gitStatus(target);
+      expect(status.unstaged.map((entry) => entry.path)).toContain("linked.txt");
+      expect(status.unstaged.map((entry) => entry.path)).not.toContain("outside.txt");
+      const diff = gitDiff(target, { mode: "unstaged" });
+      expect(diff.diff).toContain("linked workspace change");
+      expect(diff.diff).not.toContain("linked outside change");
+      expect(fs.readFileSync(path.join(mainRepo, "app/linked.txt"), "utf8")).toBe(
+        "linked baseline\n",
+      );
+    } finally {
+      try {
+        git(mainRepo, "worktree", "remove", "--force", linkedRepo);
+      } catch {
+        // The worktree may not have been registered if setup failed.
+      }
+      cleanup(linkedRepo);
+      cleanup(mainRepo);
+    }
+  });
+
+  it("disables configured external diff and textconv programs for read-only diffs", () => {
+    const isolatedRepo = makeTmpDir("git-disabled-diff-drivers");
+    try {
+      makeGitRepo(isolatedRepo);
+      write(isolatedRepo, ".gitattributes", "*.txt diff=marker\n");
+      write(isolatedRepo, "driver.txt", "baseline driver text\n");
+      git(isolatedRepo, "add", ".gitattributes", "driver.txt");
+      git(isolatedRepo, "commit", "-m", "diff driver fixture");
+
+      const externalMarker = path.join(isolatedRepo, "external.marker");
+      const textconvMarker = path.join(isolatedRepo, "textconv.marker");
+      const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+      const script = write(
+        isolatedRepo,
+        "driver.sh",
+        `#!/bin/sh\nif [ "$#" -gt 1 ]; then printf x >> ${quote(externalMarker)}; else printf x >> ${quote(textconvMarker)}; fi\ncat "$1" 2>/dev/null || true\n`,
+      );
+      fs.chmodSync(script, 0o755);
+      git(isolatedRepo, "config", "diff.external", script);
+      git(isolatedRepo, "config", "diff.marker.textconv", script);
+      write(isolatedRepo, "driver.txt", "changed driver text\n");
+
+      git(isolatedRepo, "diff", "--", "driver.txt");
+      expect(fs.existsSync(externalMarker)).toBe(true);
+      fs.rmSync(externalMarker);
+      git(isolatedRepo, "config", "--unset", "diff.external");
+      git(isolatedRepo, "diff", "--", "driver.txt");
+      expect(fs.existsSync(textconvMarker)).toBe(true);
+      fs.rmSync(textconvMarker);
+
+      git(isolatedRepo, "config", "diff.external", script);
+      const protectedDiff = gitDiff(isolatedRepo, { mode: "unstaged" });
+      expect(protectedDiff.diff).toContain("changed driver text");
+      expect(fs.existsSync(externalMarker)).toBe(false);
+      expect(fs.existsSync(textconvMarker)).toBe(false);
+
+      git(isolatedRepo, "config", "--unset", "diff.external");
+      const protectedTextconv = gitDiff(isolatedRepo, { mode: "unstaged" });
+      expect(protectedTextconv.diff).toContain("changed driver text");
+      expect(fs.existsSync(textconvMarker)).toBe(false);
     } finally {
       cleanup(isolatedRepo);
     }
@@ -338,5 +547,136 @@ describe("gitDiff pagination", () => {
     expect(srcDiff.diff).not.toContain("root_secret_leak.txt");
 
     git(repo, "reset", "--hard", "HEAD");
+  });
+
+  it("excludes sensitive descendants when a tracked file becomes a directory", () => {
+    const isolatedRepo = makeTmpDir("git-file-to-directory-collision");
+    try {
+      makeGitRepo(isolatedRepo);
+      write(isolatedRepo, "app/public", "safe original file content\n");
+      write(isolatedRepo, "src/positive.ts", "export const state = 'baseline';\n");
+      git(isolatedRepo, "add", "app/public", "src/positive.ts");
+      git(isolatedRepo, "commit", "-m", "file to directory baseline");
+
+      git(isolatedRepo, "rm", "app/public");
+      write(isolatedRepo, "app/public/.env", "FILE_TO_DIRECTORY_SECRET=not-a-rename\n");
+      write(isolatedRepo, "src/positive.ts", "export const state = 'src-positive-file-to-directory';\n");
+      git(isolatedRepo, "add", "-f", "app/public/.env");
+      git(isolatedRepo, "add", "src/positive.ts");
+
+      const inventory = git(isolatedRepo, "diff", "--cached", "--name-status", "-z", "--find-renames=1%");
+      expect(inventory.split("\0")).toEqual(
+        expect.arrayContaining(["D", "app/public", "A", "app/public/.env"]),
+      );
+      const diff = gitDiff(isolatedRepo, { mode: "staged" });
+      expect(diff.diff).toContain("src-positive-file-to-directory");
+      expect(diff.diff).not.toContain("FILE_TO_DIRECTORY_SECRET");
+    } finally {
+      cleanup(isolatedRepo);
+    }
+  });
+
+  it("excludes deleted sensitive descendants when a directory becomes a tracked file", () => {
+    const isolatedRepo = makeTmpDir("git-directory-to-file-collision");
+    try {
+      makeGitRepo(isolatedRepo);
+      write(isolatedRepo, "app/public/.env", "DIRECTORY_TO_FILE_SECRET=not-a-rename\n");
+      write(isolatedRepo, "src/positive.ts", "export const state = 'baseline';\n");
+      git(isolatedRepo, "add", "-f", "app/public/.env", "src/positive.ts");
+      git(isolatedRepo, "commit", "-m", "directory to file baseline");
+
+      git(isolatedRepo, "rm", "app/public/.env");
+      write(isolatedRepo, "app/public", "safe replacement file with unrelated content\n");
+      write(isolatedRepo, "src/positive.ts", "export const state = 'src-positive-directory-to-file';\n");
+      git(isolatedRepo, "add", "app/public", "src/positive.ts");
+
+      const inventory = git(isolatedRepo, "diff", "--cached", "--name-status", "-z", "--find-renames=1%");
+      expect(inventory.split("\0")).toEqual(
+        expect.arrayContaining(["A", "app/public", "D", "app/public/.env"]),
+      );
+      const diff = gitDiff(isolatedRepo, { mode: "staged" });
+      expect(diff.diff).toContain("src-positive-directory-to-file");
+      expect(diff.diff).not.toContain("DIRECTORY_TO_FILE_SECRET");
+    } finally {
+      cleanup(isolatedRepo);
+    }
+  });
+
+  it("keeps an allowed scoped child when its deleted ancestor is outside the requested scope", () => {
+    const isolatedRepo = makeTmpDir("git-scoped-allowed-child");
+    try {
+      makeGitRepo(isolatedRepo);
+      write(isolatedRepo, "app/public", "old ancestor outside the requested scope\n");
+      git(isolatedRepo, "add", "app/public");
+      git(isolatedRepo, "commit", "-m", "scoped child baseline");
+
+      git(isolatedRepo, "rm", "app/public");
+      write(isolatedRepo, "app/public/allowed.ts", "export const allowed = 'SCOPED_ALLOWED_CHILD';\n");
+      git(isolatedRepo, "add", "app/public/allowed.ts");
+
+      const inventory = git(isolatedRepo, "diff", "--cached", "--name-status", "-z", "--find-renames=1%");
+      expect(inventory.split("\0")).toEqual(
+        expect.arrayContaining(["D", "app/public", "A", "app/public/allowed.ts"]),
+      );
+      const diff = gitDiff(isolatedRepo, { mode: "staged", path: "app/public/allowed.ts" });
+      expect(diff.isRepo).toBe(true);
+      expect(diff.diff).toContain("SCOPED_ALLOWED_CHILD");
+      expect(diff.diff).not.toContain("old ancestor outside the requested scope");
+    } finally {
+      cleanup(isolatedRepo);
+    }
+  });
+
+  it("keeps nested workspace diffs when fifty unrelated repository paths change", () => {
+    const isolatedRepo = makeTmpDir("git-unrelated-exclusion-budget");
+    try {
+      makeGitRepo(isolatedRepo);
+      write(isolatedRepo, "app/allowed.ts", "export const allowed = 'baseline';\n");
+      for (let i = 0; i < 50; i++) {
+        write(isolatedRepo, `outside/file-${i}.txt`, `outside baseline ${i}\n`);
+      }
+      git(isolatedRepo, "add", "app", "outside");
+      git(isolatedRepo, "commit", "-m", "unrelated paths baseline");
+
+      write(isolatedRepo, "app/allowed.ts", "export const allowed = 'NESTED_ALLOWED_CHANGE';\n");
+      for (let i = 0; i < 50; i++) {
+        write(isolatedRepo, `outside/file-${i}.txt`, `OUTSIDE_UNRELATED_CHANGE_${i}\n`);
+      }
+      git(isolatedRepo, "add", "app", "outside");
+
+      const inventory = git(isolatedRepo, "diff", "--cached", "--name-only", "-z");
+      expect(inventory.split("\0").filter(Boolean)).toHaveLength(51);
+      const diff = gitDiff(path.join(isolatedRepo, "app"), { mode: "staged" });
+      expect(diff.isRepo).toBe(true);
+      expect(diff.diff).toContain("NESTED_ALLOWED_CHANGE");
+      expect(diff.diff).not.toContain("OUTSIDE_UNRELATED_CHANGE");
+      expect(diff.diff).not.toContain("outside/file-");
+    } finally {
+      cleanup(isolatedRepo);
+    }
+  });
+
+  it("fails closed when one positive path requires fifty sensitive descendant exclusions", () => {
+    const isolatedRepo = makeTmpDir("git-required-exclusion-budget");
+    try {
+      makeGitRepo(isolatedRepo);
+      write(isolatedRepo, "app/public", "safe original file content\n");
+      git(isolatedRepo, "add", "app/public");
+      git(isolatedRepo, "commit", "-m", "required exclusions baseline");
+
+      git(isolatedRepo, "rm", "app/public");
+      for (let i = 0; i < 50; i++) {
+        write(isolatedRepo, `app/public/.env.${i}`, `REQUIRED_EXCLUSION_SECRET_${i}=private\n`);
+      }
+      git(isolatedRepo, "add", "-f", "app/public");
+
+      const diff = gitDiff(isolatedRepo, { mode: "staged" });
+      expect(diff.diff).toBe("");
+      expect(diff.totalBytes).toBe(0);
+      expect(diff.returnedBytes).toBe(0);
+      expect(diff.hasMore).toBe(false);
+    } finally {
+      cleanup(isolatedRepo);
+    }
   });
 });

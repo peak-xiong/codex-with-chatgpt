@@ -6,7 +6,13 @@ import {
   installRuntime,
   runtimeCurrentPath,
 } from "../src/config/runtime-install.js";
-import { readSourceMetadata } from "../src/update/source-metadata.js";
+import {
+  collectSourceMetadata,
+  readSourceMetadata,
+  sanitizeRepository,
+  SOURCE_METADATA_FILENAME,
+  writeSourceMetadata,
+} from "../src/update/source-metadata.js";
 import { cleanup, git, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 const temporaryDirectories: string[] = [];
@@ -59,6 +65,57 @@ describe("checkGitUpdate", () => {
     expect(checkGitUpdate(local)).toMatchObject({ updateAvailable: true });
   });
 
+  it("does not treat an observed but unintegrated remote baseline as installed", () => {
+    const { local, remote } = createRemoteFixture();
+    const root = path.dirname(local);
+    const publisher = path.join(root, "publisher");
+    git(root, "clone", remote, publisher);
+    write(publisher, "remote-only.txt", "published before installation\n");
+    git(publisher, "add", "remote-only.txt");
+    git(publisher, "commit", "-m", "remote update before install");
+    git(publisher, "push", "origin", "main");
+    git(local, "fetch", "origin", "main");
+    git(local, "remote", "set-url", "origin", `file://${remote}`);
+
+    expect(fs.existsSync(path.join(local, ".git"))).toBe(true);
+    expect(git(local, "rev-parse", "--show-toplevel").trim()).toBe(local);
+    const metadata = collectSourceMetadata(local);
+    expect(metadata).toMatchObject({
+      repository: `file://${remote}`,
+      ref: "refs/heads/main",
+      baselineRemoteRevision: expect.stringMatching(/^[a-f0-9]{40}$/),
+    });
+    expect(metadata.baselineIncludedInRevision).toBe(false);
+    expect(metadata.revision).not.toBe(metadata.baselineRemoteRevision);
+    const installed = path.join(root, "installed-runtime");
+    fs.mkdirSync(installed);
+    writeSourceMetadata(installed, { ...metadata, baselineIncludedInRevision: null });
+    expect(checkGitUpdate(installed)).toBeNull();
+
+    writeSourceMetadata(installed, metadata);
+    expect(checkGitUpdate(installed)).toMatchObject({ updateAvailable: true });
+
+    const legacyMetadata = { ...metadata } as Record<string, unknown>;
+    delete legacyMetadata.baselineIncludedInRevision;
+    fs.writeFileSync(path.join(installed, SOURCE_METADATA_FILENAME), JSON.stringify(legacyMetadata));
+    expect(readSourceMetadata(installed)?.baselineIncludedInRevision).toBeNull();
+    expect(checkGitUpdate(installed)).toBeNull();
+  });
+
+  it("normalizes SSH and HTTP repository credentials idempotently", () => {
+    const scp = sanitizeRepository("git@github.com:owner/project.git");
+    expect(scp).toBe("ssh://git@github.com/owner/project.git");
+    expect(sanitizeRepository(scp)).toBe(scp);
+
+    const ssh = sanitizeRepository("ssh://git:password@github.com/owner/project.git?token=secret#fragment");
+    expect(ssh).toBe("ssh://git@github.com/owner/project.git");
+    expect(sanitizeRepository(ssh)).toBe(ssh);
+
+    const https = sanitizeRepository("https://user:password@github.com/owner/project.git?token=secret#fragment");
+    expect(https).toBe("https://github.com/owner/project.git");
+    expect(sanitizeRepository(https)).toBe(https);
+  });
+
   it("checks an installed non-git runtime from source metadata", () => {
     const root = makeTmpDir("installed-update");
     temporaryDirectories.push(root);
@@ -102,6 +159,7 @@ describe("checkGitUpdate", () => {
       repository: `file://${remote}`,
       ref: "refs/heads/main",
       baselineRemoteRevision: expect.stringMatching(/^[a-f0-9]{40}$/),
+      baselineIncludedInRevision: true,
       contentDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
     expect(checkGitUpdate(installed)).toMatchObject({ updateAvailable: false });
@@ -117,6 +175,7 @@ describe("checkGitUpdate", () => {
     git(source, "add", "local-only.txt");
     git(source, "commit", "-m", "local ahead");
     installRuntime({ stateRoot, checkoutRoot: source, homeDir, runner });
+    expect(readSourceMetadata(runtimeCurrentPath(stateRoot))?.baselineIncludedInRevision).toBe(true);
     expect(checkGitUpdate(runtimeCurrentPath(stateRoot))).toMatchObject({ updateAvailable: false });
 
     const publisher = path.join(root, "publisher");

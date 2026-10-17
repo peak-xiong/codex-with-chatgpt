@@ -19,6 +19,7 @@ export async function readMany(workspace: Workspace, input: z.infer<typeof readM
   }
   const items: ReadItem[] = [];
   const observedAt = new Date().toISOString();
+  workspace.ignoreRules.refresh();
   // Reserve metadata and one bounded error per remaining file.
   let budget = maxBytes - 256 - files.length * 80;
   for (const [index, file] of files.entries()) {
@@ -26,7 +27,7 @@ export async function readMany(workspace: Workspace, input: z.infer<typeof readM
     if (budget < 1024) item = { index, error: "BATCH_LIMIT_REACHED" };
     else {
       try {
-        item = { index, file: await workspace.readFile(file.path, {
+        item = { index, file: await workspace.readFileAfterIgnoreRefresh(file.path, {
           startLine: file.start_line, endLine: file.end_line, maxBytes: budget,
         }) };
         const bytes = Buffer.byteLength(JSON.stringify(item));

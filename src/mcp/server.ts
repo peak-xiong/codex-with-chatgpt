@@ -378,7 +378,8 @@ export function createMcpServer(ctx: McpContext): McpServer {
       title: "Read file",
       description:
         `Read a text file from the workspace with line-range pagination. Defaults to the first ` +
-        `400 lines; use start_line/end_line to page through large files. Sensitive files ` +
+        `400 lines; use start_line/end_line to page through files up to the 8 MiB scan limit. ` +
+        `A larger file or first requested line beyond the byte budget returns FILE_TOO_LARGE. Sensitive files ` +
         `(.env, keys, credentials) are always denied. ${UNTRUSTED_NOTE}`,
       inputSchema: {
         context_id: contextIdSchema,
@@ -437,7 +438,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
       title: "Search workspace",
       description:
         `Search file contents across the workspace (ripgrep when available). Returns matching ` +
-        `lines with file paths and line numbers. ${UNTRUSTED_NOTE}`,
+        `lines with file paths and line numbers; files above 2 MiB are skipped. ${UNTRUSTED_NOTE}`,
       inputSchema: {
         context_id: contextIdSchema,
         query: z.string().min(2).max(MAX_SEARCH_QUERY_LENGTH).describe("Text to search for (literal by default)"),
@@ -472,7 +473,7 @@ export function createMcpServer(ctx: McpContext): McpServer {
 
   server.registerTool("read_many", {
     title: "Read bounded files",
-    description: `Read up to 16 bounded file ranges in one call. Per-file failures are explicit; the reads are not an atomic snapshot. ${UNTRUSTED_NOTE}`,
+    description: `Read up to 16 bounded file ranges in one call. Text scans stop at 8 MiB; larger files or an oversized first requested line return FILE_TOO_LARGE. Per-file failures are explicit; the reads are not an atomic snapshot. ${UNTRUSTED_NOTE}`,
     inputSchema: {
       context_id: contextIdSchema, files: readManyFilesSchema,
       max_bytes: z.number().int().min(1024).max(READ_MANY_MAX_BYTES).default(READ_MANY_MAX_BYTES),

@@ -1,6 +1,5 @@
-import fs from "node:fs/promises";
-import { constants } from "node:fs";
 import { Workspace, WorkspaceError } from "./manager.js";
+import { openWorkspaceFile, SafeOpenError } from "./safe-open.js";
 
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 
@@ -32,12 +31,19 @@ const MEDIA_TYPES: Record<WorkspaceImageFormat, WorkspaceImageMediaType> = {
 
 export async function readWorkspaceImage(workspace: Workspace, requested: string): Promise<WorkspaceImage> {
   const { abs, rel } = workspace.resolve(requested);
-  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
-  let handle: Awaited<ReturnType<typeof fs.open>>;
+  let handle: Awaited<ReturnType<typeof openWorkspaceFile>>;
   try {
-    handle = await fs.open(abs, flags);
-  } catch {
-    throw new WorkspaceError("FILE_NOT_FOUND", `Image file not found: ${rel}`);
+    handle = await openWorkspaceFile(workspace.root, abs);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      throw new WorkspaceError("FILE_NOT_FOUND", `Image file not found: ${rel}`);
+    }
+    if (error instanceof SafeOpenError) {
+      if (error.reason === "NOT_A_FILE") throw new WorkspaceError("NOT_A_FILE", `Not a regular image file: ${rel}`);
+      throw new WorkspaceError("ACCESS_DENIED_SENSITIVE_FILE", "File identity changed while opening the workspace path.");
+    }
+    throw error;
   }
 
   try {

@@ -34,7 +34,7 @@ describe("sandbox isolation", () => {
 
     expect(
       ensureSandboxIsolation({ configPath, protectedStateRoot: path.join(dir, "state") }),
-    ).toEqual({ alreadyIsolated: true, removedRoots: 0, configPath });
+    ).toEqual({ alreadyIsolated: true, removedRoots: 0, configPath, rollback: null });
     expect(fs.existsSync(configPath)).toBe(false);
     cleanup(dir);
   });
@@ -181,31 +181,59 @@ describe("sandbox isolation", () => {
     cleanup(dir);
   });
 
-  it("restores an existing Codex config after a failed setup transaction", () => {
+  it("uses the config at the isolation write as its rollback preimage", () => {
     const dir = makeTmpDir("sandbox-rollback-existing");
     const stateRoot = path.join(dir, "state");
     const configPath = path.join(dir, "config.toml");
     const original = `[sandbox_workspace_write]\nwritable_roots = ["${toTomlPath(stateRoot)}"]\n`;
     fs.writeFileSync(configPath, original, { mode: 0o600 });
-    const snapshot = snapshotCodexConfig(configPath);
+    const earlySnapshot = snapshotCodexConfig(configPath);
+    expect(earlySnapshot.previous.kind).toBe("file");
 
-    ensureSandboxIsolation({ configPath, protectedStateRoot: stateRoot });
-    restoreCodexConfig(snapshot);
+    const independentlyEdited = `${original}\n[other]\nvalue = "independent edit"\n`;
+    fs.writeFileSync(configPath, independentlyEdited, { mode: 0o640 });
+    fs.chmodSync(configPath, 0o640);
 
-    expect(fs.readFileSync(configPath, "utf8")).toBe(original);
-    expect(fs.statSync(configPath).mode & 0o777).toBe(0o600);
+    const isolation = ensureSandboxIsolation({ configPath, protectedStateRoot: stateRoot });
+    expect(isolation.rollback).not.toBeNull();
+    restoreCodexConfig(isolation.rollback!);
+
+    expect(fs.readFileSync(configPath, "utf8")).toBe(independentlyEdited);
+    expect(fs.statSync(configPath).mode & 0o777).toBe(0o640);
     cleanup(dir);
   });
 
-  it("keeps a missing Codex config missing across snapshot and restore", () => {
+  it("does not create a rollback receipt for a missing config or remove a later independent file", () => {
     const dir = makeTmpDir("sandbox-rollback-missing");
     const configPath = path.join(dir, "config.toml");
-    const snapshot = snapshotCodexConfig(configPath);
 
-    ensureSandboxIsolation({ configPath, protectedStateRoot: path.join(dir, "state") });
-    restoreCodexConfig(snapshot);
+    const isolation = ensureSandboxIsolation({ configPath, protectedStateRoot: path.join(dir, "state") });
+    expect(isolation.rollback).toBeNull();
+    const independent = "[other]\nvalue = \"created independently\"\n";
+    fs.writeFileSync(configPath, independent);
 
-    expect(fs.existsSync(configPath)).toBe(false);
+    expect(fs.readFileSync(configPath, "utf8")).toBe(independent);
+    cleanup(dir);
+  });
+
+  it("preserves an independent edit made after isolation instead of overwriting it during rollback", () => {
+    const dir = makeTmpDir("sandbox-rollback-conflict");
+    const stateRoot = path.join(dir, "state");
+    const configPath = path.join(dir, "config.toml");
+    fs.writeFileSync(
+      configPath,
+      `[sandbox_workspace_write]\nwritable_roots = ["${toTomlPath(stateRoot)}"]\n`,
+      { mode: 0o600 },
+    );
+
+    const isolation = ensureSandboxIsolation({ configPath, protectedStateRoot: stateRoot });
+    const independent = "[other]\nvalue = \"changed after isolation\"\n";
+    fs.writeFileSync(configPath, independent, { mode: 0o640 });
+    fs.chmodSync(configPath, 0o640);
+
+    expect(() => restoreCodexConfig(isolation.rollback!)).toThrow(/preserving independent edits/);
+    expect(fs.readFileSync(configPath, "utf8")).toBe(independent);
+    expect(fs.statSync(configPath).mode & 0o777).toBe(0o640);
     cleanup(dir);
   });
 });

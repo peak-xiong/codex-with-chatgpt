@@ -5,9 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Workspace, WorkspaceError } from "../src/workspace/manager.js";
+import { IgnoreRulesError } from "../src/workspace/ignore.js";
 import { makeTmpDir, cleanup, write, git, makeGitRepo, isolateStateDir } from "./helpers.js";
 import { getProjectDataDir, getWorkspaceDataDir } from "../src/config/paths.js";
 import { projectDataDirectory, projectIdMetadataPath } from "../src/workspace/identity.js";
+import { readMany } from "../src/workspace/read-many.js";
 import { openControlRequest } from "../src/control/requests.js";
 import { saveExecutionOutput, listExecutionOutputs } from "../src/execution/output.js";
 import { appendExecutionRecord, readExecutionRecords } from "../src/execution/records.js";
@@ -201,6 +203,269 @@ describe("read_file pagination", () => {
 
   it("reports FILE_NOT_FOUND for missing files", async () => {
     await expect(ws.readFile("nope.txt")).rejects.toMatchObject({ code: "FILE_NOT_FOUND" });
+  });
+
+  it("preserves readline CRLF and bare-CR line semantics across chunk boundaries", async () => {
+    const boundaryLine = "a".repeat(65_535);
+    write(root, "newline-separators.txt", `${boundaryLine}\r\nsecond\rthird\nfourth`);
+    const bareCrLine = "b".repeat(65_535);
+    write(root, "bare-cr-boundary.txt", `${bareCrLine}\rnext`);
+    const utf8BoundaryLine = "c".repeat(65_535) + "中";
+    write(root, "utf8-boundary.txt", `${utf8BoundaryLine}\r\nlast`);
+
+    const whole = await ws.readFile("newline-separators.txt", { maxBytes: 100_000 });
+    expect(whole.totalLines).toBe(4);
+    expect(whole.content).toBe(`${boundaryLine}\nsecond\nthird\nfourth`);
+    const page = await ws.readFile("newline-separators.txt", {
+      startLine: 2,
+      endLine: 3,
+      maxBytes: 1024,
+    });
+    expect(page.totalLines).toBe(4);
+    expect(page.content).toBe("second\nthird");
+    expect(page.startLine).toBe(2);
+    expect(page.endLine).toBe(3);
+    expect(page.remainingLines).toBe(1);
+
+    const bareCr = await ws.readFile("bare-cr-boundary.txt", { maxBytes: 70_000 });
+    expect(bareCr.totalLines).toBe(2);
+    expect(bareCr.content).toBe(`${bareCrLine}\nnext`);
+    const utf8 = await ws.readFile("utf8-boundary.txt", { maxBytes: 70_000 });
+    expect(utf8.totalLines).toBe(2);
+    expect(utf8.content).toBe(`${utf8BoundaryLine}\nlast`);
+  });
+
+  it("stops scanning a first requested line once its chunk exceeds the byte budget", async () => {
+    const longLine = write(root, "oversized-line.txt", "x".repeat(2 * 1024 * 1024));
+    const originalOpen = fs.promises.open.bind(fs.promises);
+    let bytesRead = 0;
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      return new Proxy(handle, {
+        get(target, property) {
+          const value = Reflect.get(target, property, target) as unknown;
+          if (property === "read") {
+            return async (...readArgs: unknown[]) => {
+              const result = await Reflect.apply(value as (...values: unknown[]) => Promise<{ bytesRead: number }>, target, readArgs);
+              bytesRead += result.bytesRead;
+              return result;
+            };
+          }
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }) as Awaited<ReturnType<typeof fs.promises.open>>;
+    });
+    try {
+      await expect(ws.readFile("oversized-line.txt", { maxBytes: 1024 })).rejects.toMatchObject({
+        code: "FILE_TOO_LARGE",
+      });
+      expect(bytesRead).toBeLessThanOrEqual(8 * 1024 + 64 * 1024);
+      expect(fs.statSync(longLine).size).toBe(2 * 1024 * 1024);
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
+  it("rejects text scans above the fixed 8 MiB cap", async () => {
+    write(root, "scan-cap.txt", "x".repeat(8 * 1024 * 1024 + 1));
+    await expect(ws.readFile("scan-cap.txt")).rejects.toMatchObject({ code: "FILE_TOO_LARGE" });
+  });
+});
+
+describe("workspace state read isolation", () => {
+  it("denies Git metadata and project state for Git, linked, and non-Git workspaces", async () => {
+    const previousStateDir = process.env.C2C_STATE_DIR;
+    const stateDir = isolateStateDir();
+    const repo = makeTmpDir("internal-state-repo");
+    const linked = `${repo}-linked`;
+    const plain = makeTmpDir("internal-state-plain");
+    try {
+      makeGitRepo(repo);
+      git(repo, "worktree", "add", "-b", "internal-state-linked", linked);
+      const primaryWorkspace = new Workspace(repo);
+      const linkedWorkspace = new Workspace(linked);
+      const plainWorkspace = new Workspace(plain);
+      expect(projectDataDirectory(linked)).toBe(projectDataDirectory(repo));
+
+      const assertDenied = (workspace: Workspace, file: string): void => {
+        const aliases = [file, path.join(workspace.root, file)];
+        if (!path.isAbsolute(file)) {
+          aliases.push(`workspace:/${file}`, file.replace(/\\/g, "/").replace(/\//g, "\\"));
+        }
+        for (const requested of aliases) {
+          expect(() => workspace.resolve(requested, { allowSensitive: true })).toThrowError(
+            expect.objectContaining<Partial<WorkspaceError>>({ code: "ACCESS_DENIED_SENSITIVE_FILE" }),
+          );
+        }
+      };
+      const primaryData = path.join(projectDataDirectory(repo), "workspaces", primaryWorkspace.id, "execution.json");
+      const linkedData = path.join(projectDataDirectory(linked), "workspaces", linkedWorkspace.id, "execution.json");
+      const plainData = path.join(projectDataDirectory(plain), "workspaces", plainWorkspace.id, "execution.json");
+      fs.mkdirSync(path.dirname(primaryData), { recursive: true });
+      fs.mkdirSync(path.dirname(linkedData), { recursive: true });
+      fs.mkdirSync(path.dirname(plainData), { recursive: true });
+      fs.writeFileSync(primaryData, "private execution record");
+      fs.writeFileSync(linkedData, "private linked execution record");
+      fs.writeFileSync(plainData, "private plain execution record");
+
+      assertDenied(primaryWorkspace, path.relative(repo, primaryData));
+      assertDenied(primaryWorkspace, ".git/HEAD");
+      assertDenied(linkedWorkspace, linkedData);
+      assertDenied(plainWorkspace, path.relative(plain, plainData));
+      expect(() => primaryWorkspace.resolve("..notes.ts")).not.toThrow();
+      write(repo, "src/allowed.ts", "export const safe = true;\n");
+      await expect(primaryWorkspace.readFile("src/allowed.ts")).resolves.toMatchObject({
+        content: "export const safe = true;",
+      });
+    } finally {
+      cleanup(repo);
+      cleanup(linked);
+      cleanup(plain);
+      cleanup(stateDir);
+      if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+      else process.env.C2C_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it("denies the full separate Git metadata directory through reads and hides it from listings", async () => {
+    const previousStateDir = process.env.C2C_STATE_DIR;
+    const stateDir = isolateStateDir();
+    const repo = makeTmpDir("separate-git-dir");
+    try {
+      const gitMetadata = path.join(repo, "gitmeta");
+      git(repo, "init", "--separate-git-dir", gitMetadata, "-b", "main");
+      write(repo, "src/allowed.ts", "export const allowed = true;\n");
+      const workspace = new Workspace(repo);
+      expect(path.dirname(projectIdMetadataPath(repo)!)).toBe(gitMetadata);
+
+      const sentinel = path.join(
+        projectDataDirectory(repo), "workspaces", workspace.id, "execution-record.json",
+      );
+      write(repo, path.relative(repo, sentinel), "separate-git-execution-sentinel");
+      const relativeSentinel = path.relative(repo, sentinel);
+
+      await expect(workspace.readFile(relativeSentinel)).rejects.toMatchObject({
+        code: "ACCESS_DENIED_SENSITIVE_FILE",
+      });
+      expect(() => workspace.resolve("gitmeta/c2c-project-id", { allowSensitive: true })).toThrowError(
+        expect.objectContaining<Partial<WorkspaceError>>({ code: "ACCESS_DENIED_SENSITIVE_FILE" }),
+      );
+      const batch = await readMany(workspace, [
+        { path: relativeSentinel },
+        { path: "src/allowed.ts" },
+      ], 4096);
+      expect(batch.items).toMatchObject([
+        { index: 0, error: "ACCESS_DENIED_SENSITIVE_FILE" },
+        { index: 1, file: { path: "src/allowed.ts", content: "export const allowed = true;" } },
+      ]);
+
+      const listing = await workspace.listDirectory(".", { depth: 4, limit: 500 });
+      expect(listing.entries.map((entry) => entry.path)).toContain("src/allowed.ts");
+      expect(listing.entries.some((entry) => entry.path === "gitmeta/" || entry.path.startsWith("gitmeta/"))).toBe(false);
+      await expect(workspace.readFile("src/allowed.ts")).resolves.toMatchObject({
+        content: "export const allowed = true;",
+      });
+    } finally {
+      cleanup(repo);
+      cleanup(stateDir);
+      if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+      else process.env.C2C_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it("refreshes ignore rules per operation and preserves them when refresh fails", () => {
+    const root = makeTmpDir("ignore-refresh");
+    const previousStateDir = process.env.C2C_STATE_DIR;
+    const stateDir = isolateStateDir();
+    try {
+      write(root, ".c2cignore", "private/\n");
+      write(root, "private/notes.txt", "private");
+      write(root, "new-private.txt", "private");
+      const workspace = new Workspace(root);
+      expect(() => workspace.resolve("private/notes.txt")).toThrow();
+
+      write(root, ".c2cignore", "new-private.txt\n");
+      expect(() => workspace.resolve("private/notes.txt")).not.toThrow();
+      expect(() => workspace.resolve("new-private.txt")).toThrow();
+
+      const originalOpen = fs.openSync.bind(fs);
+      const openSpy = vi.spyOn(fs, "openSync").mockImplementation((filePath, flags, mode) => {
+        if (path.resolve(String(filePath)) === path.join(root, ".c2cignore")) {
+          throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+        }
+        return originalOpen(filePath, flags, mode);
+      });
+      try {
+        expect(() => workspace.resolve("private/notes.txt")).toThrow(IgnoreRulesError);
+        expect(workspace.ignoreRules.isSensitive("new-private.txt")).toBe(true);
+      } finally {
+        openSpy.mockRestore();
+      }
+    } finally {
+      cleanup(root);
+      cleanup(stateDir);
+      if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+      else process.env.C2C_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it("keeps existing rules when .c2cignore becomes a dangling symlink", () => {
+    const root = makeTmpDir("ignore-dangling-link");
+    const previousStateDir = process.env.C2C_STATE_DIR;
+    const stateDir = isolateStateDir();
+    try {
+      write(root, ".c2cignore", "private/\n");
+      write(root, "private/notes.txt", "private");
+      const workspace = new Workspace(root);
+      fs.unlinkSync(path.join(root, ".c2cignore"));
+      fs.symlinkSync("missing-rules", path.join(root, ".c2cignore"));
+
+      expect(() => workspace.resolve("private/notes.txt")).toThrow(IgnoreRulesError);
+      expect(workspace.ignoreRules.isSensitive("private/notes.txt")).toBe(true);
+    } finally {
+      cleanup(root);
+      cleanup(stateDir);
+      if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+      else process.env.C2C_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it("clears custom rules when .c2cignore is actually deleted", () => {
+    const root = makeTmpDir("ignore-deleted");
+    const previousStateDir = process.env.C2C_STATE_DIR;
+    const stateDir = isolateStateDir();
+    try {
+      write(root, ".c2cignore", "private/\n");
+      write(root, "private/notes.txt", "private");
+      const workspace = new Workspace(root);
+      fs.unlinkSync(path.join(root, ".c2cignore"));
+
+      expect(() => workspace.resolve("private/notes.txt")).not.toThrow();
+      expect(workspace.ignoreRules.isSensitive("private/notes.txt")).toBe(false);
+    } finally {
+      cleanup(root);
+      cleanup(stateDir);
+      if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+      else process.env.C2C_STATE_DIR = previousStateDir;
+    }
+  });
+
+  it("does not expose package metadata ignored by detectProject", () => {
+    const root = makeTmpDir("detect-project-ignore");
+    const previousStateDir = process.env.C2C_STATE_DIR;
+    const stateDir = isolateStateDir();
+    try {
+      write(root, ".c2cignore", "package.json\n");
+      write(root, "package.json", JSON.stringify({ scripts: { secret: "private command" } }));
+      const project = new Workspace(root).detectProject();
+      expect(project.projectType).toBe("node");
+      expect(project.scripts).toEqual({});
+    } finally {
+      cleanup(root);
+      cleanup(stateDir);
+      if (previousStateDir === undefined) delete process.env.C2C_STATE_DIR;
+      else process.env.C2C_STATE_DIR = previousStateDir;
+    }
   });
 });
 

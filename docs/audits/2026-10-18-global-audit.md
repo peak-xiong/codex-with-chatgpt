@@ -1,6 +1,40 @@
 # 2026-10-18 全仓审计
 
-本轮完成全仓静态审计和七组隔离复现，**全局质量验收未通过**。现有自动测试通过不能证明下列权限、脱敏和事务边界没有缺陷。本轮只修复待合并变更中的 Computer Use 成功终态恢复问题；其余发现保持开放，没有将审计请求扩大为全仓重构。
+本报告保留初次全仓审计及后续整改证据。初次审计发现 15 项问题，整改复核另发现 C2C-050；全部 16 项已修复并于 2026-10-18 通过代码与自动化验收。最终类型检查、构建和全量测试均退出 0，48 个文件、666 项通过。本轮没有部署或重新进行真实网页验收。
+
+## 整改实现与验收证据
+
+整改基于 `b33bfcdfe1e8cc01c8e545e7713335cacd8983fb`，继续使用唯一的 `codex/global-audit` 分支和原隔离工作树。实现按工作区访问、Git 读取、脱敏、配置事务和更新来源分别归属；没有改动控制终态的双观察屏障。
+
+| 问题 | 实现与回归 |
+| --- | --- |
+| C2C-035 | 从项目身份模块取得实际 Git common-dir 和内部状态根；普通读取强制拒绝，目录与两种搜索引擎复用同一可见性规则。覆盖普通、linked、non-Git 及 separate-git-dir 布局，执行记录仍由专用 scope/轮次门禁提供。 |
+| C2C-036、C2C-044 | inventory 保留全仓 rename 来源，过滤时转为 workspace 坐标，内容 pathspec 使用仓库根字面量语义；禁用 external diff/textconv。覆盖嵌套工作区、三种 diff mode、linked worktree、敏感及跨工作区 rename 和无害驱动 marker。 |
+| C2C-037、C2C-040 | logger 持有统一凭据脱敏规则，执行命令与输出复用；覆盖当前 MCP 令牌、URL 路径、结构化日志、JSON 引号/空白/转义与 shell 引号。短诊断码继续可读，私钥拒绝与输出限制保留。 |
+| C2C-038 | 仅在实际写配置时保存 preimage/postimage 并登记回滚；恢复前核对当前内容和权限，独立编辑冲突时保留并报错。公开 CLI 输出不含回滚快照。验证 helper 事务边界，完整 CLI 调用链另作静态核对。 |
+| C2C-039 | 共用 descriptor 安全打开模块，校验规范路径、父链及打开对象身份，再通过同一 descriptor 读取。覆盖叶子/祖先替换及打开后路径替换，文本、图片、Node 搜索和有界 JSON/ignore 读取共用。 |
+| C2C-041 | 每次操作刷新 ignore，批量读取复用本批规则；重复注册刷新旧实例。读取失败保留旧保护并拒绝；只有确认目录项实际不存在才清空，悬空链接不视为删除。 |
+| C2C-042 | 文本扫描上限 8 MiB，chunk 组装服从返回预算，首请求行超预算早停；保留精确数字行数和 LF/CRLF/bare-CR、跨 chunk UTF-8 语义。图片 10 MiB、Node 搜索单文件 2 MiB 仍有界。 |
+| C2C-043 | 区分 rg 成功、正常无匹配、执行错误及达到 limit 主动终止；诊断有界脱敏，regex 错误不再伪装为空结果。 |
+| C2C-045、C2C-046 | 安装元数据另存 baseline 祖先验证结果；旧元数据缺少证明时返回未知。SSH 保留连接用户名，移除密码及 HTTP 凭据，规范化往返幂等。 |
+| C2C-047 | 首次 token read-or-create 全部在同一锁内；双进程验证返回同一值，显式 rotate 仍强制更换。 |
+| C2C-048 | buildStage 清理移至发布 current 之前，清理故障不改变 current/launcher；注入清理失败回归。 |
+| C2C-049 | CLI 共用解析器支持独立值 `--scopes none`，拒绝与其他 scope 混用，缺省行为保留。集成模拟验证本地读取被拒，精确 Computer Use candidate/final 仍可完成、旧 context 撤销、下一轮保持独立 pending。 |
+| C2C-050 | 修复前两个文件/目录互换用例均复现敏感内容泄漏；修复后按批次强制排除可能重新进入的拒绝路径，相关敏感 rename 保留双端保护。独立复核发现的 scoped child 与无关修改预算回归已先复现再修复；必要排除超预算时拒绝返回，24 项 Git 测试及独立定向复核通过。 |
+
+定向原始日志和数字退出码保存在 `/tmp/c2c-global-closure/` 的 `config/`、`workspace/`、`git/`、`git-path-collision/`、`redaction-update/`、`zero-scope/`。工作区最终定向 6 个文件、105 项通过；Git 最终定向 24 项通过。配置、脱敏及更新改动已独立复核；最后三处访问/Git 修正也经定向独立复核，无剩余合并阻断。
+
+最终验收由 Luna tester 在隔离 `C2C_STATE_DIR=/tmp/c2c-global-closure/final/isolated-state` 中执行，未改变 `HOME` 或 `CODEX_HOME`：
+
+| 命令 | 真实退出状态 | 结果 |
+| --- | --- | --- |
+| `pnpm typecheck` | `status: 0, signal: null, error: null` | 类型检查通过。 |
+| `pnpm build` | `status: 0, signal: null, error: null` | 构建通过。 |
+| `pnpm exec vitest run --maxWorkers=1` | `status: 0, signal: null, error: null` | 48 个文件、666 项通过；Vitest 305.68 秒，子进程 306.190 秒。stderr 为空，无 worker timeout 或 unhandled error。 |
+
+原始 stdout/stderr 与每条命令的实际状态保存在 `final/commands.json`、`typecheck.result.json`、`build.result.json`、`full.result.json` 及对应日志。`runner-started.json`、`runner-completed.json` 记录完整生命周期，`freeze-before.json` / `freeze-after.json` 中 Git 源码和测试哈希一致；主代理直接核对这些文件及实际 diff。此前失败复现和中间日志不能替代这次最终成功证据。C2C-033 终态恢复、精确响应与跨会话隔离的既有回归也包含在本次全量中。
+
+读取并非编辑中的文件的原子快照。macOS 使用打开前后路径/对象身份校验；Linux 可用 procfs 时另核对 fd 路径。不承诺抵御所有恶意 ABA 或原地修改。零 scope 证据是自动化集成模拟，没有真实网页搜索。本轮不部署、重启网关或操作其他会话。
 
 ## 范围与证据
 
@@ -27,7 +61,9 @@
 
 源码责任仍由 `src/control/requests.ts` 持有；Gateway 只将中断重放路由回该责任模块。测试位于 `tests/control-terminal-recovery.test.ts`。
 
-## 开放问题
+## 初次审计发现与触发证据
+
+以下按发现时的版本保留触发条件和证据；当前实现状态见报告开头的整改记录，不能把历史代码描述当作当前源码行为。
 
 P1 表示应优先修复的权限、凭据或数据完整性问题；P2 表示有具体触发条件的正确性、可靠性或安全加固问题。优先级不是对真实账号已经受损的判断。
 
@@ -131,6 +167,12 @@ P1 表示应优先修复的权限、凭据或数据完整性问题；P2 表示�
 
 admin schema/broker 已支持空 scopes。最小修复：明确一个显式零 scope 的 CLI 输入并在同一解析器实现，更新帮助和文档；验证空权限不能读取仓库，同时能够完成纯网页研究工作流。
 
+### C2C-050 / P1：文件与目录互换时 diff 重新包含敏感路径
+
+**整改独立复核新增，初始为静态证据。** 此缺陷在 `b33bfcd` 已存在：Git 的 literal pathspec 仍递归匹配目录。若 HEAD 中的普通文件 `app/public` 被删除，并新增内容不同的 `app/public/.env`，inventory 会分别列出安全删除和敏感新增；只将安全路径传入内容 diff，仍会让 `:(top,literal)app/public` 匹配敏感后代。目录替换为文件也可能泄漏已删除的敏感内容，影响共用入口的 `git_diff` 和 `review_context`。
+
+修复要求：每个内容 batch 都保留 inventory 拒绝路径的强制排除，包括被拒 rename 的两个端点；不能让正向 pathspec 扩大已批准的集合。补文件到目录、目录到文件的回归，并保留合法修改正向覆盖。超出参数预算时应拒绝，不得删掉排除条件继续执行。
+
 ## 可选的结构简化
 
 以下是维护性方向，不作为已证实的运行缺陷或合并门禁。删除公开接口前必须核对外部消费者和升级影响。
@@ -138,13 +180,13 @@ admin schema/broker 已支持空 scopes。最小修复：明确一个显式零 s
 - `requests.ts` 的 terminal marker kind 只剩 `cancelled`，文件名/时间字段 helper 及 kind 条件分支可随相关修复收敛，避免保留没有第二种语义的泛化。
 - `result-schema.ts` 的 limits/factory 仅剩一套实际策略，可评估直接共享 schema 与常量；不能以少几行代码为由复制限制或删掉必要校验。
 - Gateway 的 `controlBindingForTurn` 未发现消费者；completion fence 的 Gateway 封装及 `commitSessionRoute` 当前只发现测试消费者。先核对公开导出与外部使用，再决定退役，不能仅因仓库内无生产引用就直接删除。
-- `Workspace.resolve` 的 `allowSensitive` 未发现当前消费者，属于可审查的绕过开关；`GitDiffOptions.path` 未实际参与实现，需澄清或移除未生效契约。
+- `Workspace.resolve` 的公开 `allowSensitive` 选项保留；本轮已明确它不能绕过 Git 元数据或内部状态拒绝规则。此前未生效的 `GitDiffOptions.path` 已实现为 workspace-relative scope，并保留第三参数调用方式。
 - surface 状态读路径会重写 machine/mirror，request 路径 helper 反复验证 migration marker，存在职责和 I/O 收敛空间。本轮没有性能 benchmark，不能声称某种改写必然提升延迟。
 
 ## 验收边界与后续顺序
 
 12 个 MCP 工具都已声明 `outputSchema`，成功结果使用 `structuredContent`；`read_many` 不再缺失输出架构。这是接口契约检查，不消除上面的访问边界问题。
 
-建议先修复 C2C-035 至 C2C-038，再处理文件打开/资源边界与其余正确性问题；每项沿现有责任模块收敛，避免引入第二套状态或权限判断。结构简化与相关修复一起完成，不另起无边界的重构。
+整改沿现有责任模块收敛：凭据规则由 logger 持有，安全打开由 descriptor helper 持有，路径可见性由 Workspace 持有，Git scope 与安全筛选各有明确语义。公开接口保留或扩展，不另起替代状态源或无边界的重构。其余可选简化不作为缺陷，也不声称已实施。
 
-本轮未验证 Windows 原生行为、全部文件系统竞态、真实账号攻击或新的网页端到端流程。七组临时探针不是长期回归测试；对应修复应补入项目测试。合并当前变更也不代表这 15 项开放问题已经解决。
+本轮未验证 Windows 原生行为、全部文件系统竞态、真实账号攻击或新的网页端到端流程。原七组临时探针用于记录发现，本轮对应修复已补入项目回归；定向通过与最终全量结果分别记录，不将自动测试扩大解释为所有运行环境均已验收。

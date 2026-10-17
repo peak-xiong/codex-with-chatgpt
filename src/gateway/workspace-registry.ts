@@ -412,7 +412,10 @@ export class WorkspaceRegistry {
     const existing = [...this.entries.values()].find((entry) =>
       sameFingerprint(entry.fingerprint, fingerprint)
     );
-    if (existing) return existing.registration;
+    if (existing) {
+      existing.registration.workspace.ignoreRules.refresh();
+      return existing.registration;
+    }
 
     const collision = this.entries.get(workspace.id);
     if (collision) {

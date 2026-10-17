@@ -131,14 +131,19 @@ describe("workspace registry", () => {
     }
   });
 
-  it("is idempotent for the same canonical checkout", () => {
+  it("is idempotent for the same canonical checkout and refreshes its ignore rules", () => {
     const root = makeTmpDir("registry-idempotent");
     try {
+      write(root, ".c2cignore", "first-private.txt\n");
       const broker = new TurnCapabilityBroker();
       const registry = new WorkspaceRegistry(broker);
       const first = registry.register(root);
+      expect(() => first.workspace.resolve("first-private.txt")).toThrow();
+      write(root, ".c2cignore", "second-private.txt\n");
       const second = registry.register(root);
       expect(second).toBe(first);
+      expect(() => first.workspace.resolve("first-private.txt")).not.toThrow();
+      expect(() => first.workspace.resolve("second-private.txt")).toThrow();
       expect(Object.isFrozen(first.workspace)).toBe(true);
       expect(registry.size).toBe(1);
     } finally {

@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import path from "node:path";
 import { IgnoreRules } from "./ignore.js";
 
 export interface GitCommandResult {
@@ -86,12 +87,50 @@ export interface GitStatusResult {
   hidden: { changes: number; conflicts: number };
 }
 
-export function gitStatus(target: GitTarget): GitStatusResult {
+interface WorkspaceGitContext {
+  repoRoot: string | null;
+  workspacePrefix: string;
+  ignoreRules: IgnoreRules;
+}
+
+function workspaceGitContext(target: GitTarget): WorkspaceGitContext {
   const root = typeof target === "string" ? target : target.root;
-  const ignoreRules =
-    typeof target === "object" && target.ignoreRules
-      ? target.ignoreRules
-      : new IgnoreRules(root);
+  const existingRules = typeof target === "object" ? target.ignoreRules : undefined;
+  const ignoreRules = existingRules ?? new IgnoreRules(root);
+  if (existingRules) ignoreRules.refresh();
+
+  const topLevel = runGit(root, ["rev-parse", "--show-toplevel"]);
+  const prefix = runGit(root, ["rev-parse", "--show-prefix"]);
+  return {
+    repoRoot: topLevel.ok ? topLevel.stdout.trim() : null,
+    workspacePrefix: prefix.ok ? prefix.stdout.trim().replace(/\/+$/, "") : "",
+    ignoreRules,
+  };
+}
+
+function toWorkspacePath(repositoryPath: string, workspacePrefix: string): string | null {
+  if (!workspacePrefix) return repositoryPath;
+  const prefix = `${workspacePrefix}/`;
+  return repositoryPath.startsWith(prefix) ? repositoryPath.slice(prefix.length) : null;
+}
+
+function normalizeWorkspaceScope(scope: string | undefined): string | undefined | null {
+  if (scope === undefined || scope === "") return undefined;
+  const normalized = path.posix.normalize(scope.replace(/\\/g, "/"));
+  if (normalized === ".") return undefined;
+  if (
+    normalized === ".." ||
+    normalized.startsWith("../") ||
+    path.posix.isAbsolute(normalized) ||
+    normalized.includes("\0")
+  ) {
+    return null;
+  }
+  return normalized;
+}
+
+export function gitStatus(target: GitTarget): GitStatusResult {
+  const context = workspaceGitContext(target);
   const empty: GitStatusResult = {
     isRepo: false,
     branch: null,
@@ -104,7 +143,10 @@ export function gitStatus(target: GitTarget): GitStatusResult {
     conflicted: [],
     hidden: { changes: 0, conflicts: 0 },
   };
-  const result = runGit(root, ["status", "--porcelain=v2", "--branch", "-z", "--", "."]);
+  if (!context.repoRoot) return empty;
+  const result = runGit(context.repoRoot, [
+    "status", "--porcelain=v2", "--branch", "-z",
+  ]);
   if (!result.ok) return empty;
   const out: GitStatusResult = { ...empty, isRepo: true };
   const records = result.stdout.split("\0");
@@ -124,12 +166,20 @@ export function gitStatus(target: GitTarget): GitStatusResult {
       const isRename = record.startsWith("2 ");
       const parts = record.split(" ");
       const xy = parts[1];
-      const filePath = parts.slice(isRename ? 9 : 8).join(" ");
-      const originalPath = isRename ? records[++i] ?? "" : "";
+      const repositoryPath = parts.slice(isRename ? 9 : 8).join(" ");
+      const originalRepositoryPath = isRename ? records[++i] ?? "" : "";
+      const filePath = toWorkspacePath(repositoryPath, context.workspacePrefix);
+      const originalPath = isRename
+        ? toWorkspacePath(originalRepositoryPath, context.workspacePrefix)
+        : "";
+      if (filePath === null || (isRename && originalPath === null)) {
+        if (filePath !== null || (isRename && originalPath !== null)) out.hidden.changes++;
+        continue;
+      }
       const displayPath = isRename ? `${filePath} -> ${originalPath}` : filePath;
       if (
-        ignoreRules.isSensitive(filePath) ||
-        (isRename && ignoreRules.isSensitive(originalPath))
+        context.ignoreRules.isSensitive(filePath) ||
+        (isRename && context.ignoreRules.isSensitive(originalPath!))
       ) {
         out.hidden.changes++;
         continue;
@@ -139,13 +189,15 @@ export function gitStatus(target: GitTarget): GitStatusResult {
       if (x !== ".") out.staged.push({ path: displayPath, change: x });
       if (y !== ".") out.unstaged.push({ path: displayPath, change: y });
     } else if (record.startsWith("? ")) {
-      const filePath = record.slice(2);
-      if (ignoreRules.isSensitive(filePath)) out.hidden.changes++;
+      const filePath = toWorkspacePath(record.slice(2), context.workspacePrefix);
+      if (filePath === null) continue;
+      if (context.ignoreRules.isSensitive(filePath)) out.hidden.changes++;
       else out.untracked.push(filePath);
     } else if (record.startsWith("u ")) {
       const parts = record.split(" ");
-      const filePath = parts.slice(10).join(" ");
-      if (ignoreRules.isSensitive(filePath)) out.hidden.conflicts++;
+      const filePath = toWorkspacePath(parts.slice(10).join(" "), context.workspacePrefix);
+      if (filePath === null) continue;
+      if (context.ignoreRules.isSensitive(filePath)) out.hidden.conflicts++;
       else out.conflicted.push(filePath);
     }
   }
@@ -185,26 +237,51 @@ function getDiffModeArgs(mode: DiffMode): string[] {
   return [];
 }
 
-function chunkSafePaths(paths: string[], maxCount = 50, maxBytes = 32 * 1024): string[][] {
-  const batches: string[][] = [];
-  let currentBatch: string[] = [];
-  let currentBytes = 0;
+const MAX_DIFF_PATHSPEC_COUNT = 50;
+const MAX_DIFF_PATHSPEC_BYTES = 32 * 1024;
 
-  for (const p of paths) {
-    const pBytes = Buffer.byteLength(p, "utf8") + 12; // overhead for ":(literal)"
-    if (
-      currentBatch.length > 0 &&
-      (currentBatch.length >= maxCount || currentBytes + pBytes > maxBytes)
-    ) {
-      batches.push(currentBatch);
-      currentBatch = [];
-      currentBytes = 0;
+function pathspecsFitBudget(pathspecs: string[]): boolean {
+  return pathspecs.length <= MAX_DIFF_PATHSPEC_COUNT &&
+    pathspecs.reduce((total, spec) => total + Buffer.byteLength(spec, "utf8") + 1, 0) <=
+      MAX_DIFF_PATHSPEC_BYTES;
+}
+
+function chunkSafePaths(
+  paths: string[],
+  rejectedPathGroups: string[][],
+  outOfScopePaths: string[],
+): string[][] | null {
+  const batches: string[][] = [];
+  let positivePathspecs: string[] = [];
+  let excludedPathspecs = new Set<string>();
+
+  for (const filePath of paths) {
+    // Literal pathspecs can include descendants, but cannot include ancestors.
+    const exclusions = new Set(
+      outOfScopePaths.filter((excludedPath) => isPathInScope(excludedPath, filePath)),
+    );
+    for (const group of rejectedPathGroups) {
+      if (group.some((excludedPath) => isPathInScope(excludedPath, filePath))) {
+        // Keep both endpoints of a safety-rejected rename out of the diff.
+        for (const excludedPath of group) exclusions.add(excludedPath);
+      }
     }
-    currentBatch.push(p);
-    currentBytes += pBytes;
+    const positivePathspec = `:(top,literal)${filePath}`;
+    const requiredExclusions = [...exclusions].map(
+      (excludedPath) => `:(top,exclude,literal)${excludedPath}`,
+    );
+    let nextExclusions = new Set([...excludedPathspecs, ...requiredExclusions]);
+    if (!pathspecsFitBudget([...positivePathspecs, positivePathspec, ...nextExclusions])) {
+      if (!pathspecsFitBudget([positivePathspec, ...requiredExclusions])) return null;
+      batches.push([...positivePathspecs, ...excludedPathspecs]);
+      positivePathspecs = [];
+      nextExclusions = new Set(requiredExclusions);
+    }
+    positivePathspecs.push(positivePathspec);
+    excludedPathspecs = nextExclusions;
   }
-  if (currentBatch.length > 0) {
-    batches.push(currentBatch);
+  if (positivePathspecs.length > 0) {
+    batches.push([...positivePathspecs, ...excludedPathspecs]);
   }
   return batches;
 }
@@ -219,28 +296,37 @@ export function gitDiff(
   opts: GitDiffOptions = {},
   relPath?: string
 ): GitDiffResult {
-  const root = typeof target === "string" ? target : target.root;
-  const ignoreRules =
-    typeof target === "object" && target.ignoreRules
-      ? target.ignoreRules
-      : new IgnoreRules(root);
+  const context = workspaceGitContext(target);
 
   const mode = opts.mode ?? "unstaged";
   const offset = Math.max(0, Math.floor(opts.offset ?? 0));
   const maxBytes = Math.min(256 * 1024, Math.max(1024, Math.floor(opts.maxBytes ?? 64 * 1024)));
   const modeArgs = getDiffModeArgs(mode);
+  const requestedScope = normalizeWorkspaceScope(opts.path ?? relPath);
+  if (!context.repoRoot || requestedScope === null) {
+    return {
+      isRepo: context.repoRoot !== null,
+      mode,
+      totalBytes: 0,
+      offset: 0,
+      returnedBytes: 0,
+      hasMore: false,
+      nextOffset: null,
+      diff: "",
+    };
+  }
 
-  // 1. Full-workspace inventory using NUL separation and global rename detection
+  // Keep rename provenance across workspace and requested-path boundaries.
   const listArgs = [
     "diff",
+    "--no-ext-diff",
+    "--no-textconv",
     "--name-status",
     "-z",
     "--find-renames=1%",
     ...modeArgs,
-    "--",
-    ".",
   ];
-  const listResult = runGit(root, listArgs);
+  const listResult = runGit(context.repoRoot, listArgs);
   if (!listResult.ok) {
     return {
       isRepo: false,
@@ -255,7 +341,9 @@ export function gitDiff(
   }
 
   const tokens = listResult.stdout.split("\0");
-  const safePaths: string[] = [];
+  const safePaths = new Set<string>();
+  const rejectedPathGroups: string[][] = [];
+  const outOfScopePaths = new Set<string>();
   for (let i = 0; i < tokens.length; ) {
     const status = tokens[i++];
     if (!status) break;
@@ -263,27 +351,43 @@ export function gitDiff(
       const oldPath = tokens[i++];
       const newPath = tokens[i++];
       if (oldPath && newPath) {
-        // Layer 1: Security - EITHER side sensitive -> completely unsafe
-        const isSafe = !ignoreRules.isSensitive(oldPath) && !ignoreRules.isSensitive(newPath);
-        // Layer 2: Scope - EITHER side in scope -> relevant
-        const isRelevant = isPathInScope(oldPath, relPath) || isPathInScope(newPath, relPath);
-        if (isSafe && isRelevant) {
-          safePaths.push(oldPath, newPath);
+        const oldWorkspacePath = toWorkspacePath(oldPath, context.workspacePrefix);
+        const newWorkspacePath = toWorkspacePath(newPath, context.workspacePrefix);
+        const isSafe = oldWorkspacePath !== null && newWorkspacePath !== null &&
+          !context.ignoreRules.isSensitive(oldWorkspacePath) &&
+          !context.ignoreRules.isSensitive(newWorkspacePath);
+        const isRelevant = requestedScope === undefined ||
+          (oldWorkspacePath !== null && isPathInScope(oldWorkspacePath, requestedScope)) ||
+          (newWorkspacePath !== null && isPathInScope(newWorkspacePath, requestedScope));
+        if (!isSafe) {
+          rejectedPathGroups.push([oldPath, newPath]);
+        } else if (isRelevant) {
+          safePaths.add(oldPath);
+          safePaths.add(newPath);
+        } else {
+          outOfScopePaths.add(oldPath);
+          outOfScopePaths.add(newPath);
         }
       }
     } else {
       const filePath = tokens[i++];
       if (filePath) {
-        const isSafe = !ignoreRules.isSensitive(filePath);
-        const isRelevant = isPathInScope(filePath, relPath);
-        if (isSafe && isRelevant) {
-          safePaths.push(filePath);
+        const workspacePath = toWorkspacePath(filePath, context.workspacePrefix);
+        const isSafe = workspacePath !== null && !context.ignoreRules.isSensitive(workspacePath);
+        const isRelevant = requestedScope === undefined ||
+          (workspacePath !== null && isPathInScope(workspacePath, requestedScope));
+        if (!isSafe) {
+          rejectedPathGroups.push([filePath]);
+        } else if (isRelevant) {
+          safePaths.add(filePath);
+        } else {
+          outOfScopePaths.add(filePath);
         }
       }
     }
   }
 
-  if (safePaths.length === 0) {
+  if (safePaths.size === 0) {
     return {
       isRepo: true,
       mode,
@@ -297,22 +401,40 @@ export function gitDiff(
   }
 
   // 2. Fetch diffs for safe paths in bounded batches (path count + argv bytes)
-  const batches = chunkSafePaths(safePaths);
+  const rejectedPaths = new Set(rejectedPathGroups.flat());
+  const batches = chunkSafePaths(
+    [...safePaths].filter((filePath) => !rejectedPaths.has(filePath)),
+    rejectedPathGroups,
+    [...outOfScopePaths],
+  );
+  if (!batches) {
+    return {
+      isRepo: false,
+      mode,
+      totalBytes: 0,
+      offset: 0,
+      returnedBytes: 0,
+      hasMore: false,
+      nextOffset: null,
+      diff: "",
+    };
+  }
   let combinedDiff = "";
   let totalAggregateBytes = 0;
   const MAX_AGGREGATE_DIFF_BYTES = 64 * 1024 * 1024;
 
-  for (const batch of batches) {
-    const pathspecs = batch.map((p) => `:(literal)${p}`);
+  for (const pathspecs of batches) {
     const diffArgs = [
       "diff",
+      "--no-ext-diff",
+      "--no-textconv",
       "--no-color",
       "--find-renames=1%",
       ...modeArgs,
       "--",
       ...pathspecs,
     ];
-    const diffResult = runGit(root, diffArgs);
+    const diffResult = runGit(context.repoRoot, diffArgs);
     if (!diffResult.ok) {
       // Fail closed on any batch error: never return partial silent success
       return {

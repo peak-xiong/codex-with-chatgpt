@@ -1,6 +1,7 @@
 import ignore, { type Ignore } from "ignore";
 import fs from "node:fs";
 import path from "node:path";
+import { openWorkspaceFileSync, readDescriptorBoundedSync } from "./safe-open.js";
 
 /**
  * Files that must never be readable through MCP, regardless of user config.
@@ -35,6 +36,8 @@ export const SENSITIVE_PATTERNS: string[] = [
   "*.keychain-db",
   ".cloudflared/",
   ".codex-with-chatgpt/",
+  ".git",
+  ".git/**",
   "credentials.json",
   "service-account*.json",
   "secrets.json",
@@ -42,6 +45,15 @@ export const SENSITIVE_PATTERNS: string[] = [
   "Cookies",
   ".c2c-secrets*",
 ];
+
+const MAX_C2CIGNORE_BYTES = 1024 * 1024;
+
+export class IgnoreRulesError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IgnoreRulesError";
+  }
+}
 
 /** High-noise directories excluded from listing/search by default. */
 export const NOISE_PATTERNS: string[] = [
@@ -82,13 +94,45 @@ export class IgnoreRules {
     this.sensitive = ignore().add(SENSITIVE_PATTERNS);
     this.noise = ignore().add(NOISE_PATTERNS);
     this.custom = ignore();
-    const c2cignore = path.join(workspaceRoot, ".c2cignore");
+    this.workspaceRoot = workspaceRoot;
+    this.refresh();
+  }
+
+  private readonly workspaceRoot: string;
+
+  /** Reload custom rules once at the start of an authorized workspace operation. */
+  refresh(): void {
+    const c2cignore = path.join(this.workspaceRoot, ".c2cignore");
+    let fd: number;
     try {
-      if (fs.existsSync(c2cignore)) {
-        this.custom.add(fs.readFileSync(c2cignore, "utf8"));
+      fd = openWorkspaceFileSync(this.workspaceRoot, c2cignore);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        try {
+          fs.lstatSync(c2cignore);
+        } catch (statError) {
+          if ((statError as NodeJS.ErrnoException).code === "ENOENT") {
+            this.custom = ignore();
+            return;
+          }
+        }
       }
-    } catch {
-      // unreadable .c2cignore: fall back to defaults only
+      throw new IgnoreRulesError("Unable to refresh .c2cignore; the previous protection rules remain active.");
+    }
+
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.size > MAX_C2CIGNORE_BYTES) {
+        throw new IgnoreRulesError(".c2cignore is not a bounded regular file; the previous protection rules remain active.");
+      }
+      const content = readDescriptorBoundedSync(fd, MAX_C2CIGNORE_BYTES).toString("utf8");
+      const next = ignore().add(content);
+      this.custom = next;
+    } catch (error) {
+      if (error instanceof IgnoreRulesError) throw error;
+      throw new IgnoreRulesError("Unable to refresh .c2cignore; the previous protection rules remain active.");
+    } finally {
+      fs.closeSync(fd);
     }
   }
 

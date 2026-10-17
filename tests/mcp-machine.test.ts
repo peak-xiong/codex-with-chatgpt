@@ -12,7 +12,8 @@ import { nullLogger } from "../src/logger/index.js";
 import { createMcpServer } from "../src/mcp/server.js";
 import { readManyOutputSchema } from "../src/mcp/server.js";
 import { Workspace } from "../src/workspace/manager.js";
-import { cleanup, isolateStateDir, makeTmpDir, projectSelection, write } from "./helpers.js";
+import { projectDataDirectory } from "../src/workspace/identity.js";
+import { cleanup, isolateStateDir, makeGitRepo, makeTmpDir, projectSelection, write } from "./helpers.js";
 
 const cleanups: string[] = [];
 
@@ -153,6 +154,67 @@ describe("machine MCP capability correlation", () => {
       expect(diff.isError).not.toBe(true);
       expect(diff.structuredContent).toMatchObject({ atomicSnapshot: false, execution: null, diff: { isRepo: false } });
     } finally { await connection.close(); }
+  });
+
+  it("scopes read_file/read_many and rejects Git state while allowing source reads", async () => {
+    cleanups.push(isolateStateDir());
+    const root = makeTmpDir("mcp-workspace-read-boundary");
+    cleanups.push(root);
+    makeGitRepo(root);
+    write(root, "src/allowed.ts", "export const safe = true;\n");
+    const gateway = new MachineGateway();
+    const registration = gateway.registerWorkspace(root);
+    const stateFile = path.join(
+      projectDataDirectory(root), "workspaces", registration.workspaceId, "execution-record.json",
+    );
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(stateFile, "private execution record");
+    const statePath = path.relative(root, stateFile).split(path.sep).join("/");
+
+    const readTurn = correlation();
+    const readRequest = openControlRequest(registration.workspaceId, readTurn);
+    const readGrant = gateway.issueTurn({ ...registration, ...readTurn, requestId: readRequest.requestId,
+      scopes: ["workspace.read"], compactionEpoch: 0, generation: 1 });
+    const executionTurn = { ...correlation(), localSessionId: "session-execution-only", taskId: "task-execution-only" };
+    const executionRequest = openControlRequest(registration.workspaceId, executionTurn);
+    const executionGrant = gateway.issueTurn({ ...registration, ...executionTurn, requestId: executionRequest.requestId,
+      scopes: ["execution.read"], compactionEpoch: 0, generation: 1 });
+    const connection = await connectedClient(gateway);
+    try {
+      const source = await connection.client.callTool({
+        name: "read_file", arguments: { context_id: readGrant.token, path: "src/allowed.ts" },
+      });
+      expect(source.isError).not.toBe(true);
+      expect(source.structuredContent).toMatchObject({ content: "export const safe = true;" });
+
+      const gitMetadata = await connection.client.callTool({
+        name: "read_file", arguments: { context_id: readGrant.token, path: ".git/HEAD" },
+      });
+      expect(gitMetadata.isError).toBe(true);
+      expect(JSON.stringify(gitMetadata)).toContain("ACCESS_DENIED_SENSITIVE_FILE");
+
+      const batch = await connection.client.callTool({
+        name: "read_many", arguments: { context_id: readGrant.token, files: [
+          { path: statePath }, { path: "src/allowed.ts" },
+        ] },
+      });
+      expect(batch.isError).not.toBe(true);
+      expect(readManyOutputSchema.parse(batch.structuredContent)).toMatchObject({ items: [
+        { index: 0, error: "ACCESS_DENIED_SENSITIVE_FILE" },
+        { index: 1, file: { content: "export const safe = true;" } },
+      ] });
+
+      for (const name of ["read_file", "read_many"] as const) {
+        const args = name === "read_file"
+          ? { context_id: executionGrant.token, path: "src/allowed.ts" }
+          : { context_id: executionGrant.token, files: [{ path: "src/allowed.ts" }] };
+        const denied = await connection.client.callTool({ name, arguments: args });
+        expect(denied.isError).toBe(true);
+        expect(JSON.stringify(denied)).toContain("SCOPE_DENIED");
+      }
+    } finally {
+      await connection.close();
+    }
   });
 
   it("reads bounded image content under the workspace capability and rejects unsafe paths and sizes", async () => {

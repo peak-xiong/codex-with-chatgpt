@@ -92,13 +92,28 @@ The following are rejected:
 - `..` traversal outside the root.
 - Absolute paths that are outside the root.
 - Symlinks whose resolved target escapes the root.
-- NUL/control characters and malformed path input.
+- NUL characters and malformed path input.
 - Requests after the registration has been revoked.
 
 The workspace root is selected by the local `cwd`; ChatGPT cannot choose a
 different root by passing a path in a tool argument. Workspace-scoped CLI
 commands apply the same rule: an optional `-w` must resolve to the exact
 current `cwd`, so it cannot register or operate on another local path.
+
+Git metadata and C2C's repository-local state are denied to ordinary workspace
+reads, including canonical aliases of the internal state directory. Execution
+records remain available only through their scoped, exact-turn tools.
+
+Text, image and Node-search reads validate the opened descriptor against the
+canonical path and parent identities, then read from that same descriptor.
+Changed identities fail closed. These reads are not atomic snapshots of files
+being edited in place. Text reads scan at most 8 MiB and reject larger files;
+within that limit, line totals and pagination remain exact. Image and Node-search
+limits remain 10 MiB and 2 MiB per file respectively.
+
+Custom `.c2cignore` rules refresh at operation boundaries. An unreadable or
+invalid policy prevents the operation rather than silently dropping protection.
+Git diff reads explicitly disable external diff and textconv drivers.
 
 ## Capability security
 
@@ -120,8 +135,8 @@ is rejected before workspace access.
 The broker gives each claim an activity lease. MCP calls renew the lease while
 running and release it even on errors. Computer Use results must match the exact
 tab, chat, generation, response, request, phase, and schema before the request
-is closed. The retained mailbox completion fence is inactive in production and
-remains tested for later comparison.
+is closed. The host records a result candidate first, then requires a separate
+matching final observation with completion evidence before delivering it.
 
 ## Result integrity
 
@@ -140,12 +155,15 @@ tabId + chatUrl + generation + responseId
 
 The allowed payload is phase-specific (`RESEARCH`, `PLAN`, `REVIEW`, `DONE`, or
 `BLOCKED`) and size bounded. A request is one-shot. An already-open request is
-not overwritten with a new token. Mailbox callback code and historical data are
-retained but the callback tools are not registered by the production MCP server.
+not overwritten with a new token. Mailbox callbacks, progress and acknowledgment
+operations are retired; there is no MCP result-write scope.
 
-Mailbox markers use separate pending, result, acknowledgement, cancellation,
-and active-lease records. Lifecycle writes use file locking and exact schema
-checks. Terminal records are retained only for bounded cleanup and audit.
+Control requests, page observations, cancellation markers and active leases
+live under `control-requests/<workspaceId>`. Lifecycle writes use file locking
+and exact schema checks. Only complete, validated Computer Use observations are
+eligible for legacy migration; mailbox callback results are never imported.
+Legacy cleanup is explicit and confined to the registered workspace. Terminal
+records are retained only for bounded cleanup and audit.
 
 ## Browser isolation
 
@@ -201,7 +219,7 @@ Mutable project data is kept inside the repository boundary: Git checkouts use
 `<git-common-dir>/codex-with-chatgpt`, while non-Git workspaces use
 `<workspace-root>/.codex-with-chatgpt`. Shared project metadata is separated
 from checkout-specific session routes and execution records under
-`workspaces/<workspaceId>/`. The authoritative mailbox, runtime installations,
+`workspaces/<workspaceId>/`. The authoritative control requests, runtime installations,
 the recorded public endpoint and bearer token, the machine association id,
 surface ownership index, gateway ownership records, machine identity, lifecycle
 locks and logs remain in protected machine state. The

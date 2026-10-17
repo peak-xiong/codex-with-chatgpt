@@ -69,9 +69,13 @@ function readAuthFile(): HttpAuthState | null {
  * an existing installation keeps working without a migration step.
  */
 export function requireHttpAuthToken(): HttpAuthState {
-  const existing = readAuthFile();
-  if (existing) return existing;
-  return rotateHttpAuthToken();
+  const directory = ensureDir(authDirectory());
+  const lockFile = path.join(directory, "auth.lock");
+  return withFileLock(lockFile, () => {
+    const existing = readAuthFile();
+    if (existing) return existing;
+    return writeNewToken(null);
+  });
 }
 
 /** Issue a fresh token, invalidating the previous one. */
@@ -79,17 +83,20 @@ export function rotateHttpAuthToken(): HttpAuthState {
   const directory = ensureDir(authDirectory());
   const lockFile = path.join(directory, "auth.lock");
   return withFileLock(lockFile, () => {
-    const previous = readAuthFile();
-    const now = new Date().toISOString();
-    const next = authFileSchema.parse({
-      schemaVersion: 1,
-      token: newToken(),
-      createdAt: previous?.createdAt ?? now,
-      ...(previous ? { rotatedAt: now } : {}),
-    });
-    writeSecureJson(httpAuthFile(), next);
-    return next;
+    return writeNewToken(readAuthFile());
   });
+}
+
+function writeNewToken(previous: HttpAuthState | null): HttpAuthState {
+  const now = new Date().toISOString();
+  const next = authFileSchema.parse({
+    schemaVersion: 1,
+    token: newToken(),
+    createdAt: previous?.createdAt ?? now,
+    ...(previous ? { rotatedAt: now } : {}),
+  });
+  writeSecureJson(httpAuthFile(), next);
+  return next;
 }
 
 /** Status view that never leaks the token itself. */

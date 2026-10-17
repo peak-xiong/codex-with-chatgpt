@@ -123,7 +123,7 @@ repository boundary: Git checkouts use `<git-common-dir>/codex-with-chatgpt`,
 while non-Git workspaces use `<workspace-root>/.codex-with-chatgpt`. Linked
 worktrees share project metadata and a non-authoritative page recovery mirror;
 session routes and execution records are isolated below
-`workspaces/<workspaceId>/`. Runtime installations, the authoritative mailbox,
+`workspaces/<workspaceId>/`. Runtime installations, authoritative control requests,
 the recorded public endpoint and bearer token, the machine association id, the
 authoritative cross-workspace Project URL, physical-tab and generation ownership
 index, gateway ownership records, machine identity, locks and logs remain in
@@ -233,8 +233,9 @@ Before a control message, the local harness:
 ChatGPT passes `context_id` to every read-only MCP call. The gateway claims a
 lease, renews it during a long operation, and releases it in a `finally` path.
 On completion, Computer Use verifies the exact bound page response and submits
-its schema-valid marker through the host-only observation endpoint. The retained
-mailbox completion path is dormant in production and remains covered by tests.
+its schema-valid marker through the host-only observation endpoint. A result
+candidate and a separate matching final observation with completion evidence
+are both required. Mailbox callbacks and acknowledgment operations are retired.
 
 Completion or cancellation revokes the capability. Gateway restart changes the
 boot epoch and invalidates all prior capabilities. Compaction or a page
@@ -264,8 +265,7 @@ remain cleanup protections. Backoff, retry, and browser recovery are scoped
 to the affected session only.
 
 Normal request open, observe, and cancel operations use a lifecycle lock for the
-specific `localSessionId`; they do not serialize the whole workspace. Dormant
-mailbox result and acknowledgment operations retain the same lock discipline.
+specific `localSessionId`; they do not serialize the whole workspace.
 The surface metadata ownership lock is only a brief atomic uniqueness guard for
 lease commits/replacements; it never limits browser turns.
 

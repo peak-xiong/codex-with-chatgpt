@@ -73,6 +73,12 @@ The least set needed for a phase is requested. An MCP tool rejects a context
 that lacks its required scope. Computer Use results are recorded by the host
 from the exact page observation.
 
+For a web-only turn, pass `--scopes none` to request an empty local capability.
+`none` must be the complete value; combining it with any scope is rejected.
+Omitting `--scopes` preserves the command's phase defaults. A zero-scope turn
+cannot call local MCP tools or read the repository; use the page's web research
+capability for external sources.
+
 ## Machine setup contract
 
 The machine is configured once:
@@ -828,6 +834,13 @@ execution review adds `execution.read` only when a matching record already
 exists. A scope authorizes a supported tool but does not create missing evidence
 or add arbitrary-ref Git access.
 
+Request a web-only capability explicitly:
+
+```sh
+c2c control open --local-session <id> --task <task> --iteration <n> \
+  --phase RESEARCH --scopes none --json
+```
+
 To cancel before expiry:
 
 ```sh
@@ -978,11 +991,25 @@ execution_summary
 execution_output
 ```
 
+`read_file` scans at most 8 MiB per text file, including bytes read after the
+initial size check. Larger files return `FILE_TOO_LARGE`; the caller can prepare
+a bounded local artifact. Within that limit, `totalLines` and `remainingLines`
+remain exact numbers. Line assembly also respects the response byte budget.
+
 `read_many` accepts 1–16 workspace-relative file ranges, reuses `read_file`
 permissions/sensitive-path checks and bounds compact JSON output to 64 KiB by
 default. Each item carries an index and either a file or explicit error code.
 Oversized first lines are rejected instead of bypassing the byte cap. Budget or
 per-file failures do not invalidate successful items. Reads are non-atomic.
+
+Ordinary file tools deny Git metadata and C2C internal state, including canonical
+aliases. Custom `.c2cignore` rules refresh at each operation boundary; a policy
+read failure prevents access instead of dropping existing protection.
+
+`search_workspace` distinguishes no matches from an engine failure. Ripgrep
+exit 1 is a normal empty result; invalid regexes and other execution errors
+return `SEARCH_FAILED` with bounded, redacted diagnostics. Reaching the result
+limit returns `truncated: true`. The Node fallback supports literal search only.
 
 `read_image` returns image content plus path, format, media type and byte-size
 metadata. It accepts PNG, JPEG, GIF and WebP signatures up to 10 MiB, reads

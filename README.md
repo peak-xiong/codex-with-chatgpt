@@ -726,6 +726,8 @@ require selection and verification in the page.
   schema-checked request and exact page/response identity.
 - Workspace paths are resolved and contained under the registered root. Symlink
   and traversal escapes are rejected.
+- Git metadata and C2C internal state cannot be read through ordinary file tools;
+  execution records retain their separate scope and exact-turn checks.
 - Capabilities and activity leases are short-lived and bound to session, task,
   iteration, phase, compaction epoch, page generation, and scopes.
 - Control requests are stored in protected machine state, partitioned by

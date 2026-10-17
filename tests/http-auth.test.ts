@@ -1,4 +1,7 @@
 import fs from "node:fs";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   httpAuthFile,
@@ -10,6 +13,7 @@ import {
 import { cleanup, isolateStateDir } from "./helpers.js";
 
 const dirs: string[] = [];
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 afterEach(() => {
   dirs.splice(0).forEach(cleanup);
   delete process.env.C2C_STATE_DIR;
@@ -26,6 +30,61 @@ describe("HTTP bearer token", () => {
     expect(second.token).toBe(first.token);
     expect(verifyHttpAuthToken(first.token)).toBe(true);
   });
+
+  it("returns the same first token to concurrent processes", async () => {
+    const stateDir = isolateStateDir();
+    dirs.push(stateDir);
+    const coordinationDir = path.join(stateDir, "barrier");
+    fs.mkdirSync(coordinationDir);
+    const releaseFile = path.join(coordinationDir, "release");
+    const authModule = pathToFileURL(path.join(projectRoot, "src/config/http-auth.ts")).href;
+    const workers = ["first", "second"].map((name) => {
+      const script = `
+        import fs from "node:fs";
+        import { requireHttpAuthToken } from ${JSON.stringify(authModule)};
+        const ready = ${JSON.stringify(path.join(coordinationDir, `${name}.ready`))};
+        const release = ${JSON.stringify(releaseFile)};
+        fs.writeFileSync(ready, "ready");
+        while (!fs.existsSync(release)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        process.stdout.write(requireHttpAuthToken().token);
+      `;
+      const child = spawn(process.execPath, ["--import", "tsx/esm", "--input-type=module", "-e", script], {
+        cwd: projectRoot,
+        env: { ...process.env, C2C_STATE_DIR: stateDir },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+      child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+      const outcome = new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+        child.on("close", (code) => resolve({ code, stdout, stderr }));
+      });
+      return { child, outcome, ready: path.join(coordinationDir, `${name}.ready`) };
+    });
+
+    try {
+      const deadline = Date.now() + 20_000;
+      while (workers.some((worker) => !fs.existsSync(worker.ready))) {
+        const exited = workers.find((worker) => worker.child.exitCode !== null);
+        if (exited) throw new Error(`token worker exited before barrier release: ${exited.child.exitCode}`);
+        if (Date.now() >= deadline) throw new Error("timed out waiting for token workers at barrier");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      fs.writeFileSync(releaseFile, "go");
+      const results = await Promise.all(workers.map((worker) => worker.outcome));
+      expect(results.map((result) => result.code)).toEqual([0, 0]);
+      expect(results.map((result) => result.stderr)).toEqual(["", ""]);
+      expect(results[0]!.stdout).toMatch(/^c2c_mcp_[A-Za-z0-9_-]{43}$/);
+      expect(results[1]!.stdout).toBe(results[0]!.stdout);
+      expect(requireHttpAuthToken().token).toBe(results[0]!.stdout);
+    } finally {
+      for (const worker of workers) {
+        if (worker.child.exitCode === null) worker.child.kill("SIGTERM");
+      }
+      await Promise.all(workers.map((worker) => worker.outcome));
+    }
+  }, 30_000);
 
   it("stores the token owner-only", () => {
     dirs.push(isolateStateDir());

@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readMachineRuntime } from "../src/gateway/runtime.js";
 import { machineConnectorFile } from "../src/gateway/connector-binding.js";
+import { requireHttpAuthToken } from "../src/config/http-auth.js";
 import { Workspace } from "../src/workspace/manager.js";
 import {
   cleanup,
@@ -544,6 +545,13 @@ describe("control CLI correlation", () => {
     expect(removedScope.command.status).toBe(1);
     expect(removedScope.command.stdout + removedScope.command.stderr).toContain("unknown scopes");
     expect(removedScope.command.stdout + removedScope.command.stderr).toContain("c2c.result.write");
+    const mixedNone = runJson([
+      "control", "open", "-w", workspace, "--local-session", "session-research",
+      "--task", "c2c_research1", "--iteration", "0", "--phase", "RESEARCH",
+      "--scopes", "none,workspace.read",
+    ]);
+    expect(mixedNone.command.status).toBe(1);
+    expect(mixedNone.command.stdout + mixedNone.command.stderr).toContain("cannot be combined");
     const opened = runJson([
       "control",
       "open",
@@ -557,6 +565,8 @@ describe("control CLI correlation", () => {
       "0",
       "--phase",
       "RESEARCH",
+      "--scopes",
+      "none",
     ]);
     expect(opened.command.status, JSON.stringify(opened)).toBe(0);
     expect(opened.body.contextId).toMatch(/^c2c_ctx_[A-Za-z0-9_-]{43}$/);
@@ -572,12 +582,38 @@ describe("control CLI correlation", () => {
     expect(opened.body.deliveryPrompt).not.toMatch(/mailbox|callback|submit_control_result|report_control_progress/i);
     expect(opened.body.resultContract).toMatchObject({
       phase: "RESEARCH",
-      requiredTools: ["workspace_info"],
+      requiredTools: [],
       examples: [
         { kind: "RESEARCH", payload: { sources: [] } },
         { kind: "BLOCKED", payload: { reason: expect.any(String), needs: expect.any(Array) } },
       ],
     });
+    const runtime = readMachineRuntime()!;
+    const authToken = requireHttpAuthToken().token;
+    const mcpUrl = `http://127.0.0.1:${runtime.port}/mcp`;
+    const mcpHeaders = {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      authorization: `Bearer ${authToken}`,
+    };
+    const callWorkspaceInfo = async (id: number) => {
+      const response = await fetch(mcpUrl, {
+        method: "POST",
+        headers: { ...mcpHeaders, "mcp-protocol-version": "2025-06-18" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name: "workspace_info", arguments: { context_id: opened.body.contextId } },
+        }),
+      });
+      const responseText = await response.text();
+      const responseData = responseText.split("\n").find((line) => line.startsWith("data: "))?.slice(6) ?? responseText;
+      return JSON.parse(responseData) as { result?: { isError?: boolean; content?: { text?: string }[] } };
+    };
+    const workspaceReadBody = await callWorkspaceInfo(1);
+    expect(workspaceReadBody.result?.isError).toBe(true);
+    expect(workspaceReadBody.result?.content?.[0]?.text).toContain("SCOPE_DENIED");
     const request = opened.body.request as {
       requestId: string;
       workspaceId: string;
@@ -602,6 +638,76 @@ describe("control CLI correlation", () => {
     expect(pending.body.status).toBe("pending");
     expect(request.allowedKinds).toEqual(["RESEARCH", "BLOCKED"]);
 
+    const page = opened.body.surface as { tabId: string; chatUrl: string; generation: number };
+    const submitted = {
+      kind: "RESEARCH",
+      payload: {
+        question: "Can a zero-scope request deliver a page result?",
+        summary: "A schema-valid page result can be delivered while local workspace tools remain denied.",
+        conclusions: ["An empty scope set blocks workspace_info without blocking correlated Computer Use result delivery."],
+        sources: [],
+        openQuestions: [],
+      },
+    } as const;
+    const registration = runJson(["preflight", "--local-session", "session-research"]).body.registration as {
+      workspaceId: string;
+      projectId: string;
+      registrationId: string;
+    };
+    await observeComputerUseResultForTest(readMachineRuntime()!, {
+      ...registration,
+      localSessionId: "session-research",
+    }, {
+      requestId: request.requestId,
+      taskId: "c2c_research1",
+      iteration: 0,
+      phase: "RESEARCH",
+    }, {
+      ...page,
+      projectUrl: page.chatUrl.replace(/\/c\/[^/]+$/, "/project"),
+    }, submitted);
+
+    const delivered = runJson([
+      "control", "wait", "-w", workspace, "--local-session", "session-research",
+      "--request", request.requestId, "--task", "c2c_research1", "--iteration", "0",
+      "--phase", "RESEARCH", "--timeout-ms", "0",
+    ]);
+    expect(delivered.command.status, JSON.stringify(delivered)).toBe(0);
+    expect(delivered.body.status).toBe("cancelled");
+    expect(delivered.body.wait).toMatchObject({
+      outcome: "delivered",
+      state: "delivered",
+      delivery: "computer_use",
+      result: submitted,
+      nextAction: "stop",
+    });
+
+    const afterDelivery = await callWorkspaceInfo(2);
+    expect(afterDelivery.result?.isError).toBe(true);
+    expect(afterDelivery.result?.content?.[0]?.text).toContain("TOKEN_REVOKED");
+
+    const next = runJson([
+      "control", "open", "-w", workspace, "--local-session", "session-research",
+      "--task", "c2c_research1", "--iteration", "1", "--phase", "RESEARCH", "--scopes", "none",
+    ]);
+    expect(next.command.status, JSON.stringify(next)).toBe(0);
+    const nextRequest = next.body.request as { requestId: string };
+    expect(nextRequest.requestId).not.toBe(request.requestId);
+    const nextWait = runJson([
+      "control", "wait", "-w", workspace, "--local-session", "session-research",
+      "--request", nextRequest.requestId, "--task", "c2c_research1", "--iteration", "1",
+      "--phase", "RESEARCH", "--timeout-ms", "0",
+    ]);
+    expect(nextWait.command.status).toBe(1);
+    expect(nextWait.body.status).toBe("pending");
+    expect(nextWait.body.wait).toMatchObject({ outcome: "pending", delivery: "none", result: null });
+
+  });
+
+  it("documents the explicit empty-scope value in control open help", () => {
+    const help = runCli(["control", "open", "--help"]);
+    expect(help.status).toBe(0);
+    expect((help.stdout + help.stderr).replace(/\s+/g, " ")).toContain("'none' for no local scopes");
   });
 
   it("keeps one question and answer bound through open, observe, and wait", async () => {

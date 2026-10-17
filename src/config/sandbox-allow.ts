@@ -11,6 +11,7 @@ export interface SandboxIsolationResult {
   alreadyIsolated: boolean;
   removedRoots: number;
   configPath: string;
+  rollback: CodexConfigRollback | null;
 }
 
 export interface CodexConfigSnapshot {
@@ -18,6 +19,11 @@ export interface CodexConfigSnapshot {
   readonly previous:
     | { readonly kind: "missing" }
     | { readonly kind: "file"; readonly bytes: Buffer; readonly mode: number };
+}
+
+export interface CodexConfigRollback {
+  readonly snapshot: CodexConfigSnapshot;
+  readonly postimage: { readonly bytes: Buffer; readonly mode: number };
 }
 
 type TomlQuote = "basic" | "literal" | "multiline-basic" | "multiline-literal";
@@ -82,8 +88,9 @@ export function snapshotCodexConfig(configPath = getCodexConfigPath()): CodexCon
   };
 }
 
-/** Restore the exact config bytes captured before setup. */
-export function restoreCodexConfig(snapshot: CodexConfigSnapshot): void {
+/** Restore the config only while it still matches the image written by C2C. */
+export function restoreCodexConfig(rollback: CodexConfigRollback): void {
+  const { snapshot, postimage } = rollback;
   const current = fs.lstatSync(snapshot.path, { throwIfNoEntry: false });
   if (current?.isSymbolicLink()) {
     throw new Error(`Refusing to restore a symlink Codex config: ${snapshot.path}`);
@@ -91,10 +98,14 @@ export function restoreCodexConfig(snapshot: CodexConfigSnapshot): void {
   if (current && !current.isFile()) {
     throw new Error(`Codex config is not a regular file: ${snapshot.path}`);
   }
-  if (snapshot.previous.kind === "missing") {
-    fs.rmSync(snapshot.path, { force: true });
-    return;
+  if (
+    !current ||
+    (current.mode & 0o777) !== postimage.mode ||
+    !fs.readFileSync(snapshot.path).equals(postimage.bytes)
+  ) {
+    throw new Error(`Codex config changed after C2C isolation; preserving independent edits: ${snapshot.path}`);
   }
+  if (snapshot.previous.kind !== "file") throw new Error("Codex config rollback has no preimage");
   fs.mkdirSync(path.dirname(snapshot.path), { recursive: true, mode: 0o700 });
   const temporary = path.join(
     path.dirname(snapshot.path),
@@ -140,16 +151,15 @@ export function ensureSandboxIsolation(opts?: {
 }): SandboxIsolationResult {
   const protectedStateRoot = path.resolve(opts?.protectedStateRoot ?? getStateDir());
   const configPath = opts?.configPath ?? getCodexConfigPath();
-  const configStat = fs.lstatSync(configPath, { throwIfNoEntry: false });
-  if (configStat?.isSymbolicLink() || (configStat && !configStat.isFile())) {
-    throw new Error(`Codex config must be a regular file: ${configPath}`);
+  const snapshot = snapshotCodexConfig(configPath);
+  if (snapshot.previous.kind === "missing") {
+    return { alreadyIsolated: true, removedRoots: 0, configPath, rollback: null };
   }
-  if (!configStat) return { alreadyIsolated: true, removedRoots: 0, configPath };
 
-  const previous = fs.readFileSync(configPath, "utf8");
+  const previous = snapshot.previous.bytes.toString("utf8");
   const roots = listWritableRoots(previous);
   const removedRoots = roots.filter((root) => pathIsWithin(root, protectedStateRoot)).length;
-  if (removedRoots === 0) return { alreadyIsolated: true, removedRoots: 0, configPath };
+  if (removedRoots === 0) return { alreadyIsolated: true, removedRoots: 0, configPath, rollback: null };
 
   const next = filterWritableRoots(previous, (root) => !pathIsWithin(root, protectedStateRoot));
   replaceFileAtomically(configPath, next);
@@ -157,6 +167,10 @@ export function ensureSandboxIsolation(opts?: {
     alreadyIsolated: false,
     removedRoots,
     configPath,
+    rollback: {
+      snapshot,
+      postimage: { bytes: Buffer.from(next, "utf8"), mode: 0o600 },
+    },
   };
 }
 
