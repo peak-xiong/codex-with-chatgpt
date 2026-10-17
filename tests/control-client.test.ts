@@ -189,10 +189,9 @@ describe("machine gateway control client", () => {
       removedLeases: 1,
       removedBindings: 1,
       removedSession: true,
-      mailbox: {
+      controlRequests: {
         localSessionId: "session-a",
         pendingCancelled: 1,
-        receivedAcknowledged: 0,
         activeRequestCleared: true,
       },
     }));
@@ -208,7 +207,7 @@ describe("machine gateway control client", () => {
     await expect(retireSurface(machine, identity)).resolves.toMatchObject({
       retired: true,
       revokedContexts: 2,
-      mailbox: { pendingCancelled: 1 },
+      controlRequests: { pendingCancelled: 1 },
     });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:48765/admin/surfaces/retire",

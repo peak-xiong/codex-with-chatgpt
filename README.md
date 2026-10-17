@@ -440,11 +440,13 @@ fail while the endpoint is reachable, refresh the ChatGPT app's cached tool
 schema (Plugins → the app → **Manage** → **Refresh**); restarting the tunnel does
 not refresh platform-side metadata.
 
-Mailbox callback code and historical live-return records are retained for a
-later comparison. Production currently does not register those callback tools.
-The page marker is accepted only after exact Computer Use correlation and schema
-validation; arbitrary browser prose is never accepted.
-See [current verification boundaries](docs/issue-log.md#最新回传验收修复).
+Computer Use is the sole result transport. The host records a candidate from the
+exact response, waits at least 1500 ms, then makes a fresh UI observation before
+accepting the final result. Exact request, session, task, iteration, phase, tab,
+chat and generation correlation is required; arbitrary browser prose is never
+accepted. The 12 public read-only MCP tools and their output schemas remain;
+mailbox callback tools and the `c2c.result.write` scope are retired. See the
+[result protocol](docs/protocol.md#waiting-and-terminal-observations).
 
 ### Use another project or session
 
@@ -498,8 +500,23 @@ layout is `~/.codex/skills/codex-with-chatgpt` pointing to the same user's
 reports the destination selected by the current environment. `C2C_STATE_DIR` changes
 machine state, not registered repository-local state; normally leave it unset.
 The managed runtime is not the source Git checkout. Do not edit it or run
-`git pull` there. The gateway owns the protected mailbox and cross-workspace
+`git pull` there. The gateway owns protected control requests and cross-workspace
 page indexes; local project state holds routes/checkpoints and execution records.
+The one-time migration preserves only complete, valid Computer Use request
+history. It excludes callback-only request metadata, results, progress records and
+acknowledgements. Before cleanup, verify that every eligible Computer Use record
+migrated without omissions or drift. Registry-bound cleanup may remove the legacy
+request root for the selected workspace after migration succeeds, machine active
+and draining turns reach zero, and no live request remains. Run the scoped cleanup
+command from the registered workspace:
+
+```sh
+c2c control clear-legacy-mailbox -w <path> --local-session <id> --json
+```
+
+It removes only that workspace's legacy request root and legacy checkpoint
+references; every other workspace root remains untouched. See the migration
+contract in [the protocol](docs/protocol.md#control-request-storage-migration).
 `prefs get/set` and `sandbox-clean` accept an obsolete `-w` for compatibility
 and ignore it because they operate machine-wide. `update-check -w` remains
 workspace-aware and uses that project's update cache.
@@ -583,7 +600,7 @@ ChatGPT Project A                 ChatGPT Project B
                               |
                c2c serve-http on 127.0.0.1:48765 (bearer-gated /mcp)
                               |
-       machine gateway: registry + capability broker + mailbox
+       machine gateway: registry + capability broker + control requests
                               |
                     trusted local workspaces
 ```
@@ -618,14 +635,10 @@ RESEARCH -> INIT -> PLAN -> EXECUTED -> REVIEW -> DONE
 Codex sends only small control messages to the exact owned chat. It never pastes
 file contents, diffs, or logs into ChatGPT. ChatGPT reads bounded data through
 read-only MCP tools and ends the exact response with a schema-bound
-`C2C_HOST_OBSERVED_RESULT` marker. Computer Use verifies the exact tab, chat,
-generation, response id, request id, phase and payload schema before advancing
-the session.
-
-This is a temporary comparison mode. Mailbox callback implementation remains in
-the source tree, but `get_control_result_status`, `report_control_progress`, and
-`submit_control_result` are not registered by the production MCP server and
-`c2c.result.write` is not granted by `control open`.
+`C2C_HOST_OBSERVED_RESULT` marker. Computer Use verifies the exact request,
+session, task, iteration, phase, tab, chat, generation, response and payload
+schema. A candidate must remain stable for at least 1500 ms and pass a fresh UI
+observation before the final result is accepted.
 
 ## Browser ownership
 
@@ -715,8 +728,9 @@ require selection and verification in the page.
   and traversal escapes are rejected.
 - Capabilities and activity leases are short-lived and bound to session, task,
   iteration, phase, compaction epoch, page generation, and scopes.
-- The retained mailbox completion fence is dormant in the current production
-  transport and remains covered by tests for later comparison.
+- Control requests are stored in protected machine state, partitioned by
+  `workspaceId`; migration and cleanup are scoped to the exact registered
+  workspace.
 - The machine lifetime record is owner-checked by machine id, boot epoch, pid,
   and exact runtime data. A second process cannot silently become the broker.
 - Secrets (bearer token, admin token, raw capability) stay in protected machine

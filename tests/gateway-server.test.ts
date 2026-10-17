@@ -4,6 +4,7 @@ import net from "node:net";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { startMachineGatewayServer, type MachineGatewayServer } from "../src/gateway/server.js";
+import { TURN_SCOPES } from "../src/gateway/server.js";
 import {
   clearMachineRuntime,
   machineLifetimeFile,
@@ -245,7 +246,7 @@ describe("machine gateway control server", () => {
       retired: boolean;
       revokedContexts: number;
       removedBindings: number;
-      mailbox: { pendingCancelled: number; receivedAcknowledged: number };
+      controlRequests: { pendingCancelled: number; activeRequestCleared: boolean };
     }>(server, "/admin/surfaces/retire", identity);
     expect(retired).toMatchObject({
       status: 200,
@@ -253,7 +254,7 @@ describe("machine gateway control server", () => {
         retired: true,
         revokedContexts: 0,
         removedBindings: 1,
-        mailbox: { pendingCancelled: 0, receivedAcknowledged: 0 },
+        controlRequests: { pendingCancelled: 0, activeRequestCleared: false },
       },
     });
   });
@@ -354,9 +355,9 @@ describe("machine gateway control server", () => {
     expect(invalidSurface.status).toBe(400);
   });
 
-  it("aborts an active mailbox wait when the gateway closes", async () => {
+  it("aborts an active control wait when the gateway closes", async () => {
     cleanups.push(isolateStateDir());
-    const root = makeTmpDir("machine-server-mailbox-close");
+    const root = makeTmpDir("machine-server-control-close");
     cleanups.push(root);
     server = await startMachineGatewayServer({ port: 0, connectStdio: false });
     const registered = await admin<{
@@ -368,17 +369,17 @@ describe("machine gateway control server", () => {
       workspaceId: registered.body.workspaceId,
       projectId: registered.body.projectId,
       registrationId: registered.body.registrationId,
-      localSessionId: "session-mailbox-close",
+      localSessionId: "session-control-close",
     };
-    const opened = await admin<{ request: { requestId: string } }>(server, "/admin/mailbox/open", {
+    const opened = await admin<{ request: { requestId: string } }>(server, "/admin/control/open", {
       ...identity,
-      taskId: "task-mailbox-close",
+      taskId: "task-control-close",
       iteration: 0,
       phase: "PLAN",
     });
     expect(opened.status).toBe(200);
 
-    const waiting = fetch(`${server.localBaseUrl()}/admin/mailbox/wait`, {
+    const waiting = fetch(`${server.localBaseUrl()}/admin/control/wait`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${server.runtime.adminToken}`,
@@ -387,7 +388,7 @@ describe("machine gateway control server", () => {
       body: JSON.stringify({
         ...identity,
         requestId: opened.body.request.requestId,
-        taskId: "task-mailbox-close",
+        taskId: "task-control-close",
         iteration: 0,
         phase: "PLAN",
         timeoutMs: 86_400_000,
@@ -404,7 +405,7 @@ describe("machine gateway control server", () => {
 
   it("looks a control request up by requestId alone while keeping partial and wrong correlations rejected", async () => {
     cleanups.push(isolateStateDir());
-    const root = makeTmpDir("machine-server-mailbox-lookup");
+    const root = makeTmpDir("machine-server-control-lookup");
     cleanups.push(root);
     server = await startMachineGatewayServer({ port: 0, connectStdio: false });
     const registered = await admin<{
@@ -416,30 +417,30 @@ describe("machine gateway control server", () => {
       workspaceId: registered.body.workspaceId,
       projectId: registered.body.projectId,
       registrationId: registered.body.registrationId,
-      localSessionId: "session-mailbox-lookup",
+      localSessionId: "session-control-lookup",
     };
-    const opened = await admin<{ request: { requestId: string } }>(server, "/admin/mailbox/open", {
+    const opened = await admin<{ request: { requestId: string } }>(server, "/admin/control/open", {
       ...identity,
-      taskId: "task-mailbox-lookup",
+      taskId: "task-control-lookup",
       iteration: 0,
       phase: "PLAN",
     });
     expect(opened.status).toBe(200);
     const requestId = opened.body.request.requestId;
-    const storedTriple = { taskId: "task-mailbox-lookup", iteration: 0, phase: "PLAN" };
+    const storedTriple = { taskId: "task-control-lookup", iteration: 0, phase: "PLAN" };
 
     // Inspection needs `requestId` only. The request already stores the triple and
     // ownership is enforced by localSessionId, so demanding the triple just made the
     // caller recall values the gateway knows — the cost that failed a first-pairing
     // `control status` on a missing `--task` even though the request id was right.
-    const bare = await admin<{ status: string }>(server, "/admin/mailbox/status", {
+    const bare = await admin<{ status: string }>(server, "/admin/control/status", {
       ...identity,
       requestId,
     });
     expect(bare.status).toBe(200);
     expect(bare.body.status).toBe("pending");
 
-    const waited = await admin<{ status: string }>(server, "/admin/mailbox/wait", {
+    const waited = await admin<{ status: string }>(server, "/admin/control/wait", {
       ...identity,
       requestId,
       timeoutMs: 0,
@@ -449,17 +450,17 @@ describe("machine gateway control server", () => {
 
     // A partial triple is always a mistake, so it is still rejected — and the error
     // names the offending field instead of a bare "failed validation".
-    const partial = await admin<{ error: string; message: string }>(server, "/admin/mailbox/status", {
+    const partial = await admin<{ error: string; message: string }>(server, "/admin/control/status", {
       ...identity,
       requestId,
-      taskId: "task-mailbox-lookup",
+      taskId: "task-control-lookup",
     });
     expect(partial.status).toBe(400);
     expect(partial.body.error).toBe("invalid_request");
     expect(partial.body.message).toContain("taskId");
 
     // A supplied triple must still agree with the stored one.
-    const wrong = await admin<{ error: string }>(server, "/admin/mailbox/status", {
+    const wrong = await admin<{ error: string }>(server, "/admin/control/status", {
       ...identity,
       requestId,
       ...storedTriple,
@@ -468,24 +469,23 @@ describe("machine gateway control server", () => {
     expect(wrong.status).toBe(409);
     expect(wrong.body.error).toContain("mismatch");
 
-    // Terminal transitions keep the triple mandatory as a tripwire against settling
-    // the wrong request: without it the request never reaches the mailbox, and with
-    // it the schema accepts and the mailbox answers on its own terms.
-    const unacknowledged = await admin<{ error: string; message: string }>(server, "/admin/mailbox/ack", {
+    const malformedObservation = await admin(server, "/admin/control/observe", {
       ...identity,
       requestId,
+      observation: {},
     });
-    expect(unacknowledged.status).toBe(400);
-    expect(unacknowledged.body.error).toBe("invalid_request");
-    expect(unacknowledged.body.message).toContain("taskId");
+    expect(malformedObservation.status).toBe(400);
 
-    const acknowledged = await admin<{ error: string }>(server, "/admin/mailbox/ack", {
+    const cancelled = await admin<{ status: string }>(server, "/admin/control/cancel", {
       ...identity,
       requestId,
       ...storedTriple,
     });
-    expect(acknowledged.status).toBe(400);
-    expect(acknowledged.body.error).toBe("mailbox_result_not_ready");
+    expect(cancelled).toMatchObject({ status: 200, body: { status: "cancelled" } });
+
+    for (const route of ["open", "status", "wait", "ack"]) {
+      expect((await admin(server, `/admin/mailbox/${route}`, { ...identity, requestId })).status).toBe(404);
+    }
   });
 
   it("issues exact turn capabilities without accepting unknown scopes or registrations", async () => {
@@ -522,7 +522,7 @@ describe("machine gateway control server", () => {
       taskId: "task-control",
       iteration: 2,
       phase: "PLAN",
-      requestId: server.gateway.openControlResultRequest({
+      requestId: server.gateway.openControlRequest({
         workspaceId: registration.body.workspaceId,
         projectId: registration.body.projectId,
         registrationId: registration.body.registrationId,
@@ -532,7 +532,7 @@ describe("machine gateway control server", () => {
         iteration: 2,
         phase: "PLAN",
       }).request.requestId,
-      scopes: ["workspace.read", "c2c.result.write"],
+      scopes: ["workspace.read"],
       compactionEpoch: 0,
       generation: 1,
     };
@@ -589,6 +589,12 @@ describe("machine gateway control server", () => {
       scopes: ["process.exec"],
     });
     expect(badScope.status).toBe(400);
+    expect(TURN_SCOPES).not.toContain("c2c.result.write");
+    const removedResultScope = await admin(server, "/admin/turns/issue", {
+      ...turn,
+      scopes: ["c2c.result.write"],
+    });
+    expect(removedResultScope.status).toBe(400);
     const wrongRegistration = await admin(server, "/admin/turns/issue", {
       ...turn,
       registrationId: "registration-wrong",
@@ -620,7 +626,7 @@ describe("machine gateway control server", () => {
       localSessionId: identity.localSessionId,
       taskId: "task-plugin", iteration: 0, phase: "PLAN",
       generation: surface.generation, compactionEpoch: 0,
-      scopes: ["workspace.read", "c2c.result.write"], plugins: ["GitHub"],
+      scopes: ["workspace.read"], plugins: ["GitHub"],
       requestId: "request-plugin",
     };
     const proof = {
@@ -636,7 +642,7 @@ describe("machine gateway control server", () => {
       github: { repository: { host: "github.com", owner: "fixture-user", name: "fixture-repo" },
         expectedActor: { login: "fixture-user", id: "123" } },
     };
-    const discoveryRequest = server.gateway.openControlResultRequest(identity, {
+    const discoveryRequest = server.gateway.openControlRequest(identity, {
       taskId: "task-profile",
       iteration: 0,
       phase: "RESEARCH",
@@ -659,12 +665,12 @@ describe("machine gateway control server", () => {
     expect(excessiveScopes.status).not.toBe(200);
     expect(server.gateway.turnStatus(profileTurn.body.token).status).toBe("issued");
     expect((await admin(server, "/admin/turns/cancel", { contextId: profileTurn.body.token })).status).toBe(200);
-    server.gateway.cancelControlResultRequest(identity, discoveryRequest.request.requestId, {
+    server.gateway.cancelControlRequest(identity, discoveryRequest.request.requestId, {
       taskId: "task-profile", iteration: 0, phase: "RESEARCH",
     });
 
     // A separately correlated business turn still needs the actual matching actor.
-    const businessRequest = server.gateway.openControlResultRequest(identity, {
+    const businessRequest = server.gateway.openControlRequest(identity, {
       taskId: "task-plugin", iteration: 0, phase: "PLAN",
     });
     turn.requestId = businessRequest.request.requestId;

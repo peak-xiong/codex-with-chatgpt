@@ -54,7 +54,6 @@ const TURN_SCOPES = [
   "workspace.search",
   "git.read",
   "execution.read",
-  "c2c.result.write",
 ] as const;
 
 const registerWorkspaceSchema = z.object({ root: z.string().min(1).max(4_096) }).strict();
@@ -147,7 +146,7 @@ const surfaceRenewSchema = surfaceIdentitySchema
 const surfaceReleaseSchema = surfaceIdentitySchema
   .extend({ lease: surfaceLeaseRefSchema })
   .strict();
-const mailboxCorrelationSchema = z
+const controlCorrelationSchema = z
   .object({
     requestId: c2cIdSchema,
     localSessionId: c2cIdSchema,
@@ -156,8 +155,8 @@ const mailboxCorrelationSchema = z
     phase: z.enum(CONTROL_PHASES),
   })
   .strict();
-const mailboxIdentitySchema = surfaceIdentitySchema;
-const mailboxOpenSchema = mailboxIdentitySchema
+const controlIdentitySchema = surfaceIdentitySchema;
+const controlOpenSchema = controlIdentitySchema
   .omit({ localSessionId: true })
   .extend({
     localSessionId: c2cIdSchema,
@@ -178,10 +177,10 @@ const mailboxOpenSchema = mailboxIdentitySchema
  * A *partial* triple is still rejected: that can only be a copy-paste mistake, and
  * catching it is the entire reason the fields remain accepted at all.
  */
-const mailboxLookupCorrelationShape = {
-  taskId: mailboxCorrelationSchema.shape.taskId.optional(),
-  iteration: mailboxCorrelationSchema.shape.iteration.optional(),
-  phase: mailboxCorrelationSchema.shape.phase.optional(),
+const controlLookupCorrelationShape = {
+  taskId: controlCorrelationSchema.shape.taskId.optional(),
+  iteration: controlCorrelationSchema.shape.iteration.optional(),
+  phase: controlCorrelationSchema.shape.phase.optional(),
 };
 const requireWholeCorrelation = (
   value: { taskId?: string; iteration?: number; phase?: string },
@@ -199,29 +198,29 @@ const requireWholeCorrelation = (
     });
   }
 };
-// `mailboxCorrelationSchema.shape` is spread first because it is the sole source of the
+// `controlCorrelationSchema.shape` is spread first because it is the sole source of the
 // two fields every lookup needs: `requestId` (which request) and `localSessionId` (whose
-// request — the actual authorization input). `mailboxLookupCorrelationShape` is applied
+// request — the actual authorization input). `controlLookupCorrelationShape` is applied
 // second so it *relaxes* the triple that shape just required; spreading them in the other
 // order would silently drop both required fields.
-const mailboxLookupBase = mailboxIdentitySchema
+const controlLookupBase = controlIdentitySchema
   .omit({ localSessionId: true })
-  .extend(mailboxCorrelationSchema.shape)
-  .extend(mailboxLookupCorrelationShape)
+  .extend(controlCorrelationSchema.shape)
+  .extend(controlLookupCorrelationShape)
   .strict();
 // Terminal transitions (`ack`, `cancel`) keep demanding the exact triple on purpose:
 // there it acts as a tripwire against settling the wrong request, and the caller
 // always has the values in hand because it just opened or waited on that request.
-const mailboxSettlingLookupSchema = mailboxIdentitySchema
+const controlCancelSchema = controlIdentitySchema
   .omit({ localSessionId: true })
-  .extend(mailboxCorrelationSchema.shape)
+  .extend(controlCorrelationSchema.shape)
   .strict();
-const mailboxLookupSchema = mailboxLookupBase.superRefine(requireWholeCorrelation);
-const mailboxWaitSchema = mailboxLookupBase
+const controlLookupSchema = controlLookupBase.superRefine(requireWholeCorrelation);
+const controlWaitSchema = controlLookupBase
   .extend({ timeoutMs: z.number().int().min(0).max(86_400_000) })
   .strict()
   .superRefine(requireWholeCorrelation);
-const mailboxObserveSchema = mailboxLookupBase
+const controlObserveSchema = controlLookupBase
   .extend({ observation: z.unknown() })
   .strict()
   .superRefine(requireWholeCorrelation);
@@ -338,7 +337,6 @@ export async function startMachineGatewayServer(
     connectStdio = false,
     connectHttp = false,
     exitOnShutdown = false,
-    resultTransport,
     associationId = resolveMachineAssociation().associationId,
     associationNonce = newAssociationNonce(),
   } = options;
@@ -350,7 +348,6 @@ export async function startMachineGatewayServer(
     broker,
     surfaceValidator: requireCurrentTurnSurface,
     workspaceMembershipFile: machineWorkspaceMembershipFile(),
-    resultTransport,
   });
   const identity = resolveMachineIdentity();
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
@@ -393,7 +390,7 @@ export async function startMachineGatewayServer(
   let mcpServer: ReturnType<typeof createMcpServer> | null = null;
   let detachStdioLifecycle: (() => void) | null = null;
   let boundPort = preferredPort;
-  const pendingMailboxWaits = new Set<{
+  const pendingControlWaits = new Set<{
     controller: AbortController;
     response: Response;
   }>();
@@ -529,11 +526,11 @@ export async function startMachineGatewayServer(
     }
   });
 
-  app.post("/admin/mailbox/open", adminGuard, (req, res) => {
+  app.post("/admin/control/open", adminGuard, (req, res) => {
     try {
-      const input = mailboxOpenSchema.parse(req.body);
+      const input = controlOpenSchema.parse(req.body);
       const { workspaceId, projectId, registrationId, localSessionId, taskId, iteration, phase, ttlMs } = input;
-      const opened = gateway.openControlResultRequest(
+      const opened = gateway.openControlRequest(
         { workspaceId, projectId, registrationId, localSessionId },
         { taskId, iteration, phase, ...(ttlMs === undefined ? {} : { ttlMs }) },
       );
@@ -544,11 +541,11 @@ export async function startMachineGatewayServer(
     }
   });
 
-  app.post("/admin/mailbox/status", adminGuard, (req, res) => {
+  app.post("/admin/control/status", adminGuard, (req, res) => {
     try {
-      const input = mailboxLookupSchema.parse(req.body);
+      const input = controlLookupSchema.parse(req.body);
       const { workspaceId, projectId, registrationId, localSessionId, requestId } = input;
-      res.json(gateway.getControlResultStatus(
+      res.json(gateway.getControlRequestStatus(
         { workspaceId, projectId, registrationId, localSessionId },
         requestId,
         lookupCorrelation(input),
@@ -559,12 +556,12 @@ export async function startMachineGatewayServer(
     }
   });
 
-  app.post("/admin/mailbox/wait", adminGuard, async (req, res) => {
+  app.post("/admin/control/wait", adminGuard, async (req, res) => {
     const controller = new AbortController();
     const pendingWait = { controller, response: res };
     const abortWait = (): void => controller.abort();
     const cleanupWait = (): void => {
-      pendingMailboxWaits.delete(pendingWait);
+      pendingControlWaits.delete(pendingWait);
       req.off("aborted", abortWait);
       res.off("close", cleanupOnClose);
       res.off("finish", cleanupWait);
@@ -573,14 +570,14 @@ export async function startMachineGatewayServer(
       abortWait();
       cleanupWait();
     };
-    pendingMailboxWaits.add(pendingWait);
+    pendingControlWaits.add(pendingWait);
     req.once("aborted", abortWait);
     res.once("close", cleanupOnClose);
     res.once("finish", cleanupWait);
     try {
-      const input = mailboxWaitSchema.parse(req.body);
+      const input = controlWaitSchema.parse(req.body);
       const { workspaceId, projectId, registrationId, localSessionId, requestId, timeoutMs } = input;
-      const status = await gateway.waitForControlResult(
+      const status = await gateway.waitForControlRequest(
         { workspaceId, projectId, registrationId, localSessionId },
         requestId,
         timeoutMs,
@@ -600,9 +597,9 @@ export async function startMachineGatewayServer(
     }
   });
 
-  app.post("/admin/mailbox/observe", adminGuard, (req, res) => {
+  app.post("/admin/control/observe", adminGuard, (req, res) => {
     try {
-      const input = mailboxObserveSchema.parse(req.body);
+      const input = controlObserveSchema.parse(req.body);
       const { workspaceId, projectId, registrationId, localSessionId, requestId, observation } = input;
       res.json(gateway.observeControlPage(
         { workspaceId, projectId, registrationId, localSessionId }, requestId,
@@ -614,11 +611,11 @@ export async function startMachineGatewayServer(
     }
   });
 
-  app.post("/admin/mailbox/ack", adminGuard, (req, res) => {
+  app.post("/admin/control/cancel", adminGuard, (req, res) => {
     try {
-      const input = mailboxSettlingLookupSchema.parse(req.body);
+      const input = controlCancelSchema.parse(req.body);
       const { workspaceId, projectId, registrationId, localSessionId, requestId, taskId, iteration, phase } = input;
-      res.json(gateway.acknowledgeControlResult(
+      res.json(gateway.cancelControlRequest(
         { workspaceId, projectId, registrationId, localSessionId },
         requestId,
         { taskId, iteration, phase },
@@ -629,15 +626,10 @@ export async function startMachineGatewayServer(
     }
   });
 
-  app.post("/admin/mailbox/cancel", adminGuard, (req, res) => {
+  app.post("/admin/control/clear-legacy-mailbox", adminGuard, (req, res) => {
     try {
-      const input = mailboxSettlingLookupSchema.parse(req.body);
-      const { workspaceId, projectId, registrationId, localSessionId, requestId, taskId, iteration, phase } = input;
-      res.json(gateway.cancelControlResultRequest(
-        { workspaceId, projectId, registrationId, localSessionId },
-        requestId,
-        { taskId, iteration, phase },
-      ));
+      const input = registrationIdentitySchema.parse(req.body);
+      res.json(gateway.clearLegacyControlMailbox(input));
     } catch (error) {
       const response = errorResponse(error);
       res.status(response.status).json(response.body);
@@ -702,13 +694,13 @@ export async function startMachineGatewayServer(
   const close = (): Promise<void> => {
     if (closePromise) return closePromise;
     closing = true;
-    for (const pendingWait of pendingMailboxWaits) {
+    for (const pendingWait of pendingControlWaits) {
       pendingWait.controller.abort();
       if (!pendingWait.response.destroyed && !pendingWait.response.writableEnded) {
         pendingWait.response.destroy();
       }
     }
-    pendingMailboxWaits.clear();
+    pendingControlWaits.clear();
     closePromise = (async () => {
       try {
         detachStdioLifecycle?.();

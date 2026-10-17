@@ -8,7 +8,7 @@ import { Workspace, WorkspaceError } from "../src/workspace/manager.js";
 import { makeTmpDir, cleanup, write, git, makeGitRepo, isolateStateDir } from "./helpers.js";
 import { getProjectDataDir, getWorkspaceDataDir } from "../src/config/paths.js";
 import { projectDataDirectory, projectIdMetadataPath } from "../src/workspace/identity.js";
-import { openControlResultRequest } from "../src/control/mailbox.js";
+import { openControlRequest } from "../src/control/requests.js";
 import { saveExecutionOutput, listExecutionOutputs } from "../src/execution/output.js";
 import { appendExecutionRecord, readExecutionRecords } from "../src/execution/records.js";
 import { commitSessionRoute, readSession } from "../src/session/state.js";
@@ -426,13 +426,13 @@ describe("workspace identity", () => {
       expect(readSession(primary.id, "session-shared")?.url).toContain("aaaaaaaa");
       expect(readSession(linkedWorkspace.id, "session-shared")?.url).toContain("bbbbbbbb");
 
-      const primaryRequest = openControlResultRequest(primary.id, {
+      const primaryRequest = openControlRequest(primary.id, {
         localSessionId: "session-shared",
         taskId: "task-primary",
         iteration: 0,
         phase: "PLAN",
       });
-      const linkedRequest = openControlResultRequest(linkedWorkspace.id, {
+      const linkedRequest = openControlRequest(linkedWorkspace.id, {
         localSessionId: "session-shared",
         taskId: "task-linked",
         iteration: 0,
@@ -441,7 +441,7 @@ describe("workspace identity", () => {
       expect(linkedRequest.requestId).not.toBe(primaryRequest.requestId);
       for (const request of [primaryRequest, linkedRequest]) {
         const requestFile = path.join(
-          stateDir, "control-mailbox", request.workspaceId, "requests", `${request.requestId}.json`,
+          stateDir, "control-requests", request.workspaceId, "requests", `${request.requestId}.json`,
         );
         expect(JSON.parse(fs.readFileSync(requestFile, "utf8"))).toEqual(request);
       }

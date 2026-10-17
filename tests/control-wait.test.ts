@@ -1,14 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
-  acknowledgeControlResult, getActiveControlResultStatus, getControlResultStatus, getControlMailboxDir,
-  pruneControlMailbox,
-  openControlResultRequest, recordControlHostFailure, reportControlProgress,
-  submitControlResult, waitForControlResult,
-} from "../src/control/mailbox.js";
+  getActiveControlRequestStatus, getControlRequestStatus, getControlRequestsDir,
+  pruneControlRequests,
+  openControlRequest, recordControlHostFailure, waitForControlRequest,
+} from "../src/control/requests.js";
 import {
   advanceControlPageObservation,
   CONTROL_PAGE_CHECK_INTERVAL_MS,
@@ -18,8 +15,6 @@ import {
   canonicalJson, MAX_CONTROL_RESULT_BYTES, sha256Hex, type ControlResultSubmission,
 } from "../src/control/result-schema.js";
 import { MachineGateway, requireCurrentTurnSurface } from "../src/gateway/machine-gateway.js";
-import { createMcpServer } from "../src/mcp/server.js";
-import { nullLogger } from "../src/logger/index.js";
 import { readSession, updateSession } from "../src/session/state.js";
 import { cleanup, isolateStateDir, makeTmpDir, projectSelection, receiveBootResult } from "./helpers.js";
 
@@ -42,10 +37,10 @@ function fixture(
     projectSelection: projectSelection(projectUrl), chatUrl: url,
   });
   gateway.surfaceCommit(identity, page, { bootRequestId: receiveBootResult(gateway, identity, page) });
-  const { request } = gateway.openControlResultRequest(identity, turnCorrelation);
+  const { request } = gateway.openControlRequest(identity, turnCorrelation);
   const grant = gateway.issueTurn({
     ...identity, ...turnCorrelation, requestId: request.requestId, generation: page.generation,
-    scopes: ["c2c.result.write"], compactionEpoch: 0,
+    scopes: ["workspace.read"], compactionEpoch: 0,
   });
   const pageIdentity = {
     tabId: page.tabId,
@@ -69,7 +64,7 @@ function fixture(
   const observation: ControlHostFailure = {
     ...pageIdentity, observationSequence: createResponse ? 4 : 3, responseId: `response-${request.requestId}`,
     state: "final", responseIsFinal: true, reason: "platform_blocked",
-    source: "model_reported", tool: "report_control_progress", errorCode: "SAFETY_CHECK_BLOCKED",
+    source: "model_reported", errorCode: "SAFETY_CHECK_BLOCKED",
     completionEvidence,
   };
   return { gateway, identity, request, grant, observation, page, turnCorrelation };
@@ -129,7 +124,7 @@ function planSubmissionAtBytes(targetBytes: number): ControlResultSubmission {
 
 function generatingObservation(f: ReturnType<typeof fixture>) {
   const { tabId, generation, observedUrl, responseToRequestId } = f.observation;
-  const sequence = (f.gateway.getControlResultStatus(
+  const sequence = (f.gateway.getControlRequestStatus(
     f.identity,
     f.request.requestId,
     { taskId: f.request.taskId, iteration: f.request.iteration, phase: f.request.phase },
@@ -144,7 +139,7 @@ function generatingObservation(f: ReturnType<typeof fixture>) {
 const completionEvidence = { responseActionsVisible: true as const, stopControlAbsent: true as const };
 
 function computerUseCandidate(f: ReturnType<typeof fixture>, terminalResult: ControlResultSubmission) {
-  const status = f.gateway.getControlResultStatus(f.identity, f.request.requestId, f.turnCorrelation);
+  const status = f.gateway.getControlRequestStatus(f.identity, f.request.requestId, f.turnCorrelation);
   return {
     tabId: f.observation.tabId,
     generation: f.observation.generation,
@@ -168,7 +163,7 @@ function hostFailureCandidate(
   f: ReturnType<typeof fixture>,
   overrides: Partial<HostFailureCompletionFields> = {},
 ) {
-  const status = f.gateway.getControlResultStatus(f.identity, f.request.requestId, f.turnCorrelation);
+  const status = f.gateway.getControlRequestStatus(f.identity, f.request.requestId, f.turnCorrelation);
   return {
     ...f.observation,
     ...overrides,
@@ -240,7 +235,7 @@ function writeLegacyPageObservation(f: ReturnType<typeof fixture>, observation: 
     ...state,
     observationHash: sha256Hex(canonicalJson(state)),
   };
-  const file = path.join(getControlMailboxDir(f.identity.workspaceId), "observations", `${f.request.requestId}.json`);
+  const file = path.join(getControlRequestsDir(f.identity.workspaceId), "observations", `${f.request.requestId}.json`);
   fs.writeFileSync(file, JSON.stringify(stored));
   return file;
 }
@@ -253,13 +248,13 @@ afterEach(() => {
   delete process.env.C2C_STATE_DIR;
 });
 
-describe("state-driven mailbox waiting", () => {
+describe("state-driven Computer Use request lifecycle", () => {
   it("does not leave a newly opened orphan request when page renewal fails", () => {
     const f = fixture();
     completeHostFailure(f);
     vi.spyOn(f.gateway, "surfaceRenew").mockImplementation(() => { throw new Error("injected renewal failure"); });
-    expect(() => f.gateway.openControlResultRequest(f.identity, { ...correlation, iteration: 1 })).toThrow(/injected renewal failure/);
-    expect(getActiveControlResultStatus(f.identity.workspaceId, f.identity.localSessionId)).toBeNull();
+    expect(() => f.gateway.openControlRequest(f.identity, { ...correlation, iteration: 1 })).toThrow(/injected renewal failure/);
+    expect(getActiveControlRequestStatus(f.identity.workspaceId, f.identity.localSessionId)).toBeNull();
   });
 
   it("normalizes opaque browser response locators consistently and rejects control characters", () => {
@@ -309,7 +304,7 @@ describe("state-driven mailbox waiting", () => {
     const result = { kind: "BLOCKED" as const, payload: { reason: "Evidence missing", needs: ["Provide evidence"] } };
     const acceptedAt = new Date().toISOString();
     const first = advanceControlPageObservation(
-      f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).pageObservation ?? null,
+      f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).pageObservation ?? null,
       computerUseCandidate(f, result),
       acceptedAt,
     );
@@ -340,7 +335,7 @@ describe("state-driven mailbox waiting", () => {
     const result = { kind: "BLOCKED" as const, payload: { reason: "Missing evidence", needs: ["Provide it"] } };
     const acceptedAt = Date.now();
     const candidate = computerUseCandidate(f, result);
-    const initial = f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).pageObservation ?? null;
+    const initial = f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).pageObservation ?? null;
     const candidateState = advanceControlPageObservation(initial, candidate, new Date(acceptedAt).toISOString()).state;
     const final = {
       ...candidate,
@@ -396,10 +391,10 @@ describe("state-driven mailbox waiting", () => {
       kind: "BLOCKED", payload: { reason: "Missing input", needs: ["Provide input"] },
     });
     f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, candidate);
-    expect(() => f.gateway.getControlResultStatus(
+    expect(() => f.gateway.getControlRequestStatus(
       { ...f.identity, localSessionId: "candidate-session-b" }, f.request.requestId, correlation,
     )).toThrow(/another local session/);
-    expect(getActiveControlResultStatus(f.identity.workspaceId, "candidate-session-b")).toBeNull();
+    expect(getActiveControlRequestStatus(f.identity.workspaceId, "candidate-session-b")).toBeNull();
   });
 
   it("renews an idle page before opening work, preserving its generation beyond the old expiry", () => {
@@ -408,7 +403,7 @@ describe("state-driven mailbox waiting", () => {
     completeHostFailure(f);
     vi.setSystemTime(Date.parse(f.page.leaseExpiresAt) - 10_000);
     const next = { ...correlation, iteration: 1 };
-    const { request } = f.gateway.openControlResultRequest(f.identity, next);
+    const { request } = f.gateway.openControlRequest(f.identity, next);
     f.gateway.issueTurn({ ...f.identity, ...next, requestId: request.requestId, generation: f.page.generation,
       scopes: ["workspace.read"], compactionEpoch: 0 });
     const base = { tabId: f.page.tabId, generation: f.page.generation, observedUrl: f.page.chatUrl!,
@@ -495,13 +490,13 @@ describe("state-driven mailbox waiting", () => {
     expect(status).toMatchObject({ status: "cancelled", hostFailure: { reason: "capability_invalid" }, lateEvidence: observation });
     expect(controlWaitPolicy(status)).toMatchObject({ state: "evidence_only", delivery: "none" });
     expect(f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, observation)).toEqual(status);
-    expect(f.gateway.openControlResultRequest(f.identity, { ...correlation, iteration: 1 }).created).toBe(true);
+    expect(f.gateway.openControlRequest(f.identity, { ...correlation, iteration: 1 }).created).toBe(true);
   });
 
   it("returns before a short activity lease expires so the host can renew automatically", async () => {
     vi.useFakeTimers();
-    const request = openControlResultRequest("workspace-a", { localSessionId: "session-a", ...correlation, ttlMs: 2_000 });
-    const wait = waitForControlResult("workspace-a", request.requestId, 30_000, "session-a", correlation);
+    const request = openControlRequest("workspace-a", { localSessionId: "session-a", ...correlation, ttlMs: 2_000 });
+    const wait = waitForControlRequest("workspace-a", request.requestId, 30_000, "session-a", correlation);
     await vi.advanceTimersByTimeAsync(1_000);
     const status = await wait;
     expect(status.status).toBe("pending");
@@ -510,10 +505,10 @@ describe("state-driven mailbox waiting", () => {
 
   it("bounds each wait slice without imposing a five-minute task deadline", async () => {
     vi.useFakeTimers();
-    const request = openControlResultRequest("workspace-a", { localSessionId: "session-a", ...correlation });
-    const read = () => getControlResultStatus("workspace-a", request.requestId, "session-a", correlation);
+    const request = openControlRequest("workspace-a", { localSessionId: "session-a", ...correlation });
+    const read = () => getControlRequestStatus("workspace-a", request.requestId, "session-a", correlation);
     const first = controlWaitPolicy(read());
-    const wait = waitForControlResult("workspace-a", request.requestId, 600_000, "session-a", correlation);
+    const wait = waitForControlRequest("workspace-a", request.requestId, 600_000, "session-a", correlation);
     await vi.advanceTimersByTimeAsync(CONTROL_PAGE_CHECK_INTERVAL_MS);
     expect((await wait).status).toBe("pending");
     expect(controlWaitPolicy(read())).toMatchObject({
@@ -521,67 +516,55 @@ describe("state-driven mailbox waiting", () => {
       nextAction: "mark_send_attempted",
     });
     vi.setSystemTime(Date.parse(request.createdAt) + 6 * 60_000);
-    const nextWait = waitForControlResult("workspace-a", request.requestId, 600_000, "session-a", correlation);
+    const nextWait = waitForControlRequest("workspace-a", request.requestId, 600_000, "session-a", correlation);
     await vi.advanceTimersByTimeAsync(CONTROL_PAGE_CHECK_INTERVAL_MS);
     const status = await nextWait;
-    expect(status).toMatchObject({ status: "pending", result: null });
+    expect(status).toMatchObject({ status: "pending" });
     expect(controlWaitPolicy(status)).toMatchObject({ outcome: "pending", nextAction: "mark_send_attempted", elapsedMs: 6 * 60_000 + CONTROL_PAGE_CHECK_INTERVAL_MS });
-    expect(getActiveControlResultStatus("workspace-a", "session-a")?.requestId).toBe(request.requestId);
+    expect(getActiveControlRequestStatus("workspace-a", "session-a")?.requestId).toBe(request.requestId);
   });
 
-  it("consumes a real refusal after more than five minutes", async () => {
-    vi.useFakeTimers();
-    const request = openControlResultRequest("workspace-a", { localSessionId: "session-a", ...correlation });
-    vi.setSystemTime(Date.parse(request.createdAt) + 6 * 60_000);
-    submitControlResult("workspace-a", {
-      requestId: request.requestId, localSessionId: "session-a", ...correlation, kind: "BLOCKED",
+  it("records a Computer Use refusal after more than five minutes", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = fixture();
+    vi.setSystemTime(Date.parse(f.request.createdAt) + 6 * 60_000);
+    const { status } = completeComputerUse(f, {
+      kind: "BLOCKED",
       payload: { reason: "Cannot complete this request", needs: ["Clarify the permitted task"] },
     });
-    const status = await waitForControlResult("workspace-a", request.requestId, 0, "session-a", correlation);
-    expect(controlWaitPolicy(status, "mailbox")).toMatchObject({ outcome: "blocked", nextAction: "persist_then_ack" });
-    expect(acknowledgeControlResult("workspace-a", request.requestId, "session-a", correlation).status).toBe("acknowledged");
+    expect(controlWaitPolicy(status)).toMatchObject({
+      outcome: "blocked", delivery: "computer_use", nextAction: "stop",
+    });
   });
 
-  it("keeps the same request, token and page alive for 90 minutes and receives the real MCP callback", async () => {
+  it("keeps the same request, capability and page alive for 90 minutes through observed activity", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
-    const f = fixture("session-a", new MachineGateway({
-      surfaceValidator: requireCurrentTurnSurface,
-      resultTransport: "mailbox",
-    }));
+    const f = fixture();
     const otherIdentity = { ...f.identity, localSessionId: "session-b" };
-    const other = f.gateway.openControlResultRequest(otherIdentity, correlation);
+    const other = f.gateway.openControlRequest(otherIdentity, correlation);
     const start = Date.parse(f.request.createdAt);
     for (let minute = 1; minute <= 90; minute++) {
       vi.setSystemTime(start + minute * 60_000);
       const status = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, generatingObservation(f));
-      expect(status).toMatchObject({ status: "pending", requestId: f.request.requestId, request: { createdAt: f.request.createdAt }, progress: null });
+      expect(status).toMatchObject({ status: "pending", requestId: f.request.requestId, request: { createdAt: f.request.createdAt } });
       expect(controlWaitPolicy(status)).toMatchObject({ outcome: "pending", nextAction: "inspect_exact_response" });
     }
     expect(f.gateway.turnStatus(f.grant.token).binding).toEqual(f.grant.binding);
     expect(() => requireCurrentTurnSurface(f.grant.binding)).not.toThrow();
-    expect(f.gateway.openControlResultRequest(f.identity, correlation)).toMatchObject({ created: false, request: { requestId: f.request.requestId } });
-    expect(f.gateway.getControlResultStatus(otherIdentity, other.request.requestId, correlation))
+    expect(f.gateway.openControlRequest(f.identity, correlation)).toMatchObject({ created: false, request: { requestId: f.request.requestId } });
+    expect(f.gateway.getControlRequestStatus(otherIdentity, other.request.requestId, correlation))
       .toMatchObject({ status: "expired", request: { expiresAt: other.request.expiresAt } });
 
-    const server = createMcpServer(
-      { gateway: f.gateway, logger: nullLogger },
-      { resultTransport: "mailbox" },
-    );
-    const client = new Client({ name: "long-task-test", version: "1.0.0" });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await server.connect(serverTransport);
-    await client.connect(clientTransport);
-    try {
-      const receipt = await client.callTool({ name: "submit_control_result", arguments: {
-        context_id: f.grant.token, kind: "BLOCKED",
-        payload: { reason: "Unable to complete the research", needs: ["End this attempt and preserve completed work"] },
-      } });
-      expect(receipt.isError, JSON.stringify(receipt)).not.toBe(true);
-      expect(receipt.structuredContent).toMatchObject({ accepted: true, requestId: f.request.requestId, kind: "BLOCKED" });
-      const received = f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation);
-      expect(controlWaitPolicy(received, "mailbox")).toMatchObject({ outcome: "blocked", nextAction: "persist_then_ack" });
-      expect(f.gateway.acknowledgeControlResult(f.identity, f.request.requestId, correlation).status).toBe("acknowledged");
-    } finally { await client.close(); await server.close(); }
+    const completed = completeComputerUse(f, {
+      kind: "BLOCKED",
+      payload: { reason: "Unable to complete the research", needs: ["End this attempt and preserve completed work"] },
+    });
+    expect(completed.status).toMatchObject({
+      status: "cancelled",
+      requestId: f.request.requestId,
+      hostObservedResult: { provenance: "host_observed", result: { kind: "BLOCKED" } },
+    });
+    expect(controlWaitPolicy(completed.status)).toMatchObject({ outcome: "blocked", delivery: "computer_use" });
   }, 120_000);
 
   it("does not extend authorization for unknown state or revive an expired request", () => {
@@ -603,11 +586,11 @@ describe("state-driven mailbox waiting", () => {
   });
 
   it("uses the last definitive phase after an unknown observation", () => {
-    const request = openControlResultRequest("workspace-a", {
+    const request = openControlRequest("workspace-a", {
       localSessionId: "session-unknown-stage",
       ...correlation,
     });
-    const status = getControlResultStatus(
+    const status = getControlRequestStatus(
       "workspace-a",
       request.requestId,
       "session-unknown-stage",
@@ -673,14 +656,14 @@ describe("state-driven mailbox waiting", () => {
     const f = fixture();
     f.gateway.revokeTurn(f.grant.token);
     expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, generatingObservation(f))).toThrow(/no unique live capability/);
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).request?.expiresAt).toBe(f.request.expiresAt);
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).request?.expiresAt).toBe(f.request.expiresAt);
     expect(f.gateway.turnStatus(f.grant.token).status).toBe("revoked");
   });
 
   it("retains immutable request identity through renewal and prunes its sidecar with the request", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const f = fixture();
-    const root = getControlMailboxDir(f.identity.workspaceId);
+    const root = getControlRequestsDir(f.identity.workspaceId);
     const original = fs.readFileSync(path.join(root, "requests", `${f.request.requestId}.json`), "utf8");
     vi.setSystemTime(Date.parse(f.request.createdAt) + 60_000);
     f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, generatingObservation(f));
@@ -690,7 +673,7 @@ describe("state-driven mailbox waiting", () => {
     expect(fs.existsSync(renewalPath)).toBe(true);
     expect(fs.existsSync(observationPath)).toBe(true);
     vi.setSystemTime(Date.parse(f.request.createdAt) + 8 * 24 * 60 * 60_000);
-    expect(pruneControlMailbox(f.identity.workspaceId)).toBe(2);
+    expect(pruneControlRequests(f.identity.workspaceId)).toBe(2);
     expect(fs.existsSync(renewalPath)).toBe(false);
     expect(fs.existsSync(observationPath)).toBe(false);
   });
@@ -711,7 +694,7 @@ describe("state-driven mailbox waiting", () => {
       ...generating,
       state: "final",
       responseIsFinal: true,
-      reason: "callback_missing",
+      reason: "result_invalid",
       source: "host_observed",
       completionEvidence,
     })).toThrow(/sequence conflicts/);
@@ -724,14 +707,14 @@ describe("state-driven mailbox waiting", () => {
       observationSequence: generating.observationSequence + 1,
       responseId: "response-replacement",
     })).toThrow(/replacement response or URL/);
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation))
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation))
       .toMatchObject({ status: "pending", request: { expiresAt: firstExpiry } });
   });
 
   it("detects stored observation tampering", () => {
     const f = fixture();
     const observationPath = path.join(
-      getControlMailboxDir(f.identity.workspaceId),
+      getControlRequestsDir(f.identity.workspaceId),
       "observations",
       `${f.request.requestId}.json`,
     );
@@ -743,7 +726,7 @@ describe("state-driven mailbox waiting", () => {
     stored.latest.observedAt = changedAt;
     stored.lastDefinitive.observedAt = changedAt;
     fs.writeFileSync(observationPath, JSON.stringify(stored));
-    expect(() => f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation))
+    expect(() => f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation))
       .toThrow(/observation integrity hash/);
   });
 
@@ -755,17 +738,17 @@ describe("state-driven mailbox waiting", () => {
     });
     const { completionEvidence: _completionEvidence, ...legacyFinal } = final;
     const file = writeLegacyPageObservation(f, legacyFinal);
-    const activePath = path.join(getControlMailboxDir(f.identity.workspaceId), "active", `${f.identity.localSessionId}.json`);
+    const activePath = path.join(getControlRequestsDir(f.identity.workspaceId), "active", `${f.identity.localSessionId}.json`);
     fs.mkdirSync(path.dirname(activePath), { recursive: true });
     fs.writeFileSync(activePath, JSON.stringify(f.request));
 
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).pageObservation?.latest)
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).pageObservation?.latest)
       .toEqual(legacyFinal);
     expect(parseStoredControlPageObservation(legacyFinal)).toEqual(legacyFinal);
     expect(() => parseControlPageObservation(legacyFinal)).toThrow(/invalid control page observation/);
     const replay = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, legacyFinal);
     expect(replay.status).toBe("cancelled");
-    expect(replay.result).toBeNull();
+    expect(replay.hostObservedResult).toBeUndefined();
     expect(fs.existsSync(activePath)).toBe(false);
     expect(fs.existsSync(file)).toBe(true);
   });
@@ -773,7 +756,7 @@ describe("state-driven mailbox waiting", () => {
   it("keeps historical failure observations with terminalResult readable for audit", () => {
     const f = fixture("legacy-mixed-failure");
     const failure = completeHostFailure(f).status;
-    const final = f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation)
+    const final = f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation)
       .pageObservation?.lastDefinitive;
     if (!final || final.state !== "final") throw new Error("expected a stored failure final");
     const { completionEvidence: _completionEvidence, ...legacyFinal } = final;
@@ -785,7 +768,7 @@ describe("state-driven mailbox waiting", () => {
       },
     };
     writeLegacyPageObservation(f, mixed);
-    const stored = f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation);
+    const stored = f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation);
     expect(stored.pageObservation?.latest).toMatchObject({
       state: "final", reason: "platform_blocked", terminalResult: { kind: "BLOCKED" },
     });
@@ -800,9 +783,9 @@ describe("state-driven mailbox waiting", () => {
     const f = fixture();
     vi.setSystemTime(Date.parse(f.request.createdAt) + 60_000);
     f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, generatingObservation(f));
-    const originalPath = path.join(getControlMailboxDir(f.identity.workspaceId), "requests", `${f.request.requestId}.json`);
+    const originalPath = path.join(getControlRequestsDir(f.identity.workspaceId), "requests", `${f.request.requestId}.json`);
     fs.writeFileSync(originalPath, JSON.stringify({ ...f.request, expiresAt: new Date(Date.parse(f.request.expiresAt) - 1_000).toISOString() }));
-    expect(() => f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation)).toThrow(/renewal does not match/);
+    expect(() => f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation)).toThrow(/renewal does not match/);
   });
 });
 
@@ -810,10 +793,10 @@ describe("exact response terminal observations", () => {
   it("keeps a sent request pending until an explicit response-start failure is observed", () => {
     const f = fixture("session-no-response", new MachineGateway({ surfaceValidator: requireCurrentTurnSurface }), correlation, false);
     const otherIdentity = { ...f.identity, localSessionId: "session-no-response-other" };
-    const other = f.gateway.openControlResultRequest(otherIdentity, correlation);
+    const other = f.gateway.openControlRequest(otherIdentity, correlation);
     const { tabId, generation, observedUrl, responseToRequestId } = f.observation;
     expect(controlWaitPolicy(
-      f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation),
+      f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation),
     ).nextAction).toBe("inspect_response_start");
     const status = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, {
       tabId,
@@ -829,7 +812,6 @@ describe("exact response terminal observations", () => {
     });
     expect(status).toMatchObject({
       status: "cancelled",
-      result: null,
       hostFailure: {
         state: "response_start_failed",
         reason: "response_start_failed",
@@ -838,13 +820,13 @@ describe("exact response terminal observations", () => {
     });
     expect(controlWaitPolicy(status)).toMatchObject({ outcome: "terminal", nextAction: "stop" });
     expect(f.gateway.turnStatus(f.grant.token).status).toBe("revoked");
-    expect(f.gateway.getControlResultStatus(otherIdentity, other.request.requestId, correlation).status).toBe("pending");
+    expect(f.gateway.getControlRequestStatus(otherIdentity, other.request.requestId, correlation).status).toBe("pending");
   });
 
   it.each(["page_lost", "authority_invalid"] as const)("automatically ends only the affected session for %s", (state) => {
     const f = fixture(`session-${state}`);
     const otherIdentity = { ...f.identity, localSessionId: `session-${state}-other` };
-    const other = f.gateway.openControlResultRequest(otherIdentity, correlation);
+    const other = f.gateway.openControlRequest(otherIdentity, correlation);
     expect(f.gateway.surfaceRelease(f.identity, f.page)).toBe(true);
     if (state === "authority_invalid") f.gateway.revokeTurn(f.grant.token);
     const { tabId, generation, responseToRequestId } = f.observation;
@@ -872,10 +854,10 @@ describe("exact response terminal observations", () => {
           errorCode: "TOKEN_REVOKED" as const,
         };
     const status = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, terminal);
-    expect(status).toMatchObject({ status: "cancelled", result: null, hostFailure: { state } });
+    expect(status).toMatchObject({ status: "cancelled", hostFailure: { state } });
     expect(controlWaitPolicy(status)).toMatchObject({ outcome: "terminal", nextAction: "stop" });
     expect(f.gateway.turnStatus(f.grant.token).status).toBe("revoked");
-    expect(f.gateway.getControlResultStatus(otherIdentity, other.request.requestId, correlation).status).toBe("pending");
+    expect(f.gateway.getControlRequestStatus(otherIdentity, other.request.requestId, correlation).status).toBe("pending");
   });
 
   it("rejects authority-invalid evidence while the exact request still has live authority", () => {
@@ -893,54 +875,45 @@ describe("exact response terminal observations", () => {
       source: "host_observed",
       errorCode: "TOKEN_REVOKED",
     })).toThrow(/conflicts with a live capability/);
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).status)
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).status)
       .toBe("pending");
     expect(f.gateway.turnStatus(f.grant.token).status).toBe("issued");
   });
 
-  it("ends a pending request after accepted progress without inventing a result, preserving other sessions and checkpoints", async () => {
+  it("ends a pending request on host-observed failure, preserving other sessions and checkpoints", async () => {
     const f = fixture();
     const otherIdentity = { ...f.identity, localSessionId: "session-b" };
-    const other = f.gateway.openControlResultRequest(otherIdentity, correlation);
+    const other = f.gateway.openControlRequest(otherIdentity, correlation);
     updateSession(f.identity.workspaceId, f.identity.localSessionId, {
       taskId: correlation.taskId, iteration: 0,
       checkpoint: { protocolState: "EXECUTED_LOCAL", completedSubtasks: "Keep completed work" },
     });
-    reportControlProgress(f.identity.workspaceId, {
-      requestId: f.request.requestId, localSessionId: f.identity.localSessionId, ...correlation, status: "SEARCHING",
-    });
-    const waiter = f.gateway.waitForControlResult(f.identity, f.request.requestId, 1_000, correlation);
-    const { final, status } = completeHostFailure(f);
-    expect(status).toMatchObject({ status: "cancelled", result: null, progress: { status: "SEARCHING" }, hostFailure: { source: "model_reported", reason: "platform_blocked" } });
+    const waiter = f.gateway.waitForControlRequest(f.identity, f.request.requestId, 1_000, correlation);
+    const { final, status } = completeHostFailure(f, { source: "host_observed" });
+    expect(status).toMatchObject({ status: "cancelled", hostFailure: { source: "host_observed", reason: "platform_blocked" } });
     expect((await waiter).status).toBe("cancelled");
     expect(f.gateway.turnStatus(f.grant.token).status).toBe("revoked");
-    expect(() => acknowledgeControlResult(f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation)).toThrow(/before receipt/);
-    expect(f.gateway.getControlResultStatus(otherIdentity, other.request.requestId, correlation).status).toBe("pending");
+    expect(f.gateway.getControlRequestStatus(otherIdentity, other.request.requestId, correlation).status).toBe("pending");
     expect(readSession(f.identity.workspaceId, f.identity.localSessionId)?.checkpoint?.completedSubtasks).toBe("Keep completed work");
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).hostFailure).toEqual(final);
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).hostFailure).toEqual(final);
   });
 
-  it.each(["final", "generating"] as const)("preserves a receipt racing a %s observation", (state) => {
-    const f = fixture("session-a", new MachineGateway({
-      surfaceValidator: requireCurrentTurnSurface,
-      resultTransport: "mailbox",
-    }));
-    const read = f.gateway.getControlResultStatus.bind(f.gateway);
-    vi.spyOn(f.gateway, "getControlResultStatus").mockImplementationOnce((...args) => {
-      const pending = read(...args);
-      expect(pending.status).toBe("pending");
-      submitControlResult(f.identity.workspaceId, {
-        requestId: f.request.requestId, localSessionId: f.identity.localSessionId, ...correlation, kind: "BLOCKED",
-        payload: { reason: "Business request refused", needs: ["Change the request"] },
-      });
-      return pending;
+  it("rejects generating samples after an accepted host-observed result without changing it", () => {
+    const f = fixture();
+    const result = {
+      kind: "BLOCKED" as const,
+      payload: { reason: "Business request refused", needs: ["Change the request"] },
+    };
+    const { status } = completeComputerUse(f, result);
+    expect(status).toMatchObject({
+      status: "cancelled",
+      hostObservedResult: { provenance: "host_observed", result },
     });
-    const status = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, state === "final" ? f.observation : generatingObservation(f));
-    expect(status).toMatchObject({ status: "received", result: { kind: "BLOCKED" } });
+    expect(() => f.gateway.observeControlPage(
+      f.identity, f.request.requestId, correlation, generatingObservation(f),
+    )).toThrow(/exact response lifecycle/);
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation)).toEqual(status);
     expect(status.hostFailure).toBeUndefined();
-    expect(recordControlHostFailure(f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation, f.observation).status).toBe("received");
-    expect(f.gateway.acknowledgeControlResult(f.identity, f.request.requestId, correlation).status).toBe("acknowledged");
-    expect(f.gateway.acknowledgeControlResult(f.identity, f.request.requestId, correlation).status).toBe("acknowledged");
   });
 
   it("requires page-dependent failure finals to pass the exact candidate barrier", () => {
@@ -949,15 +922,19 @@ describe("exact response terminal observations", () => {
     const generating = generatingObservation(f);
     f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, generating);
     const candidate = hostFailureCandidate(f, {
-      reason: "callback_missing",
+      reason: "platform_blocked",
       source: "host_observed",
-      tool: "submit_control_result",
       errorCode: "UNKNOWN",
     });
+    expect(() => parseControlPageObservation({
+      ...candidate,
+      reason: "callback_missing",
+      tool: "submit_control_result",
+    })).toThrow(/invalid control page observation/);
     const directFinal = finalForHostFailureCandidate(candidate);
     expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, directFinal))
       .toThrow(/exact response lifecycle/);
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
 
     const mixed = {
       ...candidate,
@@ -982,7 +959,7 @@ describe("exact response terminal observations", () => {
     expect(() => recordControlHostFailure(
       f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation, earlyFinal,
     )).toThrow(/fresh stability recheck/);
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
 
     vi.setSystemTime(Date.now() + 1_500);
     const resumed = generatingObservation(f);
@@ -995,12 +972,11 @@ describe("exact response terminal observations", () => {
     expect(() => recordControlHostFailure(
       f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation, oldCandidateFinal,
     )).toThrow(/exact response lifecycle/);
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
 
     const resumedCandidate = hostFailureCandidate(f, {
-      reason: "callback_missing",
+      reason: "platform_blocked",
       source: "host_observed",
-      tool: "submit_control_result",
       errorCode: "UNKNOWN",
     });
     f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, resumedCandidate);
@@ -1011,8 +987,7 @@ describe("exact response terminal observations", () => {
     );
     expect(status).toMatchObject({
       status: "cancelled",
-      result: null,
-      hostFailure: { reason: "callback_missing", source: "host_observed" },
+      hostFailure: { reason: "platform_blocked", source: "host_observed" },
     });
     expect(status.hostObservedResult).toBeUndefined();
     expect(controlWaitPolicy(status)).toMatchObject({ outcome: "terminal", nextAction: "stop", delivery: "none" });
@@ -1037,7 +1012,6 @@ describe("exact response terminal observations", () => {
     });
     expect(status).toMatchObject({
       status: "cancelled",
-      result: null,
       hostObservedResult: { provenance: "host_observed", result: { kind: "PLAN" } },
     });
     expect(status.hostFailure).toBeUndefined();
@@ -1056,7 +1030,6 @@ describe("exact response terminal observations", () => {
     expect(Buffer.byteLength(canonicalJson(accepted), "utf8")).toBe(MAX_CONTROL_RESULT_BYTES);
     expect(completeComputerUse(boundary, accepted).status).toMatchObject({
       status: "cancelled",
-      result: null,
       hostObservedResult: { result: { kind: "PLAN" } },
     });
   });
@@ -1079,28 +1052,27 @@ describe("exact response terminal observations", () => {
     expect(() => parseControlPageObservation(computerUseCandidate(f, multibyte)))
       .toThrow(/exceeds 16384 bytes/);
 
-    const pending = f.gateway.getControlResultStatus(f.identity, f.request.requestId, planCorrelation);
-    expect(pending).toMatchObject({ status: "pending", result: null });
+    const pending = f.gateway.getControlRequestStatus(f.identity, f.request.requestId, planCorrelation);
+    expect(pending).toMatchObject({ status: "pending" });
     expect(pending.hostObservedResult).toBeUndefined();
-    expect(getActiveControlResultStatus(f.identity.workspaceId, f.identity.localSessionId)?.requestId)
+    expect(getActiveControlRequestStatus(f.identity.workspaceId, f.identity.localSessionId)?.requestId)
       .toBe(f.request.requestId);
     expect(f.gateway.turnStatus(f.grant.token).status).toBe("issued");
 
-    const lease = f.gateway.claimTurn(f.grant.token, ["c2c.result.write"]);
-    const fence = f.gateway.beginCompletion(f.grant.token);
-    f.gateway.releaseTurn(f.grant.token, lease.lease);
-    f.gateway.completeControlResult(f.grant.token, fence, {
+    const completed = completeComputerUse(f, {
       kind: "PLAN",
       payload: {
         goal: "Complete after rejecting oversized host evidence",
         rationale: "The request and capability remained live",
         actions: [{ change: "Continue the original turn", why: "No lifecycle state was mutated" }],
-        tests: ["Read the authoritative mailbox"],
+        tests: ["Read the exact Computer Use response"],
         successCriteria: ["The real completion is received"],
       },
     });
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, planCorrelation))
-      .toMatchObject({ status: "received", result: { kind: "PLAN" } });
+    expect(completed.status).toMatchObject({
+      status: "cancelled",
+      hostObservedResult: { provenance: "host_observed", result: { kind: "PLAN" } },
+    });
   });
 
   it("rejects a host-observed kind that the request phase does not allow", () => {
@@ -1114,27 +1086,20 @@ describe("exact response terminal observations", () => {
           successCriteria: ["The observation is rejected"],
         },
       }))).toThrow(/not allowed/i);
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation))
-      .toMatchObject({ status: "pending", result: null });
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation))
+      .toMatchObject({ status: "pending" });
   });
 
-  it("lets an already-started MCP completion settle before a host terminal fallback", () => {
-    const f = fixture("session-a", new MachineGateway({
-      surfaceValidator: requireCurrentTurnSurface,
-      resultTransport: "mailbox",
-    }));
-    const lease = f.gateway.claimTurn(f.grant.token, ["c2c.result.write"]);
-    const fence = f.gateway.beginCompletion(f.grant.token);
-    f.gateway.releaseTurn(f.grant.token, lease.lease);
-    const observed = f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, f.observation);
-    expect(observed).toMatchObject({ status: "pending", result: null });
-    expect(observed.hostObservedResult).toBeUndefined();
-    f.gateway.completeControlResult(f.grant.token, fence, {
+  it("does not allow a late generating observation to replace a verified Computer Use final", () => {
+    const f = fixture();
+    const { status } = completeComputerUse(f, {
       kind: "BLOCKED",
       payload: { reason: "The business task was refused", needs: ["End this attempt"] },
     });
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation))
-      .toMatchObject({ status: "received", result: { kind: "BLOCKED" } });
+    expect(() => f.gateway.observeControlPage(
+      f.identity, f.request.requestId, correlation, generatingObservation(f),
+    )).toThrow(/exact response lifecycle/);
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation)).toEqual(status);
   });
 
   it.each(["generating", "unknown"] as const)("does not infer refusal from %s or a quotation of historical BLOCKED text", (state) => {
@@ -1155,7 +1120,7 @@ describe("exact response terminal observations", () => {
   ])("rejects stale or unrelated evidence %j", (change) => {
     const f = fixture();
     expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, { ...f.observation, ...change })).toThrow(/observation does not match/);
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
   });
 
   it("does not accept unfinished response evidence or leak arbitrary diagnostic text", () => {
@@ -1172,6 +1137,6 @@ describe("exact response terminal observations", () => {
     expect(() => f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, {
       ...f.observation, observedUrl: `${f.observation.observedUrl}?token=sk-secret-fixture`,
     })).toThrow(/observation does not match/);
-    expect(f.gateway.getControlResultStatus(f.identity, f.request.requestId, correlation).hostFailure).toBeUndefined();
+    expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).hostFailure).toBeUndefined();
   });
 });

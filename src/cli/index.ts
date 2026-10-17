@@ -48,7 +48,7 @@ import {
 import { mergeUiPrefs, readUiPrefs, SETUP_MODES, type SetupMode } from "../config/ui-prefs.js";
 import {
   CONTROL_PHASES,
-  ControlMailboxError,
+  ControlRequestError,
   MAX_C2C_ITERATION,
   validateControlId,
   type ControlPhase,
@@ -57,10 +57,8 @@ import {
 } from "../control/result-schema.js";
 import { saveExecutionOutput } from "../execution/output.js";
 import { controlDeliveryPrompt, controlResultContract } from "../control/result-contract.js";
-import { ACTIVE_CONTROL_RESULT_TRANSPORT } from "../control/result-transport.js";
 import {
   CONTROL_PAGE_CHECK_INTERVAL_MS,
-  controlStatusForTransport,
   controlWaitPolicy,
 } from "../control/wait-policy.js";
 import {
@@ -72,22 +70,22 @@ import {
   adminFetch as machineAdminFetch,
   claimSurface as claimMachineSurface,
   commitSurface as commitMachineSurface,
-  acknowledgeMailboxResult,
-  cancelMailboxRequest,
+  cancelControlRequest,
   cancelTurn as cancelMachineTurn,
-  getMailboxStatus,
+  getControlRequestStatus,
   getSurface as getMachineSurface,
+  clearLegacyControlMailbox as clearLegacyMailboxOnMachine,
   preflight as machinePreflight,
   issueTurn as issueMachineTurn,
-  openMailboxRequest,
-  observeMailboxPage,
+  openControlRequest,
+  observeControlRequest,
   registerWorkspace as registerMachineWorkspace,
   releaseSurface as releaseMachineSurface,
   renewSurface as renewMachineSurface,
   revokeRequest as revokeMachineRequest,
   retireSurface as retireMachineSurface,
   unregisterWorkspace as unregisterMachineWorkspace,
-  waitMailboxResult,
+  waitForControlRequest,
   MachineAdminError,
   type MachineRegistrationIdentity,
 } from "../gateway/control-client.js";
@@ -281,7 +279,7 @@ function readCappedUtf8(filePath: string, maxBytes: number): string {
 }
 
 function errorCode(error: unknown): string | undefined {
-  if (error instanceof ControlMailboxError) return error.code;
+  if (error instanceof ControlRequestError) return error.code;
   if (
     error &&
     typeof error === "object" &&
@@ -289,7 +287,7 @@ function errorCode(error: unknown): string | undefined {
     typeof (error as { code?: unknown }).code === "string"
   ) {
     const code = (error as { code: string }).code;
-    return code.startsWith("mailbox_") ? code.toUpperCase() : code;
+    return code;
   }
   return undefined;
 }
@@ -483,14 +481,13 @@ program.command("preflight")
       const auth = httpAuthStatus();
       const snapshot = gateway.state === "healthy" ? await machinePreflight(gateway.runtime, root, sessionIdentity.id) : null;
       const control = snapshot?.surface?.control;
-      const wait = control ? controlWaitPolicy(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : null;
+      const wait = control ? controlWaitPolicy(control) : null;
       const surface = snapshot?.surface ? {
         ...snapshot.surface,
-        control: control ? controlStatusForTransport(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : control,
+        control,
       } : null;
       const pairing = snapshot?.surface ? planProjectPairing(snapshot.surface, opts.projectUrl) : null;
       const nextAction = gateway.state !== "healthy" ? "start_gateway"
-        : wait?.outcome === "transport_mismatch" ? "transport_mismatch"
         : wait?.outcome === "pending" ? "resume_request"
         : wait?.outcome === "delivered" || wait?.outcome === "blocked" ? "consume_result"
         : control?.status === "expired" ? "inspect_expired_response"
@@ -1091,7 +1088,7 @@ machineContext
   .requiredOption("--iteration <n>")
   .requiredOption("--phase <phase>", "BOOT, RESEARCH, PLAN, or REVIEW")
   .requiredOption("--generation <n>")
-  .option("--request <id>", "exact mailbox request id (required for every phase)")
+  .option("--request <id>", "exact control request id (required for every phase)")
   .option("--compaction-epoch <n>", "compaction epoch", "0")
   .option("--local-session <id>")
   .option("--scopes <scope,...>")
@@ -1338,8 +1335,8 @@ surface
       const machine = await machineSurfaceContext(workspace, localSessionId);
       const { projectUrl, lease, binding, control } = await getMachineSurface(machine.runtime, machine.identity);
       const pairing = planProjectPairing({ projectUrl, lease, binding, control }, opts.projectUrl);
-      const safeControl = control ? controlStatusForTransport(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : null;
-      const wait = control ? controlWaitPolicy(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : null;
+      const safeControl = control;
+      const wait = control ? controlWaitPolicy(control) : null;
       if (opts.json) say(JSON.stringify({ ok: true, localSessionId, projectUrl, lease, binding, control: safeControl, wait, pairing }));
       else if (lease) {
         const route = lease.chatUrl ? `ChatGPT page：${lease.chatUrl}` : "ChatGPT Project candidate page";
@@ -1381,9 +1378,9 @@ surface
       const current = await getMachineSurface(machine.runtime, machine.identity);
       const page = assessPageHealth(current, observation);
       const control = current.control;
-      const controlReady = page.controlReady && control?.status !== "pending" && control?.status !== "received";
-      const safeControl = control ? controlStatusForTransport(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : null;
-      const wait = control ? controlWaitPolicy(control, ACTIVE_CONTROL_RESULT_TRANSPORT) : null;
+      const controlReady = page.controlReady && control?.status !== "pending";
+      const safeControl = control;
+      const wait = control ? controlWaitPolicy(control) : null;
       if (opts.json) say(JSON.stringify({ ok: true, localSessionId, ...page, controlReady, control: safeControl, wait }));
       else say(`${page.action}: ${page.reason}`);
     } catch (error) {
@@ -1662,10 +1659,9 @@ session
   .option("--completed-subtasks <text>")
   .option("--known-issues <text>")
   .option("--next-step <text>")
-  .option("--mailbox-request <id>")
-  .option("--mailbox-phase <phase>")
-  .option("--mailbox-result <id>")
-  .option("--clear-mailbox", "drop mailbox checkpoint metadata", false)
+  .option("--control-request <id>")
+  .option("--control-phase <phase>")
+  .option("--clear-control", "drop the control request checkpoint reference", false)
   .option("--clear-checkpoint", "drop the active task checkpoint", false)
   .option("--local-session <id>")
   .option("--json", "machine-readable output", false)
@@ -1681,10 +1677,9 @@ session
     completedSubtasks?: string;
     knownIssues?: string;
     nextStep?: string;
-    mailboxRequest?: string;
-    mailboxPhase?: string;
-    mailboxResult?: string;
-    clearMailbox: boolean;
+    controlRequest?: string;
+    controlPhase?: string;
+    clearControl: boolean;
     clearCheckpoint: boolean;
     localSession?: string;
     json: boolean;
@@ -1702,11 +1697,11 @@ session
       if (waiting && !WAITING_FOR.includes(waiting as WaitingFor)) {
         throw new Error(`waiting-for must be one of ${WAITING_FOR.join(", ")}`);
       }
-      if (opts.clearMailbox && (opts.mailboxRequest || opts.mailboxPhase || opts.mailboxResult)) {
-        throw new Error("clear-mailbox cannot be combined with mailbox metadata");
+      if (opts.clearControl && (opts.controlRequest || opts.controlPhase)) {
+        throw new Error("clear-control cannot be combined with control request metadata");
       }
-      if ((opts.clearMailbox || opts.mailboxRequest || opts.mailboxPhase || opts.mailboxResult) && !protocolRaw) {
-        throw new Error("mailbox checkpoint options require --protocol-state");
+      if ((opts.clearControl || opts.controlRequest || opts.controlPhase) && !protocolRaw) {
+        throw new Error("control checkpoint options require --protocol-state");
       }
       const saved = updateSession(workspace.id, localSessionId, {
         localSessionId,
@@ -1716,7 +1711,7 @@ session
           opts.iteration === undefined ? undefined : parseControlIteration(opts.iteration),
         lastState: opts.state,
         clearCheckpoint: opts.clearCheckpoint,
-        clearMailbox: opts.clearMailbox,
+        clearControl: opts.clearControl,
         checkpoint: protocolRaw
           ? {
               protocolState: protocolRaw as ProtocolState,
@@ -1725,13 +1720,10 @@ session
               completedSubtasks: opts.completedSubtasks,
               knownIssues: opts.knownIssues,
               nextExpectedStep: opts.nextStep,
-              mailboxRequestId: opts.mailboxRequest
-                ? validateControlId(opts.mailboxRequest, "mailbox request id")
+              controlRequestId: opts.controlRequest
+                ? validateControlId(opts.controlRequest, "control request id")
                 : undefined,
-              mailboxPhase: opts.mailboxPhase ? parseControlPhase(opts.mailboxPhase) : undefined,
-              mailboxResultId: opts.mailboxResult
-                ? validateControlId(opts.mailboxResult, "mailbox result id")
-                : undefined,
+              controlPhase: opts.controlPhase ? parseControlPhase(opts.controlPhase) : undefined,
             }
           : undefined,
       });
@@ -1761,7 +1753,29 @@ session
 
 const control = program
   .command("control")
-  .description("Manage exact, correlated ChatGPT result turns");
+  .description("Manage exact, correlated ChatGPT page-control turns");
+
+control
+  .command("clear-legacy-mailbox")
+  .description("Migrate verified Computer Use history, then remove this workspace's legacy control data")
+  .option("-w, --workspace <path>")
+  .option("--local-session <id>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { workspace?: string; localSession?: string; json: boolean }) => {
+    try {
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const machine = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession), false);
+      const result = await clearLegacyMailboxOnMachine(machine.runtime, {
+        workspaceId: machine.identity.workspaceId,
+        projectId: machine.identity.projectId,
+        registrationId: machine.identity.registrationId,
+      });
+      if (opts.json) say(JSON.stringify({ ok: true, ...result }));
+      else check(result.removed ? "已迁移并清理本 Workspace 的旧 control 数据" : "本 Workspace 的旧 control 数据已清理");
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
 
 control
   .command("open")
@@ -1826,11 +1840,8 @@ control
           ? ["workspace.read"]
           : pluginIntent === "identity-discovery"
             ? []
-            : TURN_SCOPES.filter((scope) => scope !== "c2c.result.write")
+            : [...TURN_SCOPES]
         : parseScopes(opts.scopes);
-      if (ACTIVE_CONTROL_RESULT_TRANSPORT === "computer_use" && scopes.includes("c2c.result.write")) {
-        throw new Error("c2c.result.write is temporarily disabled while Computer Use is the active result transport");
-      }
       const connector = scopes.length > 0 || correlation.phase === "BOOT"
         ? requireMachineConnector(localConnectorMachine(machine.runtime))
         : undefined;
@@ -1846,7 +1857,7 @@ control
       const pluginPolicy = assessPluginPreflight({
         workspaceId: workspace.id, localSessionId, ...correlation, generation: page.generation, plugins, pluginIntent, scopes, pluginPreflight,
       }, page, machine.runtime.bootEpoch);
-      const opened = await openMailboxRequest(machine.runtime, machine.identity, {
+      const opened = await openControlRequest(machine.runtime, machine.identity, {
         ...correlation,
         ttlMs,
       });
@@ -1900,11 +1911,10 @@ control
         request: opened.request,
         contextId: grant.token,
         contextExpiresAt: grant.expiresAt,
-        resultTransport: ACTIVE_CONTROL_RESULT_TRANSPORT,
         connector: connector ?? null,
         resultContract: controlResultContract(correlation.phase, connector, scopes.includes("workspace.read")),
         deliveryPrompt: controlDeliveryPrompt(opened.request, grant.token, connector, scopes.includes("workspace.read")),
-        wait: controlWaitPolicy({ requestId: opened.request.requestId, request: opened.request, status: "pending", result: null, progress: null }),
+        wait: controlWaitPolicy({ requestId: opened.request.requestId, request: opened.request, status: "pending" }),
         pluginPolicy,
         surface: {
           tabId: page.tabId,
@@ -1920,8 +1930,8 @@ control
     } catch (error) {
       if (createdRequest) {
         try {
-          if (!machineContext) throw new Error("machine context is unavailable for mailbox cleanup");
-          await cancelMailboxRequest(
+          if (!machineContext) throw new Error("machine context is unavailable for control request cleanup");
+          await cancelControlRequest(
             machineContext.runtime,
             machineContext.identity,
             {
@@ -1941,8 +1951,8 @@ control
 
 /**
  * `optional` correlation: `status` / `wait` / `observe` can find a request by
- * `--request` alone. `required`: `ack` / `cancel` settle a request, so the triple
- * stays mandatory there as a tripwire against settling the wrong one.
+ * `--request` alone. `required`: `cancel` settles a request, so the triple stays
+ * mandatory there as a tripwire against cancelling the wrong one.
  */
 function addControlLookupOptions(
   command: Command,
@@ -1978,19 +1988,19 @@ addControlLookupOptions(control.command("status"), "optional")
     try {
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession), false);
-      const status = await getMailboxStatus(identity.runtime, identity.identity, {
+      const status = await getControlRequestStatus(identity.runtime, identity.identity, {
         requestId: opts.request,
         ...parseControlCorrelation(opts),
       });
-      const wait = controlWaitPolicy(status, ACTIVE_CONTROL_RESULT_TRANSPORT);
+      const wait = controlWaitPolicy(status);
       const payload = {
-        ok: status.status !== "not_found" && wait.outcome !== "transport_mismatch",
-        ...controlStatusForTransport(status, ACTIVE_CONTROL_RESULT_TRANSPORT),
+        ok: status.status !== "not_found",
+        ...status,
         wait,
       };
       if (opts.json) say(JSON.stringify(payload));
       else say(`状态：${status.status}; ${wait.outcome}; ${wait.nextAction}`);
-      if (status.status === "not_found" || wait.outcome === "transport_mismatch") process.exitCode = 1;
+      if (status.status === "not_found") process.exitCode = 1;
     } catch (error) {
       handleCliError(error, opts.json);
     }
@@ -2016,16 +2026,16 @@ addControlLookupOptions(
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession), false);
       const timeoutMs = parseIntegerOption(opts.timeoutMs, "timeout-ms", 0, 86_400_000);
-      const status = await waitMailboxResult(identity.runtime, identity.identity, {
+      const status = await waitForControlRequest(identity.runtime, identity.identity, {
         requestId: opts.request,
         ...parseControlCorrelation(opts),
         timeoutMs,
       });
-      const wait = controlWaitPolicy(status, ACTIVE_CONTROL_RESULT_TRANSPORT);
+      const wait = controlWaitPolicy(status);
       const delivered = wait.outcome === "delivered" || wait.outcome === "blocked";
       if (opts.json) say(JSON.stringify({
         ok: delivered,
-        ...controlStatusForTransport(status, ACTIVE_CONTROL_RESULT_TRANSPORT),
+        ...status,
         wait,
       }));
       else if (wait.result) say(JSON.stringify(wait.result, null, 2));
@@ -2049,41 +2059,17 @@ addControlLookupOptions(control.command("observe"), "optional")
       catch { throw new Error("page-observation must be valid JSON; raw page text is not accepted"); }
       const workspace = new Workspace(resolveWorkspace(opts.workspace));
       const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession), false);
-      const status = await observeMailboxPage(identity.runtime, identity.identity, {
+      const status = await observeControlRequest(identity.runtime, identity.identity, {
         requestId: opts.request, ...parseControlCorrelation(opts), observation: rawObservation,
       });
-      const wait = controlWaitPolicy(status, ACTIVE_CONTROL_RESULT_TRANSPORT);
+      const wait = controlWaitPolicy(status);
       if (opts.json) say(JSON.stringify({
-        ok: wait.outcome !== "transport_mismatch",
-        ...controlStatusForTransport(status, ACTIVE_CONTROL_RESULT_TRANSPORT),
+        ok: status.status !== "not_found",
+        ...status,
         wait,
       }));
       else say(`状态：${status.status}; ${wait.outcome}; ${wait.nextAction}`);
-      if (wait.outcome === "transport_mismatch") process.exitCode = 1;
-    } catch (error) {
-      handleCliError(error, opts.json);
-    }
-  });
-
-addControlLookupOptions(control.command("ack"), "required")
-  .action(async (opts: {
-    workspace?: string;
-    request: string;
-    task: string;
-    iteration: string;
-    phase: string;
-    localSession?: string;
-    json: boolean;
-  }) => {
-    try {
-      const workspace = new Workspace(resolveWorkspace(opts.workspace));
-      const identity = await machineSurfaceContext(workspace, resolveLocalSession(opts.localSession));
-      const status = await acknowledgeMailboxResult(identity.runtime, identity.identity, {
-        requestId: opts.request,
-        ...requireControlCorrelation(opts),
-      });
-      if (opts.json) say(JSON.stringify({ ok: true, ...status }));
-      else check("已确认 control result");
+      if (status.status === "not_found") process.exitCode = 1;
     } catch (error) {
       handleCliError(error, opts.json);
     }
@@ -2134,7 +2120,7 @@ addControlLookupOptions(control.command("cancel"), "required")
       } else {
         throw new Error("The capability could not be revoked because the gateway state is uncertain.");
       }
-      const status = await cancelMailboxRequest(machineRuntime, {
+      const status = await cancelControlRequest(machineRuntime, {
         ...registration,
         localSessionId,
       }, {
@@ -2149,9 +2135,9 @@ addControlLookupOptions(control.command("cancel"), "required")
           ...status,
         }));
       } else if (contextCancelled) {
-        check("已取消 control result request");
+        check("已取消 control request");
       } else {
-        check("已清理已失效的 control result request");
+        check("已清理已失效的 control request");
       }
     } catch (error) {
       handleCliError(error, opts.json);

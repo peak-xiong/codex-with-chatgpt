@@ -35,8 +35,8 @@ describe("cross-process repository session storage", () => {
       };
       const local = run(false, `updateSession(ws.id, "local-one", { checkpoint: {
         taskId: "recovery", iteration: 2, originalGoal: "preserve progress", protocolState: "PLAN_RECEIVED",
-        waitingFor: "none", mailboxRequestId: "review-request", mailboxPhase: "PLAN",
-        mailboxResultId: "received-result", updatedAt: new Date().toISOString()
+        waitingFor: "none", controlRequestId: "review-request", controlPhase: "PLAN",
+        updatedAt: new Date().toISOString()
       }});`);
       const machine = run(true, `commitSessionRoute(ws.id, "local-one", {
         projectUrl: ${JSON.stringify(projectUrl)}, chatUrl: ${JSON.stringify(chatUrl)},
@@ -45,7 +45,10 @@ describe("cross-process repository session storage", () => {
       expect(machine.file).toBe(local.file);
       expect(machine.workspaceDir).toBe(path.join(root, ".git", "codex-with-chatgpt", "workspaces", path.basename(machine.workspaceDir)));
       expect(machine.projectDir).toBe(path.join(root, ".git", "codex-with-chatgpt"));
-      expect(machine.session.checkpoint.mailboxResultId).toBe("received-result");
+      expect(machine.session.checkpoint).toMatchObject({
+        controlRequestId: "review-request",
+        controlPhase: "PLAN",
+      });
       const resumed = run(false, 'updateSession(ws.id, "local-one", { title: "resumed" });');
       expect(resumed.session).toMatchObject({ url: chatUrl, title: "resumed", surfaceTabId: "owned-tab" });
       expect(run(true, "").session).toEqual(resumed.session);

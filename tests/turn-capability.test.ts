@@ -122,7 +122,7 @@ describe("turn capability broker", () => {
     expect(lease.leaseId).toMatch(/^c2c_lease_[A-Za-z0-9_-]{43}$/);
   });
 
-  it("requires an exact mailbox request for every phase including BOOT", () => {
+  it("requires an exact control request for every phase including BOOT", () => {
     const broker = new TurnCapabilityBroker();
 
     expectCode(() => broker.issue(binding({ requestId: undefined })), "INVALID_BINDING");

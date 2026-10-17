@@ -3,6 +3,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   clearChatPointer,
+  clearLegacyControlCheckpointReferences,
   commitSessionRoute,
   currentLocalSessionId,
   currentLocalSessionIdentity,
@@ -358,8 +359,8 @@ describe("mergeSession", () => {
             iteration: 0,
             protocolState: "RESEARCH_SENT",
             waitingFor: "GPT_RESEARCH",
-            mailboxRequestId: "research-request",
-            mailboxPhase: "RESEARCH",
+            controlRequestId: "research-request",
+            controlPhase: "RESEARCH",
             updatedAt: "2026-01-01T00:00:00.000Z",
           },
           savedAt: "2026-01-01T00:00:00.000Z",
@@ -370,7 +371,7 @@ describe("mergeSession", () => {
       expect(saved.checkpoint).toMatchObject({
         protocolState: "RESEARCH_SENT",
         waitingFor: "GPT_RESEARCH",
-        mailboxPhase: "RESEARCH",
+        controlPhase: "RESEARCH",
       });
       expect(readSession("research123", "session-research")?.checkpoint).toEqual(saved.checkpoint);
     } finally {
@@ -401,8 +402,8 @@ describe("mergeSession", () => {
             iteration: 1,
             protocolState: "INIT",
             waitingFor: "GPT_PLAN",
-            mailboxRequestId: "req-a",
-            mailboxPhase: "PLAN",
+            controlRequestId: "req-a",
+            controlPhase: "PLAN",
             updatedAt: "2026-01-01T00:00:00.000Z",
           },
         },
@@ -426,7 +427,7 @@ describe("mergeSession", () => {
       expect(b?.projectUrl).toBe(PROJECT);
       expect(a?.url).toContain("chat-a");
       expect(b?.url).toContain("chat-b");
-      expect(a?.checkpoint?.mailboxRequestId).toBe("req-a");
+      expect(a?.checkpoint?.controlRequestId).toBe("req-a");
       expect(b?.checkpoint).toBeUndefined();
       expect(resolveConversation(a).reuseSavedChat).toBe(true);
       expect(resolveConversation(b).reuseSavedChat).toBe(true);
@@ -808,7 +809,7 @@ describe("mergeSession", () => {
     expect(cleared.url).toBe(PROJECT_CHAT);
   });
 
-  it("does not carry mailbox result metadata into a new request", () => {
+  it("replaces and clears control correlation through the current checkpoint API", () => {
     const previous = mergeSession(
       {
         conversationMode: "project",
@@ -822,9 +823,8 @@ describe("mergeSession", () => {
         checkpoint: {
           protocolState: "PLAN_RECEIVED",
           waitingFor: "none",
-          mailboxRequestId: "request-plan",
-          mailboxPhase: "PLAN",
-          mailboxResultId: "result-plan",
+          controlRequestId: "request-plan",
+          controlPhase: "PLAN",
         },
       }
     );
@@ -834,27 +834,25 @@ describe("mergeSession", () => {
       checkpoint: {
         protocolState: "EXECUTED_SENT",
         waitingFor: "GPT_REVIEW",
-        mailboxRequestId: "request-review",
-        mailboxPhase: "REVIEW",
+        controlRequestId: "request-review",
+        controlPhase: "REVIEW",
       },
     });
-    expect(nextRequest.checkpoint?.mailboxRequestId).toBe("request-review");
-    expect(nextRequest.checkpoint?.mailboxPhase).toBe("REVIEW");
-    expect(nextRequest.checkpoint?.mailboxResultId).toBeUndefined();
+    expect(nextRequest.checkpoint?.controlRequestId).toBe("request-review");
+    expect(nextRequest.checkpoint?.controlPhase).toBe("REVIEW");
 
     const browserFallback = mergeSession(nextRequest, {
-      clearMailbox: true,
+      clearControl: true,
       checkpoint: {
         protocolState: "PLAN_RECEIVED",
         waitingFor: "none",
       },
     });
-    expect(browserFallback.checkpoint?.mailboxRequestId).toBeUndefined();
-    expect(browserFallback.checkpoint?.mailboxPhase).toBeUndefined();
-    expect(browserFallback.checkpoint?.mailboxResultId).toBeUndefined();
+    expect(browserFallback.checkpoint?.controlRequestId).toBeUndefined();
+    expect(browserFallback.checkpoint?.controlPhase).toBeUndefined();
   });
 
-  it("requires complete mailbox correlation and clears it when the turn changes", () => {
+  it("requires complete control correlation and clears it when the turn changes", () => {
     expect(() =>
       mergeSession(
         {
@@ -869,7 +867,7 @@ describe("mergeSession", () => {
           checkpoint: {
             protocolState: "INIT",
             waitingFor: "GPT_PLAN",
-            mailboxRequestId: "request-only",
+            controlRequestId: "request-only",
           },
         }
       )
@@ -888,9 +886,8 @@ describe("mergeSession", () => {
         checkpoint: {
           protocolState: "PLAN_RECEIVED",
           waitingFor: "none",
-          mailboxRequestId: "plan-request",
-          mailboxPhase: "PLAN",
-          mailboxResultId: "plan-result",
+          controlRequestId: "plan-request",
+          controlPhase: "PLAN",
         },
       }
     );
@@ -898,9 +895,8 @@ describe("mergeSession", () => {
       iteration: 1,
       checkpoint: { protocolState: "EXECUTED_LOCAL", waitingFor: "none" },
     });
-    expect(nextIteration.checkpoint?.mailboxRequestId).toBeUndefined();
-    expect(nextIteration.checkpoint?.mailboxPhase).toBeUndefined();
-    expect(nextIteration.checkpoint?.mailboxResultId).toBeUndefined();
+    expect(nextIteration.checkpoint?.controlRequestId).toBeUndefined();
+    expect(nextIteration.checkpoint?.controlPhase).toBeUndefined();
   });
 
   it("keeps an existing checkpoint when only the chat URL is updated", () => {
@@ -1063,6 +1059,160 @@ describe("clearChatPointer", () => {
     expect(saved?.checkpoint?.chatUrl).toBeUndefined();
   });
 
+});
+
+describe("clearLegacyControlCheckpointReferences", () => {
+  it("clears callback aliases, preserves qualified control pairs, and leaves other sessions untouched", () => {
+    const dir = isolateStateDir();
+    const workspaceId = "checkpoint-cleanup";
+    const otherWorkspaceId = "checkpoint-other";
+    try {
+      const seed = (
+        targetWorkspaceId: string,
+        localSessionId: string,
+        taskId: string,
+        iteration: number,
+        checkpoint: SavedSession["checkpoint"],
+      ) => writeSession(targetWorkspaceId, {
+        localSessionId,
+        conversationMode: "project",
+        projectUrl: PROJECT,
+        url: `https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/${localSessionId}`,
+        taskId,
+        iteration,
+        checkpoint: {
+          taskId,
+          iteration,
+          protocolState: "PLAN_RECEIVED",
+          waitingFor: "none",
+          ...checkpoint,
+        },
+        savedAt: "2026-01-01T00:00:00.000Z",
+      }, localSessionId);
+      const addLegacyAliases = (
+        targetWorkspaceId: string,
+        localSessionId: string,
+        aliases: Record<string, string>,
+      ) => {
+        const file = threadSessionFile(targetWorkspaceId, localSessionId);
+        const raw = JSON.parse(fs.readFileSync(file, "utf8")) as {
+          checkpoint: Record<string, unknown>;
+        };
+        raw.checkpoint = { ...raw.checkpoint, ...aliases };
+        fs.writeFileSync(file, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+        return file;
+      };
+
+      seed(workspaceId, "session-mixed", "c2c_mixed1", 1, {
+        controlRequestId: "req-current",
+        controlPhase: "PLAN",
+        originalGoal: "keep mixed checkpoint",
+      });
+      const mixedFile = addLegacyAliases(workspaceId, "session-mixed", {
+        mailboxRequestId: "stale-legacy-request",
+        mailboxPhase: "REVIEW",
+        mailboxResultId: "old-callback-result",
+      });
+      seed(workspaceId, "session-callback", "c2c_callback1", 2, {
+        originalGoal: "keep callback checkpoint text",
+      });
+      const callbackFile = addLegacyAliases(workspaceId, "session-callback", {
+        mailboxRequestId: "req-callback-only",
+        mailboxPhase: "REVIEW",
+        mailboxResultId: "callback-result",
+      });
+      seed(workspaceId, "session-valid-cu", "c2c_validcu1", 3, {
+        originalGoal: "keep migrated control checkpoint text",
+      });
+      const validCuFile = addLegacyAliases(workspaceId, "session-valid-cu", {
+        mailboxRequestId: "req-valid-cu",
+        mailboxPhase: "PLAN",
+        mailboxResultId: "old-cu-callback-result",
+      });
+      seed(workspaceId, "session-untouched", "c2c_untouched1", 4, {
+        originalGoal: "untouched checkpoint",
+      });
+      const untouchedFile = threadSessionFile(workspaceId, "session-untouched");
+      const untouchedBefore = fs.readFileSync(untouchedFile, "utf8");
+
+      seed(otherWorkspaceId, "session-other-workspace", "c2c_otherws1", 5, {
+        originalGoal: "other workspace checkpoint",
+      });
+      const otherWorkspaceFile = addLegacyAliases(otherWorkspaceId, "session-other-workspace", {
+        mailboxRequestId: "req-other-workspace",
+        mailboxPhase: "PLAN",
+        mailboxResultId: "other-workspace-result",
+      });
+      const otherWorkspaceBefore = fs.readFileSync(otherWorkspaceFile, "utf8");
+
+      expect(readSession(workspaceId, "session-mixed")?.checkpoint).toMatchObject({
+        controlRequestId: "req-current",
+        controlPhase: "PLAN",
+        originalGoal: "keep mixed checkpoint",
+      });
+      const qualifiedReferences: string[] = [];
+      expect(clearLegacyControlCheckpointReferences(workspaceId, (reference) => {
+        if (reference.requestId === "req-valid-cu" &&
+          reference.localSessionId === "session-valid-cu" &&
+          reference.taskId === "c2c_validcu1" &&
+          reference.iteration === 3 &&
+          reference.phase === "PLAN") {
+          qualifiedReferences.push(reference.requestId);
+          return true;
+        }
+        qualifiedReferences.push(reference.requestId);
+        return false;
+      })).toBe(3);
+      expect(qualifiedReferences.sort()).toEqual(["req-callback-only", "req-valid-cu"]);
+
+      const mixedRaw = JSON.parse(fs.readFileSync(mixedFile, "utf8")) as { checkpoint: Record<string, unknown> };
+      expect(mixedRaw.checkpoint).toMatchObject({
+        controlRequestId: "req-current",
+        controlPhase: "PLAN",
+        originalGoal: "keep mixed checkpoint",
+      });
+      expect(mixedRaw.checkpoint).not.toHaveProperty("mailboxRequestId");
+      expect(mixedRaw.checkpoint).not.toHaveProperty("mailboxPhase");
+      expect(mixedRaw.checkpoint).not.toHaveProperty("mailboxResultId");
+      expect(readSession(workspaceId, "session-mixed")).toMatchObject({
+        url: `https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/session-mixed`,
+        checkpoint: { controlRequestId: "req-current", controlPhase: "PLAN" },
+      });
+
+      const callbackRaw = JSON.parse(fs.readFileSync(callbackFile, "utf8")) as { checkpoint: Record<string, unknown> };
+      expect(callbackRaw.checkpoint).toMatchObject({ originalGoal: "keep callback checkpoint text" });
+      expect(callbackRaw.checkpoint).not.toHaveProperty("controlRequestId");
+      expect(callbackRaw.checkpoint).not.toHaveProperty("controlPhase");
+      expect(callbackRaw.checkpoint).not.toHaveProperty("mailboxRequestId");
+      expect(callbackRaw.checkpoint).not.toHaveProperty("mailboxPhase");
+      expect(callbackRaw.checkpoint).not.toHaveProperty("mailboxResultId");
+
+      const validCuRaw = JSON.parse(fs.readFileSync(validCuFile, "utf8")) as { checkpoint: Record<string, unknown> };
+      expect(validCuRaw.checkpoint).toMatchObject({
+        controlRequestId: "req-valid-cu",
+        controlPhase: "PLAN",
+        originalGoal: "keep migrated control checkpoint text",
+      });
+      expect(validCuRaw.checkpoint).not.toHaveProperty("mailboxRequestId");
+      expect(validCuRaw.checkpoint).not.toHaveProperty("mailboxPhase");
+      expect(validCuRaw.checkpoint).not.toHaveProperty("mailboxResultId");
+      expect(readSession(workspaceId, "session-valid-cu")?.checkpoint).toMatchObject({
+        controlRequestId: "req-valid-cu",
+        controlPhase: "PLAN",
+      });
+
+      expect(fs.readFileSync(untouchedFile, "utf8")).toBe(untouchedBefore);
+      expect(fs.readFileSync(otherWorkspaceFile, "utf8")).toBe(otherWorkspaceBefore);
+      expect(readSession(workspaceId, "session-untouched")?.checkpoint?.originalGoal).toBe("untouched checkpoint");
+      expect(readSession(otherWorkspaceId, "session-other-workspace")?.checkpoint).toMatchObject({
+        controlRequestId: "req-other-workspace",
+        controlPhase: "PLAN",
+      });
+    } finally {
+      cleanup(dir);
+      delete process.env.C2C_STATE_DIR;
+    }
+  });
 });
 
 describe("retireSession", () => {

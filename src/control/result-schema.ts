@@ -6,46 +6,40 @@ import { isBrowserTabId } from "../session/browser-tab-id.js";
 
 export const CONTROL_PHASES = ["BOOT", "RESEARCH", "PLAN", "REVIEW"] as const;
 export const CONTROL_RESULT_KINDS = ["BOOT", "RESEARCH", "PLAN", "REVIEW", "DONE", "BLOCKED"] as const;
-export const CONTROL_PROGRESS_STATES = ["SEARCHING", "READING_CODE", "SYNTHESIZING"] as const;
 export const MAX_CONTROL_RESULT_BYTES = 16 * 1024;
-export const MAX_STORED_CONTROL_RESULT_BYTES = 32 * 1024;
 export const MAX_C2C_ITERATION = 10_000;
 export const C2C_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 
 export type ControlPhase = (typeof CONTROL_PHASES)[number];
 export type ControlResultKind = (typeof CONTROL_RESULT_KINDS)[number];
-export type ControlProgressState = (typeof CONTROL_PROGRESS_STATES)[number];
 
 export const BOOT_ALLOWED_KINDS = ["BOOT", "BLOCKED"] as const;
 export const RESEARCH_ALLOWED_KINDS = ["RESEARCH", "BLOCKED"] as const;
 export const PLAN_ALLOWED_KINDS = ["PLAN", "BLOCKED"] as const;
 export const REVIEW_ALLOWED_KINDS = ["REVIEW", "DONE", "BLOCKED"] as const;
 
-export type ControlMailboxErrorCode =
+export type ControlRequestErrorCode =
   | "AUTH_REQUIRED"
-  | "MAILBOX_REQUEST_NOT_FOUND"
-  | "MAILBOX_REQUEST_EXPIRED"
-  | "MAILBOX_REQUEST_CANCELLED"
-  | "MAILBOX_SESSION_MISMATCH"
-  | "MAILBOX_CORRELATION_MISMATCH"
-  | "MAILBOX_TURN_IN_PROGRESS"
-  | "MAILBOX_INTEGRITY_ERROR"
-  | "MAILBOX_KIND_NOT_ALLOWED"
-  | "MAILBOX_RESULT_NOT_READY"
-  | "CONTROL_RESULT_TRANSPORT_MISMATCH"
-  | "MAILBOX_REQUEST_NOT_PENDING"
-  | "MAILBOX_PROGRESS_NOT_ALLOWED"
-  | "MAILBOX_PROGRESS_OUT_OF_ORDER"
-  | "RESULT_ALREADY_SUBMITTED"
+  | "CONTROL_REQUEST_NOT_FOUND"
+  | "CONTROL_REQUEST_EXPIRED"
+  | "CONTROL_REQUEST_CANCELLED"
+  | "CONTROL_REQUEST_SESSION_MISMATCH"
+  | "CONTROL_REQUEST_CORRELATION_MISMATCH"
+  | "CONTROL_REQUEST_TURN_IN_PROGRESS"
+  | "CONTROL_REQUEST_INTEGRITY_ERROR"
+  | "CONTROL_REQUEST_KIND_NOT_ALLOWED"
+  | "CONTROL_REQUEST_NOT_PENDING"
+  | "CONTROL_REQUEST_RESULT_NOT_READY"
+  | "CONTROL_REQUEST_OBSERVATION_OUT_OF_ORDER"
   | "INVALID_RESULT";
 
-export class ControlMailboxError extends Error {
+export class ControlRequestError extends Error {
   constructor(
-    readonly code: ControlMailboxErrorCode,
+    readonly code: ControlRequestErrorCode,
     message: string
   ) {
     super(message);
-    this.name = "ControlMailboxError";
+    this.name = "ControlRequestError";
   }
 }
 
@@ -176,15 +170,6 @@ const CURRENT_PAYLOAD_LIMITS: ControlPayloadLimits = {
   verification: 12, remainingRisks: 6, blockedReason: 600, needText: 240, needs: 5,
 };
 
-const STORED_PAYLOAD_LIMITS: ControlPayloadLimits = {
-  actionText: 1_000, actionRisks: 6, riskText: 400, testText: 500, criterionText: 500,
-  sourceTitle: 300, sourceEvidence: 1_200, question: 1_200, summary: 4_000, terminalSummary: 2_000,
-  conclusionText: 1_200, conclusions: 20, sources: 20, openQuestionText: 600,
-  openQuestions: 12, findingLocation: 160, findingText: 1_000, findings: 20,
-  goal: 1_200, rationale: 4_000, actions: 20, tests: 20, criteria: 12,
-  verification: 20, remainingRisks: 12, blockedReason: 2_000, needText: 500, needs: 12,
-};
-
 function createControlPayloadSchemas(limits: ControlPayloadLimits) {
   const action = z.object({
     file: relativeFileHintSchema.optional(),
@@ -243,7 +228,6 @@ function createControlPayloadSchemas(limits: ControlPayloadLimits) {
 }
 
 const currentPayloadSchemas = createControlPayloadSchemas(CURRENT_PAYLOAD_LIMITS);
-const storedPayloadSchemas = createControlPayloadSchemas(STORED_PAYLOAD_LIMITS);
 export const bootPayloadSchema = currentPayloadSchemas.boot;
 export const researchPayloadSchema = currentPayloadSchemas.research;
 export const planPayloadSchema = currentPayloadSchemas.plan;
@@ -262,53 +246,9 @@ function createControlResultSubmissionSchema(payloads: ReturnType<typeof createC
   ]);
 }
 
-function createSubmitControlResultInputSchema(payloads: ReturnType<typeof createControlPayloadSchemas>) {
-  const correlation = {
-    requestId: c2cIdSchema,
-    localSessionId: c2cIdSchema,
-    taskId: c2cIdSchema,
-    iteration: z.number().int().min(0).max(MAX_C2C_ITERATION),
-  };
-  return z.discriminatedUnion("kind", [
-    z.object({ ...correlation, phase: z.literal("BOOT"), kind: z.literal("BOOT"), payload: payloads.boot }).strict(),
-    z.object({ ...correlation, phase: z.literal("RESEARCH"), kind: z.literal("RESEARCH"), payload: payloads.research }).strict(),
-    z.object({ ...correlation, phase: z.literal("PLAN"), kind: z.literal("PLAN"), payload: payloads.plan }).strict(),
-    z.object({ ...correlation, phase: z.literal("REVIEW"), kind: z.literal("REVIEW"), payload: payloads.review }).strict(),
-    z.object({ ...correlation, phase: z.literal("REVIEW"), kind: z.literal("DONE"), payload: payloads.done }).strict(),
-    z.object({ ...correlation, phase: z.enum(CONTROL_PHASES), kind: z.literal("BLOCKED"), payload: payloads.blocked }).strict(),
-  ]);
-}
-
 export const controlResultSubmissionSchema = createControlResultSubmissionSchema(currentPayloadSchemas);
-const storedSubmitControlResultInputSchema = createSubmitControlResultInputSchema(storedPayloadSchemas);
-export const submitControlResultInputSchema = createSubmitControlResultInputSchema(currentPayloadSchemas);
 
 export type ControlResultSubmission = z.infer<typeof controlResultSubmissionSchema>;
-
-export type SubmitControlResultInput = z.infer<typeof submitControlResultInputSchema>;
-
-export const controlProgressUpdateSchema = z
-  .object({
-    status: z.enum(CONTROL_PROGRESS_STATES),
-    message: boundedText(500).optional(),
-  })
-  .strict();
-
-export type ControlProgressUpdate = z.infer<typeof controlProgressUpdateSchema>;
-
-export const reportControlProgressInputSchema = z
-  .object({
-    requestId: c2cIdSchema,
-    localSessionId: c2cIdSchema,
-    taskId: c2cIdSchema,
-    iteration: z.number().int().min(0).max(MAX_C2C_ITERATION),
-    phase: z.enum(CONTROL_PHASES),
-    status: z.enum(CONTROL_PROGRESS_STATES),
-    message: boundedText(500).optional(),
-  })
-  .strict();
-
-export type ReportControlProgressInput = z.infer<typeof reportControlProgressInputSchema>;
 
 export interface ControlResultCorrelation {
   taskId: string;
@@ -325,64 +265,12 @@ export interface ControlResultRequest {
   iteration: number;
   phase: ControlPhase;
   allowedKinds: ControlResultKind[];
-  /** Surface generation that authorized this request, or null for isolated mailbox use. */
+  /** Surface generation that authorized this request, or null for pre-migration records. */
   surfaceGeneration: number | null;
   /** Exact browser tab that authorized this request, paired with surfaceGeneration. */
   surfaceTabId: string | null;
   createdAt: string;
   expiresAt: string;
-}
-
-export interface ControlResultEnvelope {
-  schemaVersion: 1;
-  requestId: string;
-  workspaceId: string;
-  localSessionId: string;
-  taskId: string;
-  iteration: number;
-  phase: ControlPhase;
-  kind: ControlResultKind;
-  payload: SubmitControlResultInput["payload"];
-  receivedAt: string;
-  payloadHash: string;
-  resultId: string;
-}
-
-export interface ControlResultReceipt {
-  accepted: true;
-  requestId: string;
-  localSessionId: string;
-  resultId: string;
-  phase: ControlPhase;
-  kind: ControlResultKind;
-  receivedAt: string;
-  idempotentReplay: boolean;
-}
-
-export interface ControlProgressEnvelope {
-  schemaVersion: 1;
-  requestId: string;
-  workspaceId: string;
-  localSessionId: string;
-  taskId: string;
-  iteration: number;
-  phase: ControlPhase;
-  status: ControlProgressState;
-  message: string | null;
-  reportedAt: string;
-  progressHash: string;
-  progressId: string;
-}
-
-export interface ControlProgressReceipt {
-  accepted: true;
-  requestId: string;
-  localSessionId: string;
-  progressId: string;
-  phase: ControlPhase;
-  status: ControlProgressState;
-  reportedAt: string;
-  idempotentReplay: boolean;
 }
 
 export function allowedKindsForPhase(phase: ControlPhase): ControlResultKind[] {
@@ -391,47 +279,10 @@ export function allowedKindsForPhase(phase: ControlPhase): ControlResultKind[] {
   return phase === "PLAN" ? [...PLAN_ALLOWED_KINDS] : [...REVIEW_ALLOWED_KINDS];
 }
 
-export function parseSubmitControlResultInput(input: unknown): SubmitControlResultInput {
-  const parsed = submitControlResultInputSchema.safeParse(input);
-  if (!parsed.success) {
-    throw new ControlMailboxError("INVALID_RESULT", parsed.error.issues.map((issue) => issue.message).join("; "));
-  }
-  assertCanonicalSize({ kind: parsed.data.kind, payload: parsed.data.payload });
-  return parsed.data;
-}
-
 export function parseControlResultSubmission(input: unknown): ControlResultSubmission {
   const parsed = controlResultSubmissionSchema.safeParse(input);
   if (!parsed.success) {
-    throw new ControlMailboxError("INVALID_RESULT", parsed.error.issues.map((issue) => issue.message).join("; "));
-  }
-  assertCanonicalSize(parsed.data);
-  return parsed.data;
-}
-
-/** Validate immutable mailbox data accepted before the tighter admission contract. */
-export function parseStoredSubmitControlResultInput(input: unknown): SubmitControlResultInput {
-  const parsed = storedSubmitControlResultInputSchema.safeParse(input);
-  if (!parsed.success) {
-    throw new ControlMailboxError("INVALID_RESULT", parsed.error.issues.map((issue) => issue.message).join("; "));
-  }
-  assertCanonicalSize({ kind: parsed.data.kind, payload: parsed.data.payload }, MAX_STORED_CONTROL_RESULT_BYTES);
-  return parsed.data as SubmitControlResultInput;
-}
-
-export function parseReportControlProgressInput(input: unknown): ReportControlProgressInput {
-  const parsed = reportControlProgressInputSchema.safeParse(input);
-  if (!parsed.success) {
-    throw new ControlMailboxError("INVALID_RESULT", parsed.error.issues.map((issue) => issue.message).join("; "));
-  }
-  assertCanonicalSize(parsed.data);
-  return parsed.data;
-}
-
-export function parseControlProgressUpdate(input: unknown): ControlProgressUpdate {
-  const parsed = controlProgressUpdateSchema.safeParse(input);
-  if (!parsed.success) {
-    throw new ControlMailboxError("INVALID_RESULT", parsed.error.issues.map((issue) => issue.message).join("; "));
+    throw new ControlRequestError("INVALID_RESULT", parsed.error.issues.map((issue) => issue.message).join("; "));
   }
   assertCanonicalSize(parsed.data);
   return parsed.data;
@@ -448,21 +299,21 @@ export function sha256Hex(value: string): string {
 export function assertCanonicalSize(value: unknown, maximumBytes = MAX_CONTROL_RESULT_BYTES): void {
   const size = Buffer.byteLength(canonicalJson(value), "utf8");
   if (size > maximumBytes) {
-    throw new ControlMailboxError("INVALID_RESULT", `control result exceeds ${maximumBytes} bytes`);
+    throw new ControlRequestError("INVALID_RESULT", `control result exceeds ${maximumBytes} bytes`);
   }
 }
 
 export function validateControlId(value: string, label = "id"): string {
   const normalized = value.trim();
   if (!C2C_ID_PATTERN.test(normalized)) {
-    throw new ControlMailboxError("INVALID_RESULT", `${label} must be a safe identifier`);
+    throw new ControlRequestError("INVALID_RESULT", `${label} must be a safe identifier`);
   }
   return normalized;
 }
 
 export function validateBrowserTabId(value: string, label = "tab id"): string {
   if (!isBrowserTabId(value)) {
-    throw new ControlMailboxError("INVALID_RESULT", `${label} must be a valid browser locator`);
+    throw new ControlRequestError("INVALID_RESULT", `${label} must be a valid browser locator`);
   }
   return value;
 }

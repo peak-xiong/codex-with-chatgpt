@@ -11,7 +11,7 @@ vi.mock("../src/config/paths.js", async (importOriginal) => {
     writeSecureJson(file: string, data: unknown): void {
       if (
         observationWriteFault.failOnce &&
-        file.includes(`${path.sep}control-mailbox${path.sep}`) &&
+        file.includes(`${path.sep}control-requests${path.sep}`) &&
         file.includes(`${path.sep}observations${path.sep}`)
       ) {
         observationWriteFault.failOnce = false;
@@ -22,7 +22,7 @@ vi.mock("../src/config/paths.js", async (importOriginal) => {
   };
 });
 
-import { getActiveControlResultStatus } from "../src/control/mailbox.js";
+import { getActiveControlRequestStatus, getControlRequestsDir } from "../src/control/requests.js";
 import { MachineGateway, requireCurrentTurnSurface } from "../src/gateway/machine-gateway.js";
 import { cleanup, isolateStateDir, makeTmpDir, projectSelection, receiveBootResult } from "./helpers.js";
 
@@ -60,12 +60,12 @@ describe("terminal observation recovery", () => {
     });
 
     const turn = { taskId: "terminal-recovery", iteration: 0, phase: "REVIEW" as const };
-    const { request } = gateway.openControlResultRequest(identity, turn);
+    const { request } = gateway.openControlRequest(identity, turn);
     const grant = gateway.issueTurn({
       ...identity,
       ...turn,
       requestId: request.requestId,
-      scopes: ["workspace.read", "c2c.result.write"],
+      scopes: ["workspace.read"],
       compactionEpoch: 0,
       generation: page.generation,
     });
@@ -98,7 +98,7 @@ describe("terminal observation recovery", () => {
       responseId: "response-terminal-recovery",
       state: "result_candidate" as const,
       responseIsFinal: true as const,
-      reason: "callback_missing" as const,
+      reason: "platform_blocked" as const,
       source: "host_observed" as const,
       errorCode: "UNKNOWN" as const,
       completionEvidence: { responseActionsVisible: true as const, stopControlAbsent: true as const },
@@ -118,7 +118,7 @@ describe("terminal observation recovery", () => {
       .toThrow(/injected observation write failure/);
     expect(gateway.turnStatus(grant.token).status).toBe("revoked");
     expect(() => gateway.claimTurn(grant.token, ["workspace.read"])).toThrow(/revoked/i);
-    expect(getActiveControlResultStatus(identity.workspaceId, identity.localSessionId))
+    expect(getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId))
       .toMatchObject({ status: "cancelled", requestId: request.requestId });
 
     const delayedNow = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
@@ -130,18 +130,18 @@ describe("terminal observation recovery", () => {
     expect(restartedGateway.observeControlPage(restartedIdentity, request.requestId, turn, terminal))
       .toMatchObject({ status: "cancelled", pageObservation: { latest: terminal } });
     delayedNow.mockRestore();
-    expect(getActiveControlResultStatus(identity.workspaceId, identity.localSessionId)).toBeNull();
+    expect(getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId)).toBeNull();
 
     expect(restartedGateway.observeControlPage(restartedIdentity, request.requestId, turn, terminal))
       .toMatchObject({ status: "cancelled", pageObservation: { latest: terminal } });
 
     const nextTurn = { ...turn, iteration: 1 };
-    const { request: nextRequest } = gateway.openControlResultRequest(identity, nextTurn);
+    const { request: nextRequest } = gateway.openControlRequest(identity, nextTurn);
     const nextGrant = gateway.issueTurn({
       ...identity,
       ...nextTurn,
       requestId: nextRequest.requestId,
-      scopes: ["workspace.read", "c2c.result.write"],
+      scopes: ["workspace.read"],
       compactionEpoch: 0,
       generation: page.generation,
     });
@@ -172,7 +172,7 @@ describe("terminal observation recovery", () => {
       responseId: "response-terminal-active-cleanup",
       state: "result_candidate" as const,
       responseIsFinal: true as const,
-      reason: "callback_missing" as const,
+      reason: "platform_blocked" as const,
       source: "host_observed" as const,
       errorCode: "UNKNOWN" as const,
       completionEvidence: { responseActionsVisible: true as const, stopControlAbsent: true as const },
@@ -193,7 +193,7 @@ describe("terminal observation recovery", () => {
       const target = String(args[0]);
       if (
         failActiveRemoval &&
-        target.includes(`${path.sep}control-mailbox${path.sep}`) &&
+        target.includes(`${path.sep}control-requests${path.sep}`) &&
         target.includes(`${path.sep}active${path.sep}`)
       ) {
         failActiveRemoval = false;
@@ -206,11 +206,11 @@ describe("terminal observation recovery", () => {
     removeSpy.mockRestore();
 
     expect(gateway.turnStatus(nextGrant.token).status).toBe("revoked");
-    expect(getActiveControlResultStatus(identity.workspaceId, identity.localSessionId))
+    expect(getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId))
       .toMatchObject({ status: "cancelled", requestId: nextRequest.requestId });
     expect(gateway.observeControlPage(identity, nextRequest.requestId, nextTurn, nextTerminal))
       .toMatchObject({ status: "cancelled", pageObservation: { latest: nextTerminal } });
-    expect(getActiveControlResultStatus(identity.workspaceId, identity.localSessionId)).toBeNull();
+    expect(getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId)).toBeNull();
   });
 
   it("revokes a cancelled request when active pointer cleanup fails", () => {
@@ -234,12 +234,12 @@ describe("terminal observation recovery", () => {
     });
 
     const turn = { taskId: "cancel-cleanup", iteration: 0, phase: "PLAN" as const };
-    const { request } = gateway.openControlResultRequest(identity, turn);
+    const { request } = gateway.openControlRequest(identity, turn);
     const grant = gateway.issueTurn({
       ...identity,
       ...turn,
       requestId: request.requestId,
-      scopes: ["workspace.read", "c2c.result.write"],
+      scopes: ["workspace.read"],
       compactionEpoch: 0,
       generation: page.generation,
     });
@@ -250,7 +250,7 @@ describe("terminal observation recovery", () => {
       const target = String(args[0]);
       if (
         failActiveRemoval &&
-        target.includes(`${path.sep}control-mailbox${path.sep}`) &&
+        target.includes(`${path.sep}control-requests${path.sep}`) &&
         target.includes(`${path.sep}active${path.sep}`)
       ) {
         failActiveRemoval = false;
@@ -258,24 +258,24 @@ describe("terminal observation recovery", () => {
       }
       return originalRemove(...args);
     }) as typeof fs.rmSync);
-    expect(() => gateway.cancelControlResultRequest(identity, request.requestId, turn))
+    expect(() => gateway.cancelControlRequest(identity, request.requestId, turn))
       .toThrow(/injected cancel active pointer cleanup failure/);
     removeSpy.mockRestore();
 
     expect(gateway.turnStatus(grant.token).status).toBe("revoked");
     expect(() => gateway.claimTurn(grant.token, ["workspace.read"])).toThrow(/revoked/i);
-    expect(getActiveControlResultStatus(identity.workspaceId, identity.localSessionId))
+    expect(getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId))
       .toMatchObject({ status: "cancelled", requestId: request.requestId });
-    expect(gateway.cancelControlResultRequest(identity, request.requestId, turn))
+    expect(gateway.cancelControlRequest(identity, request.requestId, turn))
       .toMatchObject({ status: "cancelled" });
-    expect(getActiveControlResultStatus(identity.workspaceId, identity.localSessionId)).toBeNull();
+    expect(getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId)).toBeNull();
   });
 
-  it("repairs BOOT active cleanup when surface commit is replayed after acknowledgement", () => {
+  it("repairs active pointer cleanup after BOOT final observation without affecting another session", () => {
     cleanups.push(isolateStateDir());
-    const root = makeTmpDir("boot-ack-cleanup-recovery");
+    const root = makeTmpDir("boot-observation-cleanup-recovery");
     cleanups.push(root);
-    const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface, resultTransport: "mailbox" });
+    const gateway = new MachineGateway({ surfaceValidator: requireCurrentTurnSurface });
     const identity = { ...gateway.registerWorkspace(root), localSessionId: "session-boot-cleanup" };
     const chatUrl = projectUrl.replace("/project", "/c/boot-cleanup");
     const page = gateway.surfaceClaim(identity, {
@@ -286,34 +286,57 @@ describe("terminal observation recovery", () => {
       chatUrl,
       projectSelection: projectSelection(projectUrl),
     });
-    const bootRequestId = receiveBootResult(gateway, identity, page);
+    const otherIdentity = { ...identity, localSessionId: "session-boot-cleanup-other" };
+    const otherRequest = gateway.openControlRequest(otherIdentity, {
+      taskId: "other-session-work",
+      iteration: 0,
+      phase: "RESEARCH",
+    });
 
     const originalRemove = fs.rmSync.bind(fs);
     let failActiveRemoval = true;
+    const activePath = path.join(
+      getControlRequestsDir(identity.workspaceId),
+      "active",
+      `${identity.localSessionId}.json`,
+    );
     const removeSpy = vi.spyOn(fs, "rmSync").mockImplementation(((...args: any[]) => {
       const target = String(args[0]);
-      if (
-        failActiveRemoval &&
-        target.includes(`${path.sep}control-mailbox${path.sep}`) &&
-        target.includes(`${path.sep}active${path.sep}`)
-      ) {
+      if (failActiveRemoval && target === activePath) {
         failActiveRemoval = false;
         throw new Error("injected BOOT active pointer cleanup failure");
       }
       return originalRemove(...args);
     }) as typeof fs.rmSync);
-    expect(() => gateway.surfaceCommit(identity, page, {
-      bootRequestId,
-      connectorName: "Codex with ChatGPT",
-    })).toThrow(/injected BOOT active pointer cleanup failure/);
+    expect(() => receiveBootResult(gateway, identity, page))
+      .toThrow(/injected BOOT active pointer cleanup failure/);
+    expect(failActiveRemoval).toBe(false);
     removeSpy.mockRestore();
 
-    expect(getActiveControlResultStatus(identity.workspaceId, identity.localSessionId))
-      .toMatchObject({ status: "acknowledged", requestId: bootRequestId });
+    const interrupted = getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId);
+    expect(interrupted)
+      .toMatchObject({
+        status: "cancelled",
+        requestId: expect.any(String),
+        hostObservedResult: { provenance: "host_observed", result: { kind: "BOOT" } },
+      });
+    const bootRequestId = interrupted?.requestId;
+    const finalObservation = interrupted?.pageObservation?.latest;
+    if (!bootRequestId || finalObservation?.state !== "final") {
+      throw new Error("expected the failed cleanup to leave the exact BOOT final observable");
+    }
+    const bootCorrelation = { taskId: `boot-${page.generation}`, iteration: 0, phase: "BOOT" as const };
+    expect(gateway.observeControlPage(identity, bootRequestId, bootCorrelation, finalObservation))
+      .toMatchObject({ status: "cancelled", pageObservation: { latest: finalObservation } });
+    expect(getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId)).toBeNull();
+    expect(getActiveControlRequestStatus(identity.workspaceId, otherIdentity.localSessionId))
+      .toMatchObject({ status: "pending", requestId: otherRequest.request.requestId });
+
     expect(gateway.surfaceCommit(identity, page, {
       bootRequestId,
       connectorName: "Codex with ChatGPT",
     })).toMatchObject({ binding: { chatUrl } });
-    expect(getActiveControlResultStatus(identity.workspaceId, identity.localSessionId)).toBeNull();
+    expect(getActiveControlRequestStatus(identity.workspaceId, otherIdentity.localSessionId))
+      .toMatchObject({ status: "pending", requestId: otherRequest.request.requestId });
   });
 });

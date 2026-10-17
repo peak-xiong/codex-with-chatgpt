@@ -57,18 +57,25 @@ cwd. Install once per OS user; do not maintain project-local copies.
    a fresh UI observation, submit final with the identical normalized result and
    evidence. The Gateway requires at least 1500 ms between accepted observations.
    For a page-dependent failure, use the same candidate/final sequence with
-   responseIsFinal:true, the exact reason/source and optional tool/errorCode, and
-   identical completionEvidence; omit terminalResult. Explicit
+   responseIsFinal:true, the exact reason/source and identical completionEvidence;
+   omit terminalResult. If `tool` is present, its only accepted value is
+   `business_tool`; `errorCode` must also match the protocol enum. Explicit
    response_start_failed, page_lost and authority_invalid remain independent
    immediate failures.
-   In Computer Use, callback_missing means the expected final result marker or
-   contract is absent or invalid; it does not mean an MCP callback tool failed.
+   When a completed response lacks a valid result marker or contract, the host
+   records the page failure as `reason: result_invalid` and
+   `source: host_observed`; never ask ChatGPT to author this host-only failure.
+   It follows the same candidate/final sequence and 1500 ms fresh-observation
+   barrier. `callback_missing` is accepted only in stored historical failures.
    Consume wait.result only when wait.outcome is delivered or blocked; then
    execute or report the result locally.
 
-Use --request alone with the resolved --local-session for control status/wait/observe.
-The task/iteration/phase triple is an optional complete cross-check. A validation
-error returns the offending field; correct it instead of re-reading every schema.
+The user-facing lifecycle is `control open`, `status`, `wait`, `observe`, and
+`cancel`. Use `--request` with the resolved `--local-session` for status, wait,
+and observe; the task/iteration/phase triple is an optional complete cross-check.
+Cancel the exact request with its full task/iteration/phase correlation. A
+validation error returns the offending field; correct it instead of re-reading
+every schema.
 
 Read only the relevant section of <checkout>/docs/protocol.md when needed:
 
@@ -172,14 +179,12 @@ Do not repeat completed ChatGPT research without a verification reason.
 ChatGPT does not own writes, commands/tests, Git/PR mutations, deployments or
 execution-success claims.
 
-Computer Use is the only active result transport. Mailbox callbacks and
-c2c.result.write are dormant; absence is expected. Do not restore them or use
-control ack for a Computer Use result. A dormant mailbox result whose stored
-status is received or acknowledged is not a Computer Use completion: wait reports
-outcome/state transport_mismatch, result null and delivery mcp; the CLI reports
-failure and exits nonzero. Never consume its raw status.result. Legacy cancelled
-records with hostObservedResult and exact terminal replay remain compatible; use the
-public wait view.
+Computer Use is the sole result transport. Accept a result only from the exact
+page response after the candidate has remained stable for at least 1500 ms and a
+fresh UI observation confirms completion. Use the public `control wait` view for
+the validated result; never infer delivery from raw page text or stored fields.
+The 12 public read-only MCP tools and their output schemas remain available;
+mailbox callback tools and `c2c.result.write` are not part of the workflow.
 
 Wait slices (at most 30 seconds) are observation intervals, not task deadlines.
 Fresh exact-response generating evidence renews live authorization for long tasks.
@@ -202,6 +207,22 @@ confirm source and build. Do not guess accounts/endpoints/credentials or substit
 tunnel providers. The current runtime uses configured public HTTPS forwarding to
 the gateway with its transport token. Connector URLs may contain that token:
 reveal only for explicit setup, never in tracked docs or reports.
+
+The one-time control-request migration keeps only complete, valid Computer Use
+request history; callback-only request metadata, results, progress records and
+acknowledgements are not imported. Before cleanup, verify every eligible
+Computer Use record migrated without omissions or drift. Use only the
+registry-bound maintenance operation for the selected workspace, after migration
+succeeds, machine active and draining turn counts are zero, and no live request
+remains. From the registered workspace, run:
+
+```sh
+c2c control clear-legacy-mailbox -w <path> --local-session <id> --json
+```
+
+The command removes only that workspace's legacy request root and legacy
+checkpoint references; leave every other workspace root untouched. The
+protocol documents its validation and cleanup boundary.
 
 Refresh the existing app only when schema discovery needs it and the UI offers
 the action. Do not repeatedly hunt for missing controls or recreate the app.

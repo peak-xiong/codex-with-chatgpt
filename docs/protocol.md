@@ -1,10 +1,9 @@
 # C2C Protocol
 
 This document defines the machine gateway, browser routing, correlated control
-state, and ChatGPT prompt contracts. The mailbox callback implementation is
-retained but inactive while Computer Use is the result transport. Values shown
-as `<...>` are placeholders; never
-send a placeholder as a real identifier.
+state, and ChatGPT prompt contracts. Computer Use is the sole result transport.
+Values shown as `<...>` are placeholders; never send a placeholder as a real
+identifier.
 
 ## Read-only session preflight
 
@@ -30,11 +29,11 @@ URL cannot establish ChatGPT's connectivity or app permissions. Validate a real
 task-scoped MCP read when dispatching; avoid adding a separate discovery turn.
 
 The public result view is `wait.state`, `wait.delivery`, `wait.result` and
-`wait.nextAction`. A Computer Use result is delivered/blocked even though legacy
-storage uses cancelled + hostObservedResult. Existing storage remains readable;
-no mailbox migration or callback activation is required. The Computer Use wait
-path sleeps to the next page observation boundary rather than reading disk every
-250 ms. Existing callback tests retain their mailbox wait behavior.
+`wait.nextAction`. A Computer Use result is delivered/blocked even when its
+terminal request record is cancelled with `hostObservedResult`. The one-time
+storage migration is described under Workspace registration. The Computer Use
+wait path sleeps to the next page observation boundary rather than polling disk
+every 250 ms.
 
 ## Identifiers and scopes
 
@@ -68,12 +67,11 @@ workspace.read
 workspace.search
 git.read
 execution.read
-c2c.result.write
 ```
 
-The least set needed for a phase is requested. `c2c.result.write` remains
-reserved for dormant mailbox callback tests and is not granted by production
-`control open`. An MCP tool rejects a context that lacks its required scope.
+The least set needed for a phase is requested. An MCP tool rejects a context
+that lacks its required scope. Computer Use results are recorded by the host
+from the exact page observation.
 
 ## Machine setup contract
 
@@ -149,10 +147,12 @@ tool contracts while the gateway is healthy. If the actual UI offers Refresh
 and discovery needs updating, use it once and recheck. Do not assume a fixed
 Manage > Refresh path exists, or treat opening Manage as proof of refresh.
 Restarting the tunnel alone is not evidence that ChatGPT discovered new schemas.
-Confirm required read tools and input contracts; callback tools are intentionally
-absent in Computer Use mode. A scoped real read validates transport separately
-from catalog visibility. If contracts remain unavailable or stale, report that
-specific limitation without recreating apps or changing permissions/providers.
+Confirm required read tools and input contracts. A scoped real read validates
+transport separately from catalog visibility. If contracts remain unavailable
+or stale, report that specific limitation without recreating apps or changing
+permissions/providers.
+The public surface retains its 12 read-only MCP tools and output schemas;
+result delivery uses Computer Use.
 This is machine-wide discovery, not per-workspace installation.
 The public GPT catalog and custom Connector management are separate surfaces;
 GPT catalog visibility does not enumerate or prove this machine's connector
@@ -276,9 +276,38 @@ Session-route, page-recovery mirror, execution and update-check state stays
 inside the workspace repository boundary. Git checkouts use
 `<git-common-dir>/codex-with-chatgpt`; non-Git workspaces use
 `<workspace-root>/.codex-with-chatgpt`. The protected machine state directory
-owns the authoritative mailbox, runtime configuration, and cross-workspace
-Project URL, physical-tab and generation records. A workspace mirror is never
-imported into that authority.
+owns runtime configuration, `control-requests/<workspaceId>`, and the
+cross-workspace Project URL, physical-tab and generation records. A workspace
+mirror is never imported into that authority.
+
+### Control request storage migration
+
+The one-time migration reads the selected workspace's legacy
+`control-mailbox/<workspaceId>` root and imports only complete, schema-valid
+Computer Use request history into `control-requests/<workspaceId>`. Callback-only
+request metadata, results, progress records and acknowledgements are not
+imported. Before cleanup, verify that every eligible Computer Use record was
+migrated with no omissions or drift. Cleanup rechecks the legacy source manifest
+and migrated file manifest, and refuses removal if the source changed or a
+migrated file is missing or different. The registry-bound CLI command is:
+
+```sh
+c2c control clear-legacy-mailbox -w <path> --local-session <id> --json
+```
+
+It calls the admin-guarded internal route
+`/admin/control/clear-legacy-mailbox`, which verifies the exact workspace
+registration and refuses while any machine turn is active or draining. The
+store also refuses while any migrated or legacy request is live. On success, it
+removes only that workspace's `control-mailbox/<workspaceId>` root and its old
+mailbox checkpoint references; other workspace roots and sessions remain
+untouched. Do not use an unscoped filesystem cleanup for this migration.
+Before deletion, a private marker records a random retirement ID, the source
+device/inode and the `reserved`/`deleting` phase; after manifest checks, the
+root is atomically renamed into a workspace-specific retired directory under the
+same `control-mailbox` parent. An interrupted cleanup resumes only against the
+recorded inode; a reappearing source or source/identity drift before deletion
+authorization is refused.
 
 Unregister requires all three registration identities:
 
@@ -607,7 +636,7 @@ c2c surface check --local-session <id> --tab-id <id> --generation <n> \
 
 | Observed state | Action |
 | --- | --- |
-| Ready composer in the exact committed chat | Resume if the mailbox has no unresolved request |
+| Ready composer in the exact committed chat | Resume when this session has no unresolved control request |
 | Exact tab missing/closed, or URL changed | Reopen the saved chat in a hidden owned candidate |
 | Explicit archived/unavailable conversation at the exact saved chat URL | Create a new chat in the same owned tab from the saved Project URL, with a fresh generation |
 | C2C picker entry or selected-app chip missing | Keep the chat; attempt the normal authorized request with prompt-directed tool discovery |
@@ -722,10 +751,21 @@ verified `surface commit` operation may write the Project/chat route. Route
 fields that appear inside a checkpoint remain mirrors of the committed route
 and are never promoted to top-level session routing.
 
+Control checkpoint references use `controlRequestId` and `controlPhase`. Set
+both with `--control-request` and `--control-phase` together with
+`--protocol-state`; clear only that pair with `--clear-control` and
+`--protocol-state`. `--clear-control` cannot be combined with either reference
+flag. `--clear-checkpoint` removes the whole task checkpoint.
+
+```sh
+c2c session set --local-session <id> --protocol-state <state> \
+  --control-request <request-id> --control-phase <phase> --json
+```
+
 ## Delegation capability gate
 
 `CHATGPT_FIRST` applies to evidence-closed subtasks, not to broad business task
-names. Before creating a mailbox request, the host must map every required input
+names. Before creating a control request, the host must map every required input
 and operation to a currently available page capability, C2C read tool, or
 approved read-only plugin operation.
 
@@ -770,8 +810,8 @@ c2c control open \
 ```
 
 The response contains `RESULT_REQUEST_ID`, `CONTEXT_ID`, expiration, exact
-`tabId`, the surface `generation`, `resultTransport: "computer_use"`, and
-`resultContract` (current-phase payload examples and dispatch instructions).
+`tabId`, the surface `generation`, and `resultContract` (current-phase payload
+examples and dispatch instructions).
 The capability is bound to:
 
 ```text
@@ -801,9 +841,9 @@ Cancellation uses the exact request correlation to revoke every matching live
 capability. A healthy gateway returning zero matches is still a successful cleanup;
 this covers a crash before capability issuance and a gateway restart. If the
 managed gateway is stopped, start it and then cancel through its authenticated
-admin endpoint. An uncertain gateway state refuses to touch the mailbox. A
-request that is already open is never silently replaced: inspect or cancel it
-before opening another.
+admin endpoint. An uncertain gateway state refuses to change control request
+state. A request that is already open is never silently replaced: inspect or
+cancel it before opening another.
 
 ## MCP request contract
 
@@ -896,8 +936,9 @@ local remote (`--github-remote` when explicitly needed). A supplied repository
 must match it. Owner API callers provide that same trusted-local snapshot. Both
 CLI and Gateway check the exact task, session, page/generation, boot epoch, selected
 plugin set and five-minute freshness before issuing a plugin-dependent turn.
-The CLI rejects before opening a mailbox when preflight fails. Read/status/ack and
-ordinary C2C-only work remain usable. Include returned `pluginPolicy` in the prompt:
+The CLI rejects before opening a control request when preflight fails.
+`control status`, `wait`, `observe` and `cancel`, and ordinary C2C-only work
+remain usable. Include returned `pluginPolicy` in the prompt:
 no unlisted plugin, only scoped reads in the selected repository, and no writes.
 
 These are host dispatch checks, not independent browser/account attestation or a
@@ -960,9 +1001,8 @@ remote PRs or deployment state. Use the detailed execution tools when needed.
 Execution records may include an optional executor label (1–80 characters);
 older records without it remain valid and surface as absent/null metadata.
 
-The retained mailbox callbacks `get_control_result_status`,
-`report_control_progress`, and `submit_control_result` are intentionally not
-registered while the active result transport is `computer_use`.
+The MCP server exposes workspace reads. Result delivery is handled by the host
+through Computer Use and does not use an MCP write scope.
 
 ## Result delivery preflight
 
@@ -1001,12 +1041,9 @@ The marker and request ID identify a candidate result; they do not themselves
 prove acceptance. Return exactly one allowed result object, choosing either the
 phase success result or `BLOCKED`.
 
-Every delivery prompt declares `RESULT_TRANSPORT: COMPUTER_USE_ONLY` and
-`MAILBOX_CALLBACKS: DISABLED_EXPECTED`. Those declarations override earlier C2C
-mailbox directions in the same conversation. The absence of
-`get_control_result_status`, `report_control_progress`, and
-`submit_control_result` is expected, is not a blocker, and must not be reported
-as `BLOCKED`. The page marker itself is the delivery; there is no mailbox receipt.
+Every delivery prompt declares `RESULT_TRANSPORT: COMPUTER_USE_ONLY`. The exact
+page marker is the only result; a marker is accepted only after the host completes
+the candidate and fresh-observation checks below.
 
 Unavailable required read tools, explicit platform rejection or required approval stop
 business work. Missing optional evidence allows scoped conclusions with explicit
@@ -1063,10 +1100,9 @@ valid; empty `conclusions` is not. Web research still cites its real sources.
 
 Business refusal, missing input and inability to finish return terminal
 `BLOCKED` in the same final Computer Use marker. ChatGPT must include it in the
-first final page reply and must not wait for the user to interrupt, send another
-message, or request a callback. There are no progress callbacks. An explicit
-safety or approval block on a required read is reported as `BLOCKED`; do not try
-another tool, channel, app, or account to bypass it.
+first final page reply and must not wait for the user to interrupt or send another
+message. An explicit safety or approval block on a required read is reported as
+`BLOCKED`; do not try another tool, channel, app, or account to bypass it.
 
 `BLOCKED` uses `payload: {"reason": "<observed blocker>", "needs": ["<needed action>"]}`
 and the original request phase. It does not use the RESEARCH payload shape.
@@ -1075,8 +1111,6 @@ a clean review instead of inventing findings to populate a REVIEW payload.
 New results are limited to 16 KiB of canonical UTF-8 JSON, with tighter text
 and list limits; `BLOCKED.reason` is at most 600 characters and `needs` contains
 at most five items of 240 characters. Reject overflow rather than truncating it.
-Previously accepted mailbox results retain their original 32 KiB read limit.
-They are historical data and are not the active transport.
 
 Acceptance requires `pending -> cancelled + hostObservedResult`, with
 `wait.delivery: computer_use`, for each exact request. Test consecutive messages
@@ -1097,7 +1131,7 @@ template or send a second identity-check message.
 Only after Computer Use validates BOOT in the exact correlated response and the
 independently observed Project/chat URLs match the selected Project may the host
 commit the route. A page claim about success without protocol validation is not
-delivery. Callback tools are intentionally absent in this mode.
+delivery.
 
 Surface commit is a durable, idempotent sequence, not an indivisible filesystem
 transaction. After partial local failure, replay the same candidate, BOOT
@@ -1110,8 +1144,7 @@ Use `control open`'s `deliveryPrompt` as the single delivery template. It suppli
 the request/context/session/task/iteration/phase correlation, Computer Use-only
 transport, schema examples and proactive BLOCKED output. Append only the concise
 task, bounded evidence paths and any required `pluginPolicy`. Do not paste source,
-diffs, logs or credentials, duplicate the protocol fields, or restore callback
-directions from older conversation messages.
+diffs, logs or credentials, or duplicate the protocol fields.
 
 Machine-wide `prefs get/set` and `sandbox-clean` accept the obsolete `-w`
 workspace option but ignore it. `update-check -w` instead resolves the specified
@@ -1126,49 +1159,18 @@ comparison; scope grants do not create missing evidence.
 The policy delegates thinking, not execution or additional permissions. Codex
 validates the exact page result, implements changes and verifies local outcomes.
 
-## Dormant mailbox protocol
+## User-facing control lifecycle
 
-The mailbox callback implementation below is retained for comparison and tests,
-but production does not register or call it while `resultTransport` is
-`computer_use`. Do not run `control ack` in the active flow.
+The supported lifecycle commands are `c2c control open`, `status`, `wait`,
+`observe` and `cancel`. Status, wait and observe address the request with
+`--request` and the resolved `--local-session`; task, iteration and phase may be
+provided together as a cross-check. Cancel requires the exact request, task,
+iteration and phase. A wait timeout is only an observation interval and never
+permits resending while the same page response is still generating.
 
-The lifecycle is:
-
-```text
-pending -> received -> acknowledged
-       \\-> cancelled
-       \\-> expired
-```
-
-Wait for one exact request:
-
-```sh
-c2c control wait \
-  --local-session <local-session-id> \
-  --request <request-id> --task <task-id> --iteration <n> \
-  --phase <phase> --json
-```
-
-Then acknowledge it:
-
-```sh
-c2c control ack \
-  --local-session <local-session-id> \
-  --request <request-id> --task <task-id> --iteration <n> \
-  --phase <phase> --json
-```
-
-This dormant lifecycle remains tested but is not used by production. In the
-active flow, do not send the next question until the exact request has a
-verified Computer Use result, is cancelled, or expires. A wait timeout is not
-permission to resend while the page is generating.
-
-The normal mailbox lifecycle is locked per `localSessionId`; `open`, `ack`,
-`cancel`, and result writes do not acquire a workspace-wide lifecycle lock or
-queue other sessions. Pruning uses a separate short maintenance lock and
-processes each session independently. The surface metadata ownership lock is
-only a brief atomic uniqueness guard for lease commits and replacements; it
-does not limit or serialize browser turns.
+The host uses authenticated internal `/admin/control/...` operations to manage
+request state and record Computer Use observations. These operations are not MCP
+tools.
 
 ## Waiting and terminal observations
 
@@ -1185,11 +1187,11 @@ that ChatGPT is still generating.
 | `leaseRemainingMs` | Remaining activity lease, not a total task budget |
 | `elapsedMs` | Time since original request creation, for diagnostics only |
 | `checkPageAfterMs` | At most 30 seconds; earlier at half the remaining activity lease |
-| `outcome` | `pending`, `delivered`, `blocked`, `transport_mismatch` or `terminal` |
-| `delivery` | `computer_use` or `none` in the active mode; `mcp` exists only for dormant mailbox tests |
-| `state` | `pending`, `delivered`, `blocked`, `failed`, `evidence_only`, `transport_mismatch` or the stored terminal status |
-| `result` | Non-null only for a result delivered by the configured transport |
-| `nextAction` | Includes `confirm_response_final` while a candidate awaits recheck; `mark_send_attempted`, `confirm_send`, `inspect_response_start`, `inspect_exact_response`, `stop` and dormant `persist_then_ack` are also used |
+| `outcome` | `pending`, `delivered`, `blocked` or `terminal` |
+| `delivery` | `computer_use` for an accepted page result; otherwise `none` |
+| `state` | `pending`, `delivered`, `blocked`, `failed`, `evidence_only` or the stored terminal status |
+| `result` | Non-null only after an exact Computer Use result is accepted |
+| `nextAction` | Includes `confirm_response_final` while a candidate awaits recheck; `mark_send_attempted`, `confirm_send`, `inspect_response_start`, `inspect_exact_response`, `review_late_evidence` and `stop` are also used |
 
 `control wait` caps each slice at 30 seconds even if a larger `--timeout-ms`
 is supplied. Exit code 0 means a Computer Use result was validated, including a
@@ -1299,7 +1301,7 @@ uses `state: "result_candidate"`, `responseIsFinal: true`, the exact failure
   "responseId": "host-response-id",
   "state": "result_candidate",
   "responseIsFinal": true,
-  "reason": "callback_missing",
+  "reason": "result_invalid",
   "source": "host_observed",
   "errorCode": "UNKNOWN",
   "completionEvidence": {
@@ -1323,12 +1325,11 @@ not before the request). It does not independently verify the host's UI claim.
 do not fill it from an unrelated page or a quoted request ID.
 
 Those page, route, lease, and freshness checks gate only the first persistence
-of an observation. Once a terminal Computer Use result or `hostFailure` is durable, an
-exact terminal replay may bypass the current-page and 60-second gates solely to
-finish observation and active-pointer cleanup after delay, restart, or route
-replacement. Mailbox comparison must prove the replay matches the stored
-stored result or failure exactly; it cannot refresh the event, renew access, or
-reclassify the outcome. Plain
+of an observation. Once a terminal Computer Use result or `hostFailure` is
+durable, an exact terminal replay may bypass the current-page and 60-second gates
+solely to finish observation and active-pointer cleanup after delay, restart, or
+route replacement. A replay must match the stored result or failure exactly; it
+cannot refresh the event, renew access, or reclassify the outcome. Plain
 cancellation similarly revokes the exact request once its terminal marker is
 durable, even if active-pointer cleanup fails and must be replayed.
 
@@ -1340,10 +1341,10 @@ also include the canonical `observedUrl`. `response_created`, `generating`, and
 `generating` observation renews the same live request and capability using the
 original capability lease duration, and renews the exact owned surface. The
 original request creation time, correlation, token, scopes and page generation
-stay unchanged. Renewal is host-only; ChatGPT need not send a progress callback
-or receive another message. Persisted request renewal is one atomic sidecar
-under the session/request locks, shared by status, reopen, waiting and receipt
-checks. It cannot revive expired, cancelled, revoked or completed authority.
+stay unchanged. Renewal is host-only and does not require another page message.
+Persisted request renewal is one atomic sidecar under the session/request locks,
+shared by status, reopen, waiting and terminal checks. It cannot revive expired,
+cancelled, revoked or completed authority.
 Replaying the same observation does not move capability expiry forward again.
 
 The host automatically repeats observe/wait for ongoing generation. `unknown`
@@ -1366,7 +1367,7 @@ evidence, without requiring or persisting a result candidate, and does not pass
 the delivery stability barrier.
 `wait.state: evidence_only`, `wait.delivery: none` and
 `wait.nextAction: review_late_evidence` distinguish this from delivery. It cannot
-authorize local reads, commit BOOT or produce an MCP receipt.
+authorize local reads, commit BOOT or count as a delivered result.
 
 For a successful `final`, require `responseIsFinal: true`,
 `delivery: computer_use`, and a `terminalResult` parsed from the exact marker.
@@ -1379,33 +1380,31 @@ result. Explicit `response_start_failed`, `page_lost`, and `authority_invalid`
 remain independent terminal failures. Historical stored terminal observations,
 including old finals without `completionEvidence` and old `final` failures that
 also contain `terminalResult`, remain readable for audit and exact idempotent
-replay only. That compatibility does not permit those shapes on new writes or
-turn them into a newly authorized delivery. Exact replay may finish active
-request cleanup but does not create a result or renew authority.
+replay only. Stored historical failures may also contain
+`reason: "callback_missing"`; this value is not accepted for new observations.
+That compatibility does not permit those shapes on new writes or turn them into
+a newly authorized delivery. Exact replay may finish active request cleanup but
+does not create a result or renew authority.
 
-Transport is part of result validity. In production, `computer_use` is the
-active transport. A stored dormant mailbox result in `received` or
-`acknowledged` state is exposed by the public wait projection as
-`outcome: "transport_mismatch"`, `state: "transport_mismatch"`, and
-`result: null`; its delivery may identify the stored mailbox as `mcp`, but its
-payload is not exposed as a consumable result. CLI status/wait JSON reports
-`ok: false`, plain wait output does not print the mailbox payload, and these
-commands exit nonzero. BOOT commit checks the same configured-transport wait
-policy and rejects the mismatch. Consumers must use `wait.outcome` and
-`wait.result`, not the raw mailbox `status` or stored `result` field. Mailbox
-behavior remains available only to explicit mailbox-mode tests/configuration.
+Computer Use is the only result transport. The host accepts a result only after
+the exact `result_candidate`, the minimum 1500 ms stability window and a fresh
+UI observation of the same completed response. The public wait view exposes the
+accepted result; request storage remains host-owned.
 
-Classify page-dependent final failures with `reason` values `model_refusal`,
+Classify new page-dependent final failures with `reason` values `model_refusal`,
 `tool_unavailable`, `platform_blocked`, `capability_invalid`, or
-`callback_missing`. In Computer Use, `callback_missing` means the expected final
-result marker or contract is absent or invalid; it does not mean an MCP callback
-tool is unavailable. A still-generating or missing response is not completion
-evidence. Other `source` values are
-`model_reported`, `platform_error` or `mcp_error`; choose the latter two only
-when the actual error was observed, not quoted by ChatGPT. Optional `tool` is
-`report_control_progress`, `submit_control_result`, `get_control_result_status`
-or `business_tool`; do not include personal connector names. Optional `errorCode`
-is `TOKEN_REVOKED`, `TOKEN_EXPIRED`, `STALE_BINDING_EPOCH`, `TOOL_UNAVAILABLE`,
+`result_invalid`. `result_invalid` is host-only: use it when the host observes a
+completed exact response without a valid expected result marker or contract,
+with `source: "host_observed"`. Do not ask ChatGPT to author this failure.
+It follows the same candidate/final stability barrier above. A still-generating
+or missing response is not completion evidence. `callback_missing` is accepted
+only when reading stored historical failures and must not be written anew. Other
+`source` values are `model_reported`, `platform_error` or `mcp_error`; choose the
+latter two only when the actual error was observed, not quoted by ChatGPT. The
+optional `tool` field accepts only `business_tool`; never invent tool names or
+include personal connector names.
+Optional `errorCode` is `TOKEN_REVOKED`, `TOKEN_EXPIRED`,
+`STALE_BINDING_EPOCH`, `TOOL_UNAVAILABLE`,
 `SAFETY_CHECK_BLOCKED`, `APPROVAL_REQUIRED`, or `UNKNOWN`. Unknown causes remain
 unknown. Raw excerpts and arbitrary error strings are rejected without echoing
 them. No capability, key, cookie, or business payload belongs in a failure record.
@@ -1421,12 +1420,11 @@ request. `page_lost` records the same-named reason without requiring a URL.
 request capability remains live. These terminal observations stop only the
 affected session and never create a result.
 
-The authenticated host-only `/admin/mailbox/observe` endpoint is not an MCP
-tool. Despite its retained route name, it is the active Computer Use result
-ingress. A validated terminal result is stored as `hostObservedResult`; a page
-failure is stored separately as `hostFailure`. The request is closed and its
-exact capabilities are revoked. `result` remains null, no mailbox result ID or
-receipt is created, and no acknowledgment is allowed.
+Authenticated host-only `/admin/control/...` operations are not MCP tools. The
+observation operation records a validated terminal Computer Use result as
+`hostObservedResult` or a page failure separately as `hostFailure`. The request
+is closed and its exact capabilities are revoked. The public wait projection
+returns the accepted result from the host-owned request record.
 Other sessions and task checkpoints are not changed. Terminal persistence is a
 recoverable, idempotent transaction: once cancellation is durable, retries
 finish the observation and active-pointer cleanup, while the Gateway revokes
@@ -1457,7 +1455,8 @@ rotation, claim a new generation and issue a new context. On gateway restart,
 wait for the new `bootEpoch`, re-register the workspace, and issue a new
 context. Never reuse a stale capability.
 
-Browser text is never accepted as an MCP control result. Only a schema-valid
-terminal object paired to the exact response may be retained as separately
-labelled host-observed evidence; it cannot become a receipt. Recovery resumes
-or cancels the exact protected mailbox request and issues a fresh context when required.
+Browser prose outside the schema-bound marker is never a result. Only a
+schema-valid marker paired with the exact response and accepted through the
+Computer Use observation barrier appears in `wait.result`. Late evidence remains
+evidence-only and cannot authorize reads or a BOOT commit. Recovery resumes or
+cancels the exact protected control request and issues a fresh context when required.

@@ -13,9 +13,9 @@ import { describe, expect, it } from "vitest";
  * example whose `--ttl-ms` expired mid-round-trip; nothing else in the suite would
  * notice if that came back.
  *
- * Behaviour — the validation messages themselves, and lookups by `--request` alone — is
- * covered by tests/gateway-server.test.ts and tests/cli-control.test.ts. If those and
- * this file ever disagree, believe those.
+ * Behaviour — validation messages and request lookup using `--request` with the
+ * resolved `--local-session` — is covered by tests/gateway-server.test.ts and
+ * tests/cli-control.test.ts. Correlation flags remain optional complete cross-checks.
  */
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const read = (relative: string): string =>
@@ -88,10 +88,10 @@ describe("first-pairing guidance", () => {
   });
 
   it("does not send readers back to the superseded lookup contract", () => {
-    // `control status|wait|observe` locate a request by `--request` alone; the triple is
-    // an optional cross-check. The runbook previously claimed the opposite, which is the
-    // exact advice that made a first-pairing `control status` fail on a missing `--task`.
+    // Status, wait and observe require request plus local-session identity; a complete
+    // task/iteration/phase triple is an optional cross-check.
     expect(skill).not.toMatch(/Lookup commands[^.]*need the full correlation/);
-    expect(skill).toMatch(/--request alone/);
+    expect(skill).toContain("Use `--request` with the resolved `--local-session` for status, wait, and observe");
+    expect(skill).toContain("task/iteration/phase triple is an optional complete cross-check");
   });
 });

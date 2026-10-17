@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { controlWaitPolicy } from "../src/control/wait-policy.js";
+import { controlWaitPolicy, CONTROL_RESULT_FINAL_STABILITY_MS } from "../src/control/wait-policy.js";
 import { MachineGateway, requireCurrentTurnSurface } from "../src/gateway/machine-gateway.js";
 import { TurnCapabilityError, type TurnCapabilityBinding } from "../src/gateway/turn-capability.js";
-import { acknowledgeControlResult, getControlResultStatus, openControlResultRequest, submitControlResult } from "../src/control/mailbox.js";
+import { getControlRequestStatus } from "../src/control/requests.js";
 import { readSession, updateSession } from "../src/session/state.js";
 import {
   claimSurface,
@@ -76,7 +76,7 @@ function issueBootTurn(
   taskId: string,
 ) {
   const identity = { ...registration, localSessionId };
-  const { request } = gateway.openControlResultRequest(identity, {
+  const { request } = gateway.openControlRequest(identity, {
     taskId,
     iteration: 0,
     phase: "BOOT",
@@ -84,8 +84,50 @@ function issueBootTurn(
   return { request, grant: gateway.issueTurn(turn(registration, localSessionId, generation, taskId, request.requestId)) };
 }
 
+function completeComputerUseRequest(
+  gateway: MachineGateway,
+  identity: Parameters<MachineGateway["openControlRequest"]>[0],
+  page: { tabId: string; generation: number; projectUrl: string; chatUrl?: string },
+  request: { requestId: string },
+  correlation: { taskId: string; iteration: number; phase: "BOOT" | "RESEARCH" | "PLAN" | "REVIEW" },
+  terminalResult: { kind: "BOOT" | "BLOCKED"; payload: unknown },
+) {
+  const wasUsingFakeTimers = vi.isFakeTimers();
+  if (!wasUsingFakeTimers) vi.useFakeTimers({ toFake: ["Date"] });
+  const startedAt = Date.now();
+  const observedUrl = page.chatUrl ?? page.projectUrl;
+  const responseId = `response-${request.requestId}`;
+  const observe = (observationSequence: number, state: "send_attempted" | "sent" | "response_created" | "result_candidate" | "final") =>
+    gateway.observeControlPage(identity, request.requestId, correlation, {
+      tabId: page.tabId,
+      generation: page.generation,
+      observedUrl,
+      observedAt: new Date().toISOString(),
+      responseToRequestId: request.requestId,
+      observationSequence,
+      state,
+      ...(observationSequence >= 3 ? { responseId } : {}),
+      ...(observationSequence >= 4 ? {
+        responseIsFinal: true as const,
+        delivery: "computer_use" as const,
+        terminalResult,
+        completionEvidence: { responseActionsVisible: true as const, stopControlAbsent: true as const },
+      } : {}),
+    });
+  try {
+    observe(1, "send_attempted");
+    observe(2, "sent");
+    observe(3, "response_created");
+    observe(4, "result_candidate");
+    vi.setSystemTime(startedAt + CONTROL_RESULT_FINAL_STABILITY_MS);
+    return observe(5, "final");
+  } finally {
+    if (!wasUsingFakeTimers) vi.useRealTimers();
+  }
+}
+
 describe("machine gateway surface invalidation", () => {
-  it.each(["tab-old", "tab-new"])("requires resolving the exact mailbox before rotating to %s and preserves checkpoint and other sessions", (replacementTab) => {
+  it.each(["tab-old", "tab-new"])("requires resolving the exact control request before rotating to %s and preserves checkpoint and other sessions", (replacementTab) => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("gateway-surface-recovery");
     cleanups.push(root);
@@ -104,7 +146,7 @@ describe("machine gateway surface invalidation", () => {
     });
     const other = surface(registration.projectId, "session-other", "tab-other");
     const otherContext = issueBootTurn(gateway, registration, "session-other", other.generation, "other-task").grant;
-    const request = gateway.openControlResultRequest(identity, { taskId: "keep-task", iteration: 2, phase: "PLAN" });
+    const request = gateway.openControlRequest(identity, { taskId: "keep-task", iteration: 2, phase: "PLAN" });
     const context = gateway.issueTurn({
       ...turn(registration, identity.localSessionId, first.generation, "keep-task", request.request.requestId),
       iteration: 2,
@@ -115,19 +157,19 @@ describe("machine gateway surface invalidation", () => {
       ownerProcessEpoch: "owner-recover", replaces: first, leaseTtlMs: 60000,
     };
     expect(gateway.surfaceGet(identity).control).toMatchObject({ status: "pending", requestId: request.request.requestId });
-    expect(() => gateway.surfaceClaim(identity, replacement)).toThrow(/Resolve the active mailbox/);
+    expect(() => gateway.surfaceClaim(identity, replacement)).toThrow(/Resolve the active control request/);
     // An exact reclaim while generation is busy remains idempotent.
     expect(gateway.surfaceClaim(identity, { ...replacement, tabId: first.tabId, chatUrl: first.chatUrl }).generation).toBe(first.generation);
     expect(gateway.turnStatus(context.token).status).not.toBe("revoked");
-    submitControlResult(registration.workspaceId, {
-      requestId: request.request.requestId, localSessionId: identity.localSessionId,
-      taskId: "keep-task", iteration: 2, phase: "PLAN", kind: "BLOCKED",
+    const completed = completeComputerUseRequest(gateway, identity, first, request.request, {
+      taskId: "keep-task", iteration: 2, phase: "PLAN",
+    }, {
+      kind: "BLOCKED",
       payload: { reason: "Fixture result", needs: ["Consume this result before recovery"] },
     });
-    expect(gateway.surfaceGet(identity).control?.status).toBe("received");
-    expect(() => gateway.surfaceClaim(identity, replacement)).toThrow(/consume and acknowledge/);
-    acknowledgeControlResult(registration.workspaceId, request.request.requestId, identity.localSessionId, {
-      taskId: "keep-task", iteration: 2, phase: "PLAN",
+    expect(completed).toMatchObject({
+      status: "cancelled",
+      hostObservedResult: { provenance: "host_observed", result: { kind: "BLOCKED" } },
     });
     const candidate = gateway.surfaceClaim(identity, replacement);
     expect(candidate.tabId).toBe(replacementTab);
@@ -222,19 +264,9 @@ describe("machine gateway surface invalidation", () => {
     expect(claimedBoot.workspace.id).toBe(registration.workspaceId);
     gateway.releaseTurn(boot.token, claimedBoot.lease);
 
-    submitControlResult(registration.workspaceId, {
-      requestId: bootTurn.request.requestId,
-      localSessionId: "session-candidate",
-      taskId: "task-boot",
-      iteration: 0,
-      phase: "BOOT",
-      kind: "BOOT",
-      payload: {},
-    });
-    acknowledgeControlResult(registration.workspaceId, bootTurn.request.requestId, "session-candidate", {
-      taskId: "task-boot", iteration: 0, phase: "BOOT",
-    });
-    const laterRequest = gateway.openControlResultRequest(
+    completeComputerUseRequest(gateway, { ...registration, localSessionId: "session-candidate" }, candidate,
+      bootTurn.request, { taskId: "task-boot", iteration: 0, phase: "BOOT" }, { kind: "BOOT", payload: {} });
+    const laterRequest = gateway.openControlRequest(
       { ...registration, localSessionId: "session-candidate" },
       { taskId: "task-later", iteration: 0, phase: "RESEARCH" },
     );
@@ -281,7 +313,7 @@ describe("machine gateway surface invalidation", () => {
       responseId: "response-boot-receipt",
       state: "final",
       responseIsFinal: true,
-      reason: "callback_missing",
+      reason: "result_invalid",
       source: "host_observed",
       excerpt: "The page says BOOT succeeded",
     } as never)).toThrow(/raw page text/);
@@ -310,7 +342,6 @@ describe("machine gateway surface invalidation", () => {
     });
     expect(observed).toMatchObject({
       status: "cancelled",
-      result: null,
       hostObservedResult: { provenance: "host_observed", result: { kind: "BOOT" } },
     });
     expect(gateway.surfaceCommit(identity, candidate, {
@@ -366,7 +397,7 @@ describe("machine gateway surface invalidation", () => {
       responseId: "response-failed-boot",
       state: "result_candidate" as const,
       responseIsFinal: true as const,
-      reason: "callback_missing" as const,
+      reason: "result_invalid" as const,
       source: "host_observed" as const,
       errorCode: "UNKNOWN" as const,
       completionEvidence: { responseActionsVisible: true as const, stopControlAbsent: true as const },
@@ -377,6 +408,9 @@ describe("machine gateway surface invalidation", () => {
       ...failureCandidate,
       terminalResult: { kind: "BOOT", payload: {} },
     } as never)).toThrow(/invalid control page observation/);
+    expect(() => gateway.observeControlPage(identity, boot.request.requestId, {
+      taskId: "task-failed-boot", iteration: 0, phase: "BOOT",
+    }, { ...failureCandidate, reason: "callback_missing" } as never)).toThrow(/invalid control page observation/);
     expect(() => gateway.observeControlPage(identity, boot.request.requestId, {
       taskId: "task-failed-boot", iteration: 0, phase: "BOOT",
     }, { ...failureCandidate, state: "final" })).toThrow(/exact response lifecycle/);
@@ -403,15 +437,14 @@ describe("machine gateway surface invalidation", () => {
     });
     expect(failed).toMatchObject({
       status: "cancelled",
-      result: null,
-      hostFailure: { reason: "callback_missing" },
+      hostFailure: { reason: "result_invalid", source: "host_observed" },
     });
     expect(failed.hostObservedResult).toBeUndefined();
     expect(controlWaitPolicy(failed)).toMatchObject({ state: "failed", delivery: "none", result: null });
     expect(() => gateway.surfaceCommit(identity, candidate, {
       bootRequestId: boot.request.requestId,
       chatUrl: candidate.chatUrl,
-    })).toThrow(/active result transport/);
+    })).toThrow(/successful BOOT result/);
   });
 
   it("revokes a context when its surface is released", () => {
@@ -463,7 +496,7 @@ describe("machine gateway surface invalidation", () => {
     expect(gateway.turnStatus(context.token).status).toBe("revoked");
   });
 
-  it("retires the session surface, contexts, and mailbox together", () => {
+  it("retires the session surface, contexts, and control requests together", () => {
     cleanups.push(isolateStateDir());
     const root = makeTmpDir("gateway-surface-retire");
     cleanups.push(root);
@@ -482,7 +515,7 @@ describe("machine gateway surface invalidation", () => {
       connectorName: "Codex with ChatGPT",
     });
     expect(gateway.surfaceGet(identity).projectUrl).toBe(PROJECT_URL);
-    const request = gateway.openControlResultRequest(identity, {
+    const request = gateway.openControlRequest(identity, {
       taskId: "task-retire-gateway",
       iteration: 0,
       phase: "PLAN",
@@ -497,15 +530,14 @@ describe("machine gateway surface invalidation", () => {
       retired: true,
       revokedContexts: 1,
       removedLeases: 1,
-      mailbox: {
+      controlRequests: {
         pendingCancelled: 1,
-        receivedAcknowledged: 0,
         activeRequestCleared: true,
       },
     });
     expect(gateway.turnStatus(context.token).status).toBe("revoked");
     expect(gateway.surfaceGet(identity).projectUrl).toBe(PROJECT_URL);
-    expect(getControlResultStatus(registration.workspaceId, request.request.requestId, identity.localSessionId, {
+    expect(getControlRequestStatus(registration.workspaceId, request.request.requestId, identity.localSessionId, {
       taskId: "task-retire-gateway", iteration: 0, phase: "PLAN",
     }).status).toBe("cancelled");
 

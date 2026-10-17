@@ -5,12 +5,11 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { observeMachineRuntime } from "../src/gateway/runtime.js";
 import type { MachineRuntimeState } from "../src/gateway/runtime.js";
-import { observeMailboxPage, type MailboxIdentity } from "../src/gateway/control-client.js";
+import { adminFetch } from "../src/gateway/control-client.js";
 import { bindMachineConnector, connectorMachine } from "../src/gateway/connector-binding.js";
 import { machineHttpPort } from "../src/process/machine-daemon.js";
 import { vi } from "vitest";
 import type { MachineGateway, MachineSurfaceIdentity } from "../src/gateway/machine-gateway.js";
-import { submitControlResult } from "../src/control/mailbox.js";
 import type { ControlResultCorrelation, ControlResultSubmission } from "../src/control/result-schema.js";
 import { CONTROL_RESULT_FINAL_STABILITY_MS } from "../src/control/wait-policy.js";
 import type { SurfaceLease } from "../src/session/surface-ownership.js";
@@ -26,24 +25,11 @@ export function receiveBootResult(
   lease: SurfaceLease,
 ): string {
   const taskId = `boot-${lease.generation}`;
-  const { request } = gateway.openControlResultRequest(identity, {
+  const { request } = gateway.openControlRequest(identity, {
     taskId,
     iteration: 0,
     phase: "BOOT",
   });
-  if (gateway.resultTransport === "mailbox") {
-    submitControlResult(identity.workspaceId, {
-      requestId: request.requestId,
-      localSessionId: identity.localSessionId,
-      taskId,
-      iteration: 0,
-      phase: "BOOT",
-      kind: "BOOT",
-      payload: {},
-    });
-    return request.requestId;
-  }
-
   const wasUsingFakeTimers = vi.isFakeTimers();
   if (!wasUsingFakeTimers) vi.useFakeTimers({ toFake: ["Date"] });
   const initialTime = Date.now();
@@ -54,7 +40,7 @@ export function receiveBootResult(
       iteration: 0,
       phase: "BOOT",
       requestId: request.requestId,
-      scopes: ["c2c.result.write"],
+      scopes: ["workspace.read"],
       compactionEpoch: 0,
       generation: lease.generation,
     });
@@ -109,7 +95,7 @@ export function receiveBootResult(
 /** Submit a synthetic Computer Use response through the managed Gateway boundary. */
 export async function observeComputerUseResultForTest(
   runtime: MachineRuntimeState,
-  identity: MailboxIdentity,
+  identity: MachineSurfaceIdentity,
   request: { requestId: string } & ControlResultCorrelation,
   page: { tabId: string; generation: number; projectUrl: string; chatUrl: string },
   result: ControlResultSubmission,
@@ -121,7 +107,11 @@ export async function observeComputerUseResultForTest(
     state: "send_attempted" | "sent" | "response_created" | "result_candidate" | "final",
     observedUrl: string,
     includeResult = false,
-  ) => observeMailboxPage(runtime, identity, {
+  ) => adminFetch(runtime, "POST", "/admin/control/observe", {
+    workspaceId: identity.workspaceId,
+    projectId: identity.projectId,
+    registrationId: identity.registrationId,
+    localSessionId: identity.localSessionId,
     requestId: request.requestId,
     taskId: request.taskId,
     iteration: request.iteration,

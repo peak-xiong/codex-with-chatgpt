@@ -1,14 +1,10 @@
 import { z } from "zod";
 import { createHash } from "node:crypto";
 import { browserTabIdSchema } from "../session/browser-tab-id.js";
-import {
-  ACTIVE_CONTROL_RESULT_TRANSPORT,
-  type ControlResultTransport,
-} from "./result-transport.js";
-import type { ControlStatus } from "./mailbox.js";
+import type { ControlRequestSnapshot } from "./requests.js";
 import {
   canonicalJson,
-  ControlMailboxError,
+  ControlRequestError,
   c2cIdSchema,
   parseControlResultSubmission,
   controlResultSubmissionSchema,
@@ -43,7 +39,17 @@ const failureReasonSchema = z.enum([
   "tool_unavailable",
   "platform_blocked",
   "capability_invalid",
+  "result_invalid",
+  "response_start_failed",
+  "page_lost",
+]);
+const legacyFailureReasonSchema = z.enum([
+  "model_refusal",
+  "tool_unavailable",
+  "platform_blocked",
+  "capability_invalid",
   "callback_missing",
+  "result_invalid",
   "response_start_failed",
   "page_lost",
 ]);
@@ -53,7 +59,8 @@ const failureSourceSchema = z.enum([
   "mcp_error",
   "host_observed",
 ]);
-const failureToolSchema = z.enum([
+const failureToolSchema = z.enum(["business_tool"]).optional();
+const legacyFailureToolSchema = z.enum([
   "report_control_progress",
   "submit_control_result",
   "get_control_result_status",
@@ -90,25 +97,43 @@ const computerUseFailureFields = {
   completionEvidence: computerUseCompletionEvidenceSchema,
 };
 
+const legacyComputerUseFailureFields = {
+  responseIsFinal: z.literal(true),
+  reason: legacyFailureReasonSchema.exclude(["response_start_failed", "page_lost"]),
+  source: failureSourceSchema,
+  tool: legacyFailureToolSchema,
+  errorCode: failureCodeSchema,
+  completionEvidence: computerUseCompletionEvidenceSchema.optional(),
+};
+
+function requireHostObservedResultInvalid(
+  value: { reason: string; source: string },
+  context: z.RefinementCtx,
+): void {
+  if (value.reason === "result_invalid" && value.source !== "host_observed") {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["source"],
+      message: "result_invalid is only valid for host-observed Computer Use failures",
+    });
+  }
+}
+
 const computerUseFailureCandidateSchema = responseIdentity.extend({
   state: z.literal("result_candidate"),
   ...computerUseFailureFields,
-}).strict();
+}).strict().superRefine(requireHostObservedResultInvalid);
 
 const finalHostFailureSchema = responseIdentity.extend({
   state: z.literal("final"),
   ...computerUseFailureFields,
-}).strict();
+}).strict().superRefine(requireHostObservedResultInvalid);
 
 /** Historical page failures remain readable, but are never accepted as new observations. */
 export const legacyFinalHostFailureSchema = responseIdentity.extend({
   state: z.literal("final"),
-  responseIsFinal: z.literal(true),
-  reason: failureReasonSchema.exclude(["response_start_failed", "page_lost"]),
-  source: failureSourceSchema,
-  tool: failureToolSchema,
-  errorCode: failureCodeSchema,
-}).strict();
+  ...legacyComputerUseFailureFields,
+}).strict().superRefine(requireHostObservedResultInvalid);
 
 const computerUseResultCandidateSchema = responseIdentity.extend({
   state: z.literal("result_candidate"),
@@ -149,7 +174,7 @@ const authorityInvalidHostFailureSchema = z.object({
 }).strict();
 
 // No free-form page excerpts: these diagnostics must not persist credentials or business data.
-export const controlHostFailureSchema = z.discriminatedUnion("state", [
+export const controlHostFailureSchema = z.union([
   finalHostFailureSchema,
   responseStartFailureSchema,
   pageLostHostFailureSchema,
@@ -178,13 +203,25 @@ const legacyFinalComputerUseResultSchema = responseIdentity.extend({
   terminalResult: controlResultSubmissionSchema,
 }).strict();
 
-const legacyFinalFailedObservationSchema = legacyFinalHostFailureSchema.extend({
+const legacyFinalFailedObservationSchema = responseIdentity.extend({
+  state: z.literal("final"),
+  ...legacyComputerUseFailureFields,
   terminalResult: controlResultSubmissionSchema.optional(),
-}).strict();
+}).strict().superRefine(requireHostObservedResultInvalid);
+
+const legacyFailureCandidateSchema = responseIdentity.extend({
+  state: z.literal("result_candidate"),
+  ...legacyComputerUseFailureFields,
+}).strict().superRefine(requireHostObservedResultInvalid);
 
 const legacyTerminalObservationSchema = z.union([
   legacyFinalComputerUseResultSchema,
   legacyFinalFailedObservationSchema,
+]);
+
+const legacyStoredObservationSchema = z.union([
+  legacyFailureCandidateSchema,
+  legacyTerminalObservationSchema,
 ]);
 
 export const controlTerminalObservationSchema = z.union([
@@ -214,12 +251,14 @@ export type ControlHostObservedResult = z.infer<typeof controlHostObservedResult
 export type ControlTerminalObservation = z.infer<typeof controlTerminalObservationSchema>;
 export type ControlPageObservation = z.infer<typeof controlPageObservationSchema>;
 type LegacyTerminalObservation = z.infer<typeof legacyTerminalObservationSchema>;
-export type StoredControlPageObservation = ControlPageObservation | LegacyTerminalObservation;
+type LegacyStoredObservation = z.infer<typeof legacyStoredObservationSchema>;
+export type StoredControlPageObservation = ControlPageObservation | LegacyStoredObservation;
 export type DefinitiveControlPageObservation = Exclude<StoredControlPageObservation, { state: "unknown" }>;
 
 type CompletionObservation =
   | Extract<ControlPageObservation, { state: "result_candidate" }>
-  | Extract<ControlPageObservation, { state: "final" }>;
+  | Extract<ControlPageObservation, { state: "final" }>
+  | Extract<LegacyStoredObservation, { state: "result_candidate" }>;
 
 function completionPayload(observation: CompletionObservation): unknown {
   return "delivery" in observation
@@ -250,7 +289,7 @@ export interface ControlPageObservationState {
 export function parseControlPageObservation(value: unknown): ControlPageObservation {
   const parsed = controlPageObservationSchema.safeParse(value);
   if (!parsed.success) {
-    throw new ControlMailboxError(
+    throw new ControlRequestError(
       "INVALID_RESULT",
       "invalid control page observation; raw page text and unlisted diagnostic fields are not accepted",
     );
@@ -261,7 +300,6 @@ export function parseControlPageObservation(value: unknown): ControlPageObservat
     terminalResult: parseControlResultSubmission(parsed.data.terminalResult),
   };
 }
-
 function normalizeStoredTerminalObservation(value: LegacyTerminalObservation): LegacyTerminalObservation {
   if (!("terminalResult" in value) || value.terminalResult === undefined) return value;
   return { ...value, terminalResult: parseControlResultSubmission(value.terminalResult) };
@@ -276,9 +314,12 @@ export function parseStoredControlPageObservation(value: unknown): StoredControl
       ? { ...observation, terminalResult: parseControlResultSubmission(observation.terminalResult) }
       : observation;
   }
-  const legacy = legacyTerminalObservationSchema.safeParse(value);
-  if (legacy.success) return normalizeStoredTerminalObservation(legacy.data);
-  throw new ControlMailboxError("INVALID_RESULT", "stored page observation payload is invalid");
+  const legacy = legacyStoredObservationSchema.safeParse(value);
+  if (legacy.success) {
+    if (legacy.data.state === "result_candidate") return legacy.data;
+    return normalizeStoredTerminalObservation(legacyTerminalObservationSchema.parse(legacy.data));
+  }
+  throw new ControlRequestError("INVALID_RESULT", "stored page observation payload is invalid");
 }
 
 /** True only for a legacy terminal payload identical to the terminal already on disk. */
@@ -307,8 +348,8 @@ export function parseLateControlPageObservation(
       ("responseId" in prior && observation.responseId !== prior.responseId) ||
       observation.observationSequence <= previous.latest.observationSequence ||
       Date.parse(observation.observedAt) <= Date.parse(prior.observedAt)) {
-    throw new ControlMailboxError(
-      "MAILBOX_CORRELATION_MISMATCH",
+    throw new ControlRequestError(
+      "CONTROL_REQUEST_CORRELATION_MISMATCH",
       "late response does not match the exact prompt, page, response, and sequence",
     );
   }
@@ -329,7 +370,7 @@ export function advanceControlPageObservation(
 ): { state: ControlPageObservationState; idempotentReplay: boolean; terminal: ControlTerminalObservation | null } {
   const observation = parseControlPageObservation(input);
   if (!Number.isFinite(Date.parse(acceptedAt)) || new Date(acceptedAt).toISOString() !== acceptedAt) {
-    throw new ControlMailboxError("INVALID_RESULT", "page observation acceptance time is invalid");
+    throw new ControlRequestError("INVALID_RESULT", "page observation acceptance time is invalid");
   }
   if (previous && observation.observationSequence === previous.latest.observationSequence) {
     if (JSON.stringify(observation) === JSON.stringify(previous.latest)) {
@@ -339,10 +380,10 @@ export function advanceControlPageObservation(
         terminal: isTerminalObservation(previous.latest) ? previous.latest : null,
       };
     }
-    throw new ControlMailboxError("MAILBOX_PROGRESS_OUT_OF_ORDER", "page observation sequence conflicts with an existing event");
+    throw new ControlRequestError("CONTROL_REQUEST_OBSERVATION_OUT_OF_ORDER", "page observation sequence conflicts with an existing event");
   }
   if (previous && observation.observationSequence < previous.latest.observationSequence) {
-    throw new ControlMailboxError("MAILBOX_PROGRESS_OUT_OF_ORDER", "page observation is stale or out of order");
+    throw new ControlRequestError("CONTROL_REQUEST_OBSERVATION_OUT_OF_ORDER", "page observation is stale or out of order");
   }
   const prior = previous?.lastDefinitive ?? null;
   if (observation.state === "unknown") {
@@ -362,7 +403,7 @@ export function advanceControlPageObservation(
     const priorLatest = previous.latest;
     if (observation.responseToRequestId !== priorLatest.responseToRequestId ||
         observation.tabId !== priorLatest.tabId || observation.generation !== priorLatest.generation) {
-      throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "page observation belongs to another request or page generation");
+      throw new ControlRequestError("CONTROL_REQUEST_CORRELATION_MISMATCH", "page observation belongs to another request or page generation");
     }
   }
 
@@ -380,7 +421,7 @@ export function advanceControlPageObservation(
     observation.state === "page_lost" ||
     observation.state === "authority_invalid";
   if (!transitionAllowed) {
-    throw new ControlMailboxError("MAILBOX_PROGRESS_OUT_OF_ORDER", "page observation does not follow the exact response lifecycle");
+    throw new ControlRequestError("CONTROL_REQUEST_OBSERVATION_OUT_OF_ORDER", "page observation does not follow the exact response lifecycle");
   }
 
   if (
@@ -389,21 +430,21 @@ export function advanceControlPageObservation(
     (observation.responseId !== prior.responseId ||
       ("observedUrl" in observation && "observedUrl" in prior && observation.observedUrl !== prior.observedUrl))
   ) {
-    throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "page observation belongs to a replacement response or URL");
+    throw new ControlRequestError("CONTROL_REQUEST_CORRELATION_MISMATCH", "page observation belongs to a replacement response or URL");
   }
 
   if (observation.state === "final") {
     if (prior?.state !== "result_candidate" ||
         canonicalJson(completionPayload(prior)) !== canonicalJson(completionPayload(observation))) {
-      throw new ControlMailboxError("MAILBOX_CORRELATION_MISMATCH", "final observation requires its exact completion candidate");
+      throw new ControlRequestError("CONTROL_REQUEST_CORRELATION_MISMATCH", "final observation requires its exact completion candidate");
     }
     if (Date.parse(observation.observedAt) <= Date.parse(prior.observedAt)) {
-      throw new ControlMailboxError("MAILBOX_PROGRESS_OUT_OF_ORDER", "final observation requires a newer UI observation");
+      throw new ControlRequestError("CONTROL_REQUEST_OBSERVATION_OUT_OF_ORDER", "final observation requires a newer UI observation");
     }
     const candidateAcceptedAt = previous?.lastDefinitiveAcceptedAt;
     if (candidateAcceptedAt == null ||
         Date.parse(acceptedAt) - Date.parse(candidateAcceptedAt) < CONTROL_RESULT_FINAL_STABILITY_MS) {
-      throw new ControlMailboxError("MAILBOX_PROGRESS_OUT_OF_ORDER", "final observation requires a fresh stability recheck");
+      throw new ControlRequestError("CONTROL_REQUEST_OBSERVATION_OUT_OF_ORDER", "final observation requires a fresh stability recheck");
     }
   }
 
@@ -425,20 +466,15 @@ export function advanceControlPageObservation(
 }
 
 export function controlWaitPolicy(
-  status: ControlStatus,
-  resultTransport: ControlResultTransport = ACTIVE_CONTROL_RESULT_TRANSPORT,
+  status: ControlRequestSnapshot,
   now = Date.now(),
 ) {
   const remainingMs = status.request ? Math.max(0, Date.parse(status.request.expiresAt) - now) : 0;
-  const mailboxDelivered = (status.status === "received" || status.status === "acknowledged") && status.result !== null;
   const computerUseDelivered = status.status === "cancelled" && status.hostObservedResult !== undefined &&
     (!status.hostFailure || status.hostObservedResult.result.kind === "BLOCKED");
-  const activeDelivered = resultTransport === "mailbox" ? mailboxDelivered : computerUseDelivered;
-  const inactiveDelivered = resultTransport === "mailbox" ? computerUseDelivered : mailboxDelivered;
-  const activeKind = resultTransport === "mailbox" ? status.result?.kind : status.hostObservedResult?.result.kind;
-  const outcome = activeDelivered
+  const activeKind = status.hostObservedResult?.result.kind;
+  const outcome = computerUseDelivered
     ? activeKind === "BLOCKED" ? "blocked" : "delivered"
-    : inactiveDelivered ? "transport_mismatch"
     : status.status !== "pending" ? "terminal" : "pending";
   const observedState = status.pageObservation?.lastDefinitive?.state;
   const pendingAction = observedState === undefined
@@ -452,17 +488,13 @@ export function controlWaitPolicy(
         : "inspect_exact_response";
   return {
     outcome,
-    state: status.lateEvidence ? "evidence_only" : activeDelivered
+    state: status.lateEvidence ? "evidence_only" : computerUseDelivered
       ? outcome === "blocked" ? "blocked" : "delivered"
-      : inactiveDelivered ? "transport_mismatch" : status.hostFailure ? "failed" : status.status,
-    result: activeDelivered && resultTransport === "mailbox" && status.result
-      ? { kind: status.result.kind, payload: status.result.payload }
-      : activeDelivered ? status.hostObservedResult?.result ?? null : null,
-    delivery: mailboxDelivered ? "mcp" : computerUseDelivered ? "computer_use" : "none",
+      : status.hostFailure ? "failed" : status.status,
+    result: computerUseDelivered ? status.hostObservedResult?.result ?? null : null,
+    delivery: computerUseDelivered ? "computer_use" : "none",
     nextAction: status.lateEvidence ? "review_late_evidence"
-      : activeDelivered && resultTransport === "mailbox"
-        ? status.status === "received" ? "persist_then_ack" : "stop"
-        : outcome === "pending" ? pendingAction : "stop",
+      : outcome === "pending" ? pendingAction : "stop",
     leaseExpiresAt: status.request?.expiresAt ?? null,
     leaseRemainingMs: remainingMs,
     elapsedMs: status.request ? Math.max(0, now - Date.parse(status.request.createdAt)) : 0,
@@ -472,14 +504,4 @@ export function controlWaitPolicy(
           Math.max(1, Math.floor(remainingMs / 2)),
         ) : 0,
   };
-}
-
-/** Remove inactive-transport result fields before exposing a status to CLI consumers. */
-export function controlStatusForTransport(
-  status: ControlStatus,
-  resultTransport: ControlResultTransport = ACTIVE_CONTROL_RESULT_TRANSPORT,
-): ControlStatus {
-  if (controlWaitPolicy(status, resultTransport).outcome !== "transport_mismatch") return status;
-  const { result: _mailboxResult, hostObservedResult: _computerUseResult, ...rest } = status;
-  return { ...rest, result: null };
 }

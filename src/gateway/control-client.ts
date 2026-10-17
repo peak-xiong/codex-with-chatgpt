@@ -20,10 +20,11 @@ import type {
   ControlResultCorrelation,
 } from "../control/result-schema.js";
 import type {
-  ControlStatus,
-  OpenControlResultRequestStatus,
-  RetireControlResultSessionSummary,
-} from "../control/mailbox.js";
+  ControlRequestSnapshot,
+  LegacyControlMailboxCleanupResult,
+  OpenControlRequestStatus,
+  RetireControlRequestSessionSummary,
+} from "../control/requests.js";
 import {
   assertChatGPTSurfaceIdentity,
   CHATGPT_BROWSER_ID,
@@ -69,23 +70,23 @@ export interface SurfaceViewResponse {
   projectUrl: string | null;
   lease: SurfaceLease | null;
   binding: SurfaceBinding | null;
-  control: ControlStatus | null;
+  control: ControlRequestSnapshot | null;
 }
 
 export type SurfaceRetireResponse = RetireSurfaceSessionResult & {
   revokedContexts: number;
-  mailbox: RetireControlResultSessionSummary;
+  controlRequests: RetireControlRequestSessionSummary;
 };
 
 export interface SurfaceIdentity extends MachineSurfaceIdentity {}
 
-export interface MailboxIdentity extends MachineSurfaceIdentity {}
+export interface ControlIdentity extends MachineSurfaceIdentity {}
 
-export interface OpenMailboxRequestInput extends ControlResultCorrelation {
+export interface OpenControlRequestInput extends ControlResultCorrelation {
   ttlMs?: number;
 }
 
-export interface MailboxLookupInput extends ControlResultCorrelation {
+export interface ControlLookupInput extends ControlResultCorrelation {
   requestId: string;
 }
 
@@ -97,13 +98,16 @@ export interface MailboxLookupInput extends ControlResultCorrelation {
  * Supply the triple to add a cross-check. A partial triple is rejected by the gateway
  * — pass all three or none.
  *
- * `ack` and `cancel` deliberately do not use this type: they settle a request, so
- * `MailboxLookupInput` keeps the triple mandatory there as a tripwire.
+ * `cancel` requires the full correlation as a tripwire against settling the wrong request.
  */
-export interface MailboxInspectionInput
+export interface ControlInspectionInput
   extends Partial<Pick<ControlResultCorrelation, "taskId" | "iteration" | "phase">> {
   requestId: string;
 }
+
+export type ClearLegacyControlMailboxResponse = LegacyControlMailboxCleanupResult & {
+  checkpointReferencesCleared: number;
+};
 
 function surfaceLeaseRef(lease: SurfaceLeaseRef): SurfaceLeaseRef {
   assertChatGPTSurfaceIdentity(lease.browserId, lease.surfaceId);
@@ -306,7 +310,15 @@ export function retireSurface(
   return adminFetch(runtime, "POST", "/admin/surfaces/retire", identity, timeoutMs);
 }
 
-function mailboxIdentityBody(identity: MailboxIdentity): MailboxIdentity {
+export function clearLegacyControlMailbox(
+  runtime: MachineRuntimeState,
+  identity: MachineRegistrationIdentity,
+  timeoutMs = DEFAULT_ADMIN_TIMEOUT_MS,
+): Promise<ClearLegacyControlMailboxResponse> {
+  return adminFetch(runtime, "POST", "/admin/control/clear-legacy-mailbox", identity, timeoutMs);
+}
+
+function controlIdentityBody(identity: ControlIdentity): ControlIdentity {
   return {
     workspaceId: identity.workspaceId,
     projectId: identity.projectId,
@@ -315,73 +327,61 @@ function mailboxIdentityBody(identity: MailboxIdentity): MailboxIdentity {
   };
 }
 
-export function openMailboxRequest(
+export function openControlRequest(
   runtime: MachineRuntimeState,
-  identity: MailboxIdentity,
-  input: OpenMailboxRequestInput,
+  identity: ControlIdentity,
+  input: OpenControlRequestInput,
   timeoutMs = DEFAULT_ADMIN_TIMEOUT_MS,
-): Promise<OpenControlResultRequestStatus> {
-  return adminFetch(runtime, "POST", "/admin/mailbox/open", {
-    ...mailboxIdentityBody(identity),
+): Promise<OpenControlRequestStatus> {
+  return adminFetch(runtime, "POST", "/admin/control/open", {
+    ...controlIdentityBody(identity),
     ...input,
   }, timeoutMs);
 }
 
-export function getMailboxStatus(
+export function getControlRequestStatus(
   runtime: MachineRuntimeState,
-  identity: MailboxIdentity,
-  input: MailboxInspectionInput,
+  identity: ControlIdentity,
+  input: ControlInspectionInput,
   timeoutMs = DEFAULT_ADMIN_TIMEOUT_MS,
-): Promise<ControlStatus> {
-  return adminFetch(runtime, "POST", "/admin/mailbox/status", {
-    ...mailboxIdentityBody(identity),
+): Promise<ControlRequestSnapshot> {
+  return adminFetch(runtime, "POST", "/admin/control/status", {
+    ...controlIdentityBody(identity),
     ...input,
   }, timeoutMs);
 }
 
-export function waitMailboxResult(
+export function waitForControlRequest(
   runtime: MachineRuntimeState,
-  identity: MailboxIdentity,
-  input: MailboxInspectionInput & { timeoutMs: number },
+  identity: ControlIdentity,
+  input: ControlInspectionInput & { timeoutMs: number },
   timeoutMs = Math.max(DEFAULT_ADMIN_TIMEOUT_MS, input.timeoutMs + 5_000),
-): Promise<ControlStatus> {
-  return adminFetch(runtime, "POST", "/admin/mailbox/wait", {
-    ...mailboxIdentityBody(identity),
+): Promise<ControlRequestSnapshot> {
+  return adminFetch(runtime, "POST", "/admin/control/wait", {
+    ...controlIdentityBody(identity),
     ...input,
   }, timeoutMs);
 }
 
-export function acknowledgeMailboxResult(
+export function cancelControlRequest(
   runtime: MachineRuntimeState,
-  identity: MailboxIdentity,
-  input: MailboxLookupInput,
+  identity: ControlIdentity,
+  input: ControlLookupInput,
   timeoutMs = DEFAULT_ADMIN_TIMEOUT_MS,
-): Promise<ControlStatus> {
-  return adminFetch(runtime, "POST", "/admin/mailbox/ack", {
-    ...mailboxIdentityBody(identity),
+): Promise<ControlRequestSnapshot> {
+  return adminFetch(runtime, "POST", "/admin/control/cancel", {
+    ...controlIdentityBody(identity),
     ...input,
   }, timeoutMs);
 }
 
-export function cancelMailboxRequest(
+export function observeControlRequest(
   runtime: MachineRuntimeState,
-  identity: MailboxIdentity,
-  input: MailboxLookupInput,
+  identity: ControlIdentity,
+  input: ControlInspectionInput & { observation: unknown },
   timeoutMs = DEFAULT_ADMIN_TIMEOUT_MS,
-): Promise<ControlStatus> {
-  return adminFetch(runtime, "POST", "/admin/mailbox/cancel", {
-    ...mailboxIdentityBody(identity),
-    ...input,
-  }, timeoutMs);
-}
-
-export function observeMailboxPage(
-  runtime: MachineRuntimeState,
-  identity: MailboxIdentity,
-  input: MailboxInspectionInput & { observation: unknown },
-  timeoutMs = DEFAULT_ADMIN_TIMEOUT_MS,
-): Promise<ControlStatus> {
-  return adminFetch(runtime, "POST", "/admin/mailbox/observe", {
-    ...mailboxIdentityBody(identity), ...input,
+): Promise<ControlRequestSnapshot> {
+  return adminFetch(runtime, "POST", "/admin/control/observe", {
+    ...controlIdentityBody(identity), ...input,
   }, timeoutMs);
 }

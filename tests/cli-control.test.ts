@@ -53,13 +53,8 @@ function runJson(
   return { command, body: JSON.parse(lines.at(-1) ?? "{}") as Record<string, unknown> };
 }
 
-function planResult(requestId: string) {
+function planResult() {
   return {
-    requestId,
-    localSessionId: "session-a",
-    taskId: "c2c_0123456789abcdef",
-    iteration: 0,
-    phase: "PLAN",
     kind: "PLAN",
     payload: {
       goal: "Keep one local question matched to one ChatGPT answer",
@@ -107,6 +102,24 @@ it("preflight includes the exact active request without changing its registratio
   expect(after.body).toMatchObject({ nextAction: "resume_request", surface: { control: {
     requestId: (opened.body.request as { requestId: string }).requestId, status: "pending",
   } } });
+});
+
+it("rejects the removed ack command and mailbox transport flags", () => {
+  const ack = runCli([
+    "control", "ack", "-w", workspace, "--local-session", "session-a", "--request", "request-old",
+    "--task", "task-old", "--iteration", "0", "--phase", "PLAN",
+  ]);
+  expect(ack.status).toBe(1);
+  expect(ack.stdout + ack.stderr).toMatch(/unknown command.*ack/i);
+
+  for (const flag of ["--mailbox", "--result-transport"]) {
+    const removedFlag = runCli([
+      "control", "open", flag, "mailbox", "--task", "task-old", "--iteration", "0", "--phase", "PLAN",
+    ]);
+    expect(removedFlag.status).toBe(1);
+    expect(removedFlag.stdout + removedFlag.stderr).toMatch(/unknown option/i);
+    expect(removedFlag.stdout + removedFlag.stderr).toContain(flag);
+  }
 });
 
 beforeEach(async () => {
@@ -305,7 +318,6 @@ describe("control CLI correlation", () => {
     const hostFailure = observation;
     expect(resolved.body).toMatchObject({
       status: "cancelled",
-      result: null,
       hostFailure,
       wait: { state: "failed", delivery: "none", result: null, nextAction: "stop" },
     });
@@ -313,7 +325,6 @@ describe("control CLI correlation", () => {
     expect(waited.command.status).toBe(1);
     expect(waited.body).toMatchObject({
       status: "cancelled",
-      result: null,
       hostFailure,
       wait: { state: "failed", delivery: "none", result: null, nextAction: "stop" },
     });
@@ -525,13 +536,14 @@ describe("control CLI correlation", () => {
 
   it("opens RESEARCH requests with the Computer Use result contract", async () => {
     await claimSurface("session-research");
-    const disabledMailbox = runJson([
+    const removedScope = runJson([
       "control", "open", "-w", workspace, "--local-session", "session-research",
       "--task", "c2c_research1", "--iteration", "0", "--phase", "RESEARCH",
       "--scopes", "c2c.result.write",
     ]);
-    expect(disabledMailbox.command.status).toBe(1);
-    expect(disabledMailbox.command.stdout + disabledMailbox.command.stderr).toContain("temporarily disabled");
+    expect(removedScope.command.status).toBe(1);
+    expect(removedScope.command.stdout + removedScope.command.stderr).toContain("unknown scopes");
+    expect(removedScope.command.stdout + removedScope.command.stderr).toContain("c2c.result.write");
     const opened = runJson([
       "control",
       "open",
@@ -553,16 +565,13 @@ describe("control CLI correlation", () => {
       generation: 1,
     });
     expect(opened.body.contextExpiresAt).toEqual(expect.any(String));
-    expect(opened.body.resultTransport).toBe("computer_use");
     expect(opened.body.deliveryPrompt).toEqual(expect.any(String));
     expect(opened.body.deliveryPrompt).toContain(`CONTEXT_ID: ${opened.body.contextId}`);
     expect(opened.body.deliveryPrompt).toContain("RESULT_PHASE: RESEARCH");
-    expect(opened.body.deliveryPrompt).toContain("RESULT_TRANSPORT: COMPUTER_USE_ONLY");
-    expect(opened.body.deliveryPrompt).toContain("MAILBOX_CALLBACKS: DISABLED_EXPECTED");
-    expect(opened.body.deliveryPrompt).toContain("mailbox callbacks are disabled and their absence is expected");
+    expect(opened.body.deliveryPrompt).toContain("C2C_HOST_OBSERVED_RESULT");
+    expect(opened.body.deliveryPrompt).not.toMatch(/mailbox|callback|submit_control_result|report_control_progress/i);
     expect(opened.body.resultContract).toMatchObject({
       phase: "RESEARCH",
-      resultTransport: "computer_use",
       requiredTools: ["workspace_info"],
       examples: [
         { kind: "RESEARCH", payload: { sources: [] } },
@@ -629,7 +638,7 @@ describe("control CLI correlation", () => {
       "REVIEW",
     ]);
     expect(overlapping.command.status).toBe(1);
-    expect(overlapping.body.code).toBe("MAILBOX_TURN_IN_PROGRESS");
+    expect(overlapping.body.code).toBe("control_request_turn_in_progress");
 
     const wrongSession = runJson([
       "control",
@@ -650,7 +659,7 @@ describe("control CLI correlation", () => {
       "0",
     ]);
     expect(wrongSession.command.status).toBe(1);
-    expect(wrongSession.body.code).toBe("MAILBOX_SESSION_MISMATCH");
+    expect(wrongSession.body.code).toBe("control_request_session_mismatch");
 
     for (const mismatch of [
       { task: "c2c_fedcba9876543210", iteration: "0", phase: "PLAN" },
@@ -674,7 +683,7 @@ describe("control CLI correlation", () => {
         mismatch.phase,
       ]);
       expect(result.command.status).toBe(1);
-      expect(result.body.code).toBe("MAILBOX_CORRELATION_MISMATCH");
+      expect(result.body.code).toBe("control_request_correlation_mismatch");
     }
 
     // A lookup by `--request` alone is enough: the request already stores the triple and
@@ -710,22 +719,8 @@ describe("control CLI correlation", () => {
     expect(partial.command.status).toBe(1);
     expect(String(partial.body.error)).toContain("pass --task, --iteration and --phase together");
 
-    // Settling still demands the triple: `ack` must not accept a bare lookup.
-    const bareAck = runJson([
-      "control",
-      "ack",
-      "-w",
-      workspace,
-      "--local-session",
-      "session-a",
-      "--request",
-      request.requestId,
-    ]);
-    expect(bareAck.command.status).toBe(1);
-    expect(bareAck.command.stdout + bareAck.command.stderr).toContain("--task");
-
     const page = opened.body.surface as { tabId: string; chatUrl: string; generation: number };
-    const submitted = planResult(request.requestId);
+    const submitted = planResult();
     const registration = runJson(["preflight", "--local-session", "session-a"]).body.registration as {
       workspaceId: string;
       projectId: string;
@@ -763,29 +758,9 @@ describe("control CLI correlation", () => {
     ]);
     expect(waited.command.status).toBe(0);
     expect(waited.body.status).toBe("cancelled");
-    expect(waited.body.result).toBeNull();
     expect(waited.body.wait).toMatchObject({ outcome: "delivered", delivery: "computer_use" });
     expect((waited.body.wait.result as { kind: string; payload: { goal: string } }).payload.goal)
       .toBe(submitted.payload.goal);
-
-    const acknowledged = runJson([
-      "control",
-      "ack",
-      "-w",
-      workspace,
-      "--local-session",
-      "session-a",
-      "--request",
-      request.requestId,
-      "--task",
-      "c2c_0123456789abcdef",
-      "--iteration",
-      "0",
-      "--phase",
-      "PLAN",
-    ]);
-    expect(acknowledged.command.status).toBe(1);
-    expect(acknowledged.command.stdout + acknowledged.command.stderr).toContain("mailbox is the active transport");
 
     const next = runJson([
       "control",

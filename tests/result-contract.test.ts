@@ -3,11 +3,8 @@ import { controlDeliveryPrompt, controlResultContract } from "../src/control/res
 import {
   CONTROL_PHASES,
   MAX_CONTROL_RESULT_BYTES,
-  MAX_STORED_CONTROL_RESULT_BYTES,
   allowedKindsForPhase,
   parseControlResultSubmission,
-  parseStoredSubmitControlResultInput,
-  parseSubmitControlResultInput,
   researchPayloadSchema,
 } from "../src/control/result-schema.js";
 
@@ -19,15 +16,13 @@ describe("control result prompt contract", () => {
         ? ["workspace_info", "read_file"]
         : [],
     );
-    expect(contract.resultTransport).toBe("computer_use");
     expect(contract.examples.map((example) => example.kind)).toEqual(allowedKindsForPhase(phase));
     for (const example of contract.examples) {
       expect(parseControlResultSubmission(example)).toMatchObject(example);
-      expect(parseSubmitControlResultInput({
-        requestId: "request-test", localSessionId: "session-test", taskId: "task-test",
-        iteration: 0, phase, ...example,
-      })).toMatchObject(example);
+      expect(allowedKindsForPhase(phase)).toContain(example.kind);
     }
+    const wrongPhaseKind = phase === "RESEARCH" ? "PLAN" : "RESEARCH";
+    expect(allowedKindsForPhase(phase)).not.toContain(wrongPhaseKind);
   });
 
   it("does not supply invented external evidence for local research", () => {
@@ -58,9 +53,7 @@ describe("control result prompt contract", () => {
     expect(prompt).toContain(JSON.stringify(contract.examples[0]));
     expect(contract.examples.some((example) => example.kind === "BLOCKED")).toBe(true);
     expect(prompt).toContain("C2C_HOST_OBSERVED_RESULT");
-    expect(prompt).toContain("COMPUTER_USE_ONLY");
-    expect(prompt).toContain("RESULT_TRANSPORT: COMPUTER_USE_ONLY");
-    expect(prompt).toContain("MAILBOX_CALLBACKS: DISABLED_EXPECTED");
+    expect(prompt).not.toMatch(/mailbox|callback|submit_control_result|report_control_progress/i);
     expect(Buffer.byteLength(prompt)).toBeLessThan(2300);
     expect(prompt).toContain(request.requestId);
     expect(prompt).toContain(`RESULT_REQUEST_ID: ${request.requestId}`);
@@ -79,7 +72,7 @@ describe("control result prompt contract", () => {
     }
   });
 
-  it("does not let an absent mailbox callback block a successful BOOT", () => {
+  it("makes BOOT success depend on observed identity and bounded file evidence", () => {
     const contract = controlResultContract("BOOT");
     expect(contract.requiredTools).toEqual(["workspace_info", "read_file"]);
     expect(contract.instructions.join("\n")).toContain(
@@ -92,7 +85,6 @@ describe("control result prompt contract", () => {
 
   it("bounds new submissions while retaining validation for larger stored results", () => {
     expect(MAX_CONTROL_RESULT_BYTES).toBe(16 * 1024);
-    expect(MAX_STORED_CONTROL_RESULT_BYTES).toBe(32 * 1024);
     expect(() => parseControlResultSubmission({
       kind: "BLOCKED",
       payload: { reason: "x".repeat(601), needs: ["Stop this attempt"] },
@@ -102,22 +94,15 @@ describe("control result prompt contract", () => {
       payload: { reason: "Cannot finish", needs: Array.from({ length: 6 }, () => "Stop this attempt") },
     })).toThrow(/INVALID_RESULT|5|invalid/i);
 
-    const stored = {
-      requestId: "request-stored", localSessionId: "session-stored", taskId: "task-stored",
-      iteration: 0, phase: "PLAN" as const, kind: "PLAN" as const,
-      payload: {
-        goal: "Read a retained result",
-        rationale: "r".repeat(3_500),
-        actions: Array.from({ length: 12 }, (_, index) => ({
-          change: `change-${index} ${"c".repeat(700)}`,
-          why: `why-${index} ${"w".repeat(700)}`,
-        })),
-        tests: [],
-        successCriteria: ["The retained result remains readable"],
-      },
+    const withLegacyCorrelation = {
+      ...controlResultContract("PLAN").examples[0]!,
+      requestId: "request-stored",
+      localSessionId: "session-stored",
+      taskId: "task-stored",
+      iteration: 0,
+      phase: "PLAN",
     };
-    expect(() => parseSubmitControlResultInput(stored)).toThrow(/at most|exceeds|invalid/i);
-    expect(parseStoredSubmitControlResultInput(stored)).toMatchObject({ kind: "PLAN" });
+    expect(() => parseControlResultSubmission(withLegacyCorrelation)).toThrow(/unrecognized|unknown|strict/i);
 
     expect(() => parseControlResultSubmission({
       kind: "PLAN",

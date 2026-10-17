@@ -60,7 +60,7 @@ export interface TurnCapabilityBinding {
   taskId: string;
   iteration: number;
   phase: string;
-  /** Exact mailbox request authorized by this control turn, including BOOT. */
+  /** Exact control request authorized by this turn, including BOOT. */
   requestId: string;
   scopes: readonly string[];
   modelId?: string;

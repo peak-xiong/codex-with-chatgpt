@@ -352,9 +352,10 @@ curl -sS -i -X POST "$MCP_URL" \
 可达但调用失败时，优先刷新 ChatGPT 应用管理页缓存的工具 schema
 （Plugins → 该应用 → **Manage** → **Refresh**）；仅重启隧道不会刷新平台侧的元数据。
 
-mailbox 回调代码和历史真实回传记录继续保留，供后续对比；生产 MCP 当前不注册
-这些回调工具。只有经过精确页面关联和 schema 校验的结果标记才会被接受，普通页面
-文字不能替代结果。详见 [当前验收边界](docs/issue-log.md#最新回传验收修复)。
+Computer Use 是唯一结果传输方式。宿主先从精确回复记录候选结果，等待至少 1500 ms，
+再重新观察 UI 后接受最终结果。结果必须严格匹配 request、session、task、iteration、
+phase、tab、chat 和 generation；普通页面文字不能替代结果。详见
+[结果协议](docs/protocol.md#waiting-and-terminal-observations)。
 
 ### 在其他项目或会话中使用
 
@@ -402,8 +403,18 @@ macOS 默认位置如下，均属于当前系统用户：
 `~/.agents/skills/codex-with-chatgpt`；其他目录链接和符号链接 `SKILL.md` 会被拒绝。
 `c2c skill status --json` 可报告实际目标。`C2C_STATE_DIR` 改变机器状态位置，不改变
 已注册的仓库本地状态；通常无需设置。托管运行时不是 Git 源码目录，不要直接修改或
-在其中 `git pull`。Gateway 管理受保护的结果箱和跨工作区页面索引；项目自身保存
-路由、checkpoint 和执行记录。
+在其中 `git pull`。Gateway 管理受保护的控制请求和跨工作区页面索引；项目自身保存
+路由、checkpoint 和执行记录。一次性迁移只保留完整、有效的 Computer Use 请求历史，
+不导入仅用于 callback 的请求元数据、结果、progress 或 ack。清理前须核对每条可迁移的
+Computer Use 记录均已迁入，且没有遗漏或漂移。注册表绑定的清理操作只可在迁移成功、
+全局活动与 draining 任务数为零且没有存活请求后执行。从已注册工作区运行：
+
+```sh
+c2c control clear-legacy-mailbox -w <path> --local-session <id> --json
+```
+
+该命令只删除所选工作区的旧请求根目录和旧 checkpoint 引用；其他 workspace 根目录
+必须保留。详见[协议中的迁移契约](docs/protocol.md#control-request-storage-migration)。
 `prefs get/set` 与 `sandbox-clean` 为兼容旧调用而接受并忽略 `-w`，因为它们作用于整台机器；
 `update-check -w` 仍按指定工作区解析，并使用该项目的更新缓存。
 
@@ -479,7 +490,7 @@ ChatGPT Project A                 ChatGPT Project B
                               |
            c2c serve-http 监听 127.0.0.1:48765（/mcp 需 bearer 令牌）
                               |
-          机器网关：工作区注册表 + 能力令牌代理 + 结果箱
+          机器网关：工作区注册表 + 能力令牌代理 + 控制请求
                               |
                        可信本地工作区
 ```
@@ -493,7 +504,7 @@ checkout-specific 的 `workspaceId` 和 `registrationId`，并把注册信息保
 ```text
 machine boot + workspaceId + projectId + registrationId
 localSessionId + taskId + iteration + phase
-requestId（非 BOOT 必填，BOOT 不包含）
+requestId（所有阶段均必填，包括 BOOT）
 compactionEpoch + 页面 generation + 请求的 scopes
 ```
 
@@ -511,12 +522,10 @@ RESEARCH -> INIT -> PLAN -> EXECUTED -> REVIEW -> DONE
 
 Codex 只向精确认领的对话发送很短的控制消息，绝不把文件内容、diff 或日志粘贴
 到 ChatGPT。ChatGPT 通过只读 MCP 工具读取数据，并在精确回复末尾输出
-`C2C_HOST_OBSERVED_RESULT` 结构化标记。Computer Use 校验 tab、chat、generation、
-response id、request id、阶段和 payload schema 后，Codex 才推进会话。
-
-这是临时对比模式。mailbox 回调实现仍保留在源码中，但生产 MCP 不注册
-`get_control_result_status`、`report_control_progress` 和 `submit_control_result`，
-`control open` 也不会授予 `c2c.result.write`。
+`C2C_HOST_OBSERVED_RESULT` 结构化标记。Computer Use 校验 request、session、task、
+iteration、phase、tab、chat、generation、response 和 payload schema。候选结果必须
+至少稳定 1500 ms，并通过一次新的 UI 观察，才能接受为最终结果。现有 12 个只读 MCP
+工具及其输出 schema 保留；mailbox 回调工具和 `c2c.result.write` scope 已退役。
 
 ## 页面所有权
 
@@ -579,7 +588,8 @@ generation 不能继续写回。一次恢复只自动创建一个替代页面，
 - 工作区路径会规范化并限制在注册根目录内，符号链接和目录穿越都会被拒绝。
 - 能力令牌和活动租约均短时有效，并绑定会话、任务、轮次、阶段、压缩纪元、页面
   generation 与 scopes。
-- 保留的 mailbox 完成栅栏在当前生产传输中停用，仅继续由测试覆盖以便后续对比。
+- 控制请求按 `workspaceId` 分区保存在受保护的机器状态中；迁移和清理都绑定到
+  精确的工作区注册记录。
 - 机器生命周期记录同时校验 machine id、boot epoch、pid 和精确运行时数据，第二
   个进程不能悄悄成为网关。
 - bearer 令牌、管理令牌和原始能力令牌只保存在受保护的机器状态中（0600），普通

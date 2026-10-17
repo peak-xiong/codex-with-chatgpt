@@ -421,7 +421,7 @@ describe("machine CLI lifecycle", () => {
       ok: true,
       retired: true,
       revokedContexts: 0,
-      mailbox: { activeRequestCleared: true },
+      controlRequests: { activeRequestCleared: true },
     });
 
     const unregistered = runJson(stateDir, [

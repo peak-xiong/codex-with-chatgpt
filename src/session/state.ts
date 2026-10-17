@@ -93,9 +93,8 @@ export interface TaskCheckpoint {
   nextExpectedStep?: string;
   chatUrl?: string;
   projectUrl?: string;
-  mailboxRequestId?: string;
-  mailboxPhase?: ControlPhase;
-  mailboxResultId?: string;
+  controlRequestId?: string;
+  controlPhase?: ControlPhase;
   updatedAt: string;
 }
 
@@ -125,7 +124,7 @@ export interface SessionPatch {
   lastState?: string;
   checkpoint?: Partial<TaskCheckpoint> & { protocolState?: ProtocolState };
   clearCheckpoint?: boolean;
-  clearMailbox?: boolean;
+  clearControl?: boolean;
 }
 
 /** Route-bearing merge input. It is intentionally not accepted by updateSession. */
@@ -301,7 +300,13 @@ export function currentLocalSessionId(explicit?: string): string {
 
 function sessionDir(workspaceId: string): string {
   const resolvedWorkspaceId = validatedWorkspaceId(workspaceId);
-  return ensureDir(path.join(getWorkspaceDataDir(resolvedWorkspaceId), "sessions"));
+  const directory = path.join(getWorkspaceDataDir(resolvedWorkspaceId), "sessions");
+  ensureDir(directory);
+  const stat = fs.lstatSync(directory);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error("local session directory is unsafe");
+  }
+  return directory;
 }
 
 function sessionStateLockFile(workspaceId: string): string {
@@ -436,6 +441,8 @@ function parseStoredCheckpoint(value: unknown): TaskCheckpoint | undefined {
       "nextExpectedStep",
       "chatUrl",
       "projectUrl",
+      "controlRequestId",
+      "controlPhase",
       "mailboxRequestId",
       "mailboxPhase",
       "mailboxResultId",
@@ -455,17 +462,44 @@ function parseStoredCheckpoint(value: unknown): TaskCheckpoint | undefined {
   if (typeof waitingFor !== "string" || !WAITING_FOR.includes(waitingFor as WaitingFor)) {
     throw new Error("checkpoint waiting state is invalid");
   }
-  const mailboxRequestId = optionalSafeId(value.mailboxRequestId, "checkpoint mailbox request id");
-  const mailboxPhase = value.mailboxPhase;
+  const controlRequestId = optionalSafeId(value.controlRequestId, "checkpoint control request id");
+  const legacyRequestId = optionalSafeId(value.mailboxRequestId, "checkpoint mailbox request id");
+  const controlPhase = value.controlPhase;
+  const legacyPhase = value.mailboxPhase;
   if (
-    mailboxPhase !== undefined &&
-    (typeof mailboxPhase !== "string" || !CONTROL_PHASES.includes(mailboxPhase as ControlPhase))
+    controlPhase !== undefined &&
+    (typeof controlPhase !== "string" || !CONTROL_PHASES.includes(controlPhase as ControlPhase))
   ) {
-    throw new Error("checkpoint mailbox phase is invalid");
+    throw new Error("checkpoint control phase is invalid");
   }
-  const mailboxResultId = optionalSafeId(value.mailboxResultId, "checkpoint mailbox result id");
-  if (Boolean(mailboxRequestId) !== Boolean(mailboxPhase) || (mailboxResultId && !mailboxRequestId)) {
-    throw new Error("checkpoint mailbox correlation is incomplete");
+  if (
+    legacyPhase !== undefined &&
+    (typeof legacyPhase !== "string" || !CONTROL_PHASES.includes(legacyPhase as ControlPhase))
+  ) {
+    throw new Error("checkpoint legacy phase is invalid");
+  }
+  const hasCompleteCurrentPair = controlRequestId !== undefined && controlPhase !== undefined;
+  let requestId: string | undefined;
+  let phase: string | undefined;
+  if (hasCompleteCurrentPair) {
+    requestId = controlRequestId;
+    phase = controlPhase;
+  } else {
+    if (controlRequestId && legacyRequestId && controlRequestId !== legacyRequestId) {
+      throw new Error("checkpoint control request aliases conflict");
+    }
+    if (controlPhase && legacyPhase && controlPhase !== legacyPhase) {
+      throw new Error("checkpoint control phase aliases conflict");
+    }
+    requestId = controlRequestId ?? legacyRequestId;
+    phase = controlPhase ?? legacyPhase;
+  }
+  const legacyResultId = optionalSafeId(value.mailboxResultId, "checkpoint mailbox result id");
+  if (legacyResultId && !requestId) {
+    throw new Error("checkpoint legacy result has no mailbox request");
+  }
+  if (Boolean(requestId) !== Boolean(phase)) {
+    throw new Error("checkpoint control correlation is incomplete");
   }
   return {
     taskId,
@@ -498,9 +532,8 @@ function parseStoredCheckpoint(value: unknown): TaskCheckpoint | undefined {
     ),
     chatUrl: optionalCanonicalChatUrl(value.chatUrl, "checkpoint chat URL"),
     projectUrl: optionalCanonicalProjectUrl(value.projectUrl, "checkpoint project URL"),
-    mailboxRequestId,
-    mailboxPhase: mailboxPhase as ControlPhase | undefined,
-    mailboxResultId,
+    controlRequestId: requestId,
+    controlPhase: phase as ControlPhase | undefined,
     updatedAt: storedTimestamp(value.updatedAt, "checkpoint timestamp"),
   };
 }
@@ -640,6 +673,78 @@ export function readSession(workspaceId: string, localSessionId = currentLocalSe
   return withFileLock(sessionStateLockFile(resolvedWorkspaceId), () =>
     readSessionUnlocked(resolvedWorkspaceId, resolvedLocalSessionId)
   );
+}
+
+/** Remove legacy callback references from this workspace's thread checkpoints only. */
+export function clearLegacyControlCheckpointReferences(
+  workspaceId: string,
+  isMigratedControlRequest: (reference: {
+    requestId: string;
+    localSessionId: string;
+    taskId: string;
+    iteration: number;
+    phase: ControlPhase;
+  }) => boolean,
+): number {
+  const resolvedWorkspaceId = validatedWorkspaceId(workspaceId);
+  return withFileLock(sessionStateLockFile(resolvedWorkspaceId), () => {
+    const threadsDir = path.join(sessionDir(resolvedWorkspaceId), "threads");
+    const directoryStat = fs.lstatSync(threadsDir, { throwIfNoEntry: false });
+    if (!directoryStat) return 0;
+    if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+      throw new Error("local session thread directory is unsafe");
+    }
+
+    const updates: Array<{ file: string; value: Record<string, unknown> }> = [];
+    for (const name of fs.readdirSync(threadsDir)) {
+      if (!name.endsWith(".json")) continue;
+      const localSessionId = validatedLocalSessionId(name.slice(0, -5));
+      const file = path.join(threadsDir, name);
+      const fileStat = fs.lstatSync(file);
+      if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+        throw new Error("local session state file is unsafe");
+      }
+      const raw = readSessionJson(file, "local session state");
+      if (!isRecord(raw) || raw.workspaceId !== resolvedWorkspaceId || raw.localSessionId !== localSessionId) {
+        throw new Error("local session state does not match its storage path");
+      }
+      const parsed = readThreadSession(resolvedWorkspaceId, localSessionId);
+      if (!isRecord(raw.checkpoint)) continue;
+      const checkpoint = { ...raw.checkpoint };
+      const legacyKeys = ["mailboxRequestId", "mailboxPhase", "mailboxResultId"] as const;
+      if (!legacyKeys.some((key) => Object.hasOwn(checkpoint, key))) continue;
+      for (const key of legacyKeys) delete checkpoint[key];
+      const canonicalCheckpoint = parsed?.checkpoint;
+      const hasCompleteCurrentPair =
+        Object.hasOwn(raw.checkpoint, "controlRequestId") &&
+        Object.hasOwn(raw.checkpoint, "controlPhase");
+      const currentRequestId = canonicalCheckpoint?.controlRequestId;
+      const currentPhase = canonicalCheckpoint?.controlPhase;
+      const legacyPairWasMigrated =
+        !hasCompleteCurrentPair &&
+        canonicalCheckpoint !== undefined &&
+        currentRequestId !== undefined &&
+        currentPhase !== undefined &&
+        isMigratedControlRequest({
+          requestId: currentRequestId,
+          localSessionId,
+          taskId: canonicalCheckpoint.taskId,
+          iteration: canonicalCheckpoint.iteration,
+          phase: currentPhase,
+        });
+      if (canonicalCheckpoint && (hasCompleteCurrentPair || legacyPairWasMigrated)) {
+        checkpoint.controlRequestId = canonicalCheckpoint.controlRequestId;
+        checkpoint.controlPhase = canonicalCheckpoint.controlPhase;
+      } else {
+        delete checkpoint.controlRequestId;
+        delete checkpoint.controlPhase;
+      }
+      parseStoredCheckpoint(checkpoint);
+      updates.push({ file, value: { ...raw, checkpoint } });
+    }
+    for (const update of updates) writeSecureJson(update.file, update.value);
+    return updates.length;
+  });
 }
 
 function writeSessionUnlocked(
@@ -1138,25 +1243,17 @@ export function mergeSession(previous: SavedSession | null, patch: RouteSessionP
   if (patch.clearCheckpoint) {
     checkpoint = undefined;
   } else if (patch.checkpoint) {
-    const clearMailbox = patch.clearMailbox === true;
-    const requestedMailboxRequestId = optionalSafeId(
-      patch.checkpoint.mailboxRequestId,
-      "checkpoint mailbox request id"
+    const requestedControlRequestId = optionalSafeId(
+      patch.checkpoint.controlRequestId,
+      "checkpoint control request id"
     );
-    const requestedMailboxResultId = optionalSafeId(
-      patch.checkpoint.mailboxResultId,
-      "checkpoint mailbox result id"
-    );
-    const requestedMailboxPhase = patch.checkpoint.mailboxPhase;
+    const requestedControlPhase = patch.checkpoint.controlPhase;
     if (
-      requestedMailboxPhase !== undefined &&
-      !CONTROL_PHASES.includes(requestedMailboxPhase)
+      requestedControlPhase !== undefined &&
+      !CONTROL_PHASES.includes(requestedControlPhase)
     ) {
-      throw new Error("checkpoint mailbox phase is invalid");
+      throw new Error("checkpoint control phase is invalid");
     }
-    const mailboxRequestChanged =
-      requestedMailboxRequestId !== undefined &&
-      requestedMailboxRequestId !== previousCheckpoint?.mailboxRequestId;
     const checkpointTask = taskId ?? previousCheckpoint?.taskId;
     const checkpointTurn = iteration ?? previousCheckpoint?.iteration ?? 0;
     iteration = checkpointTurn;
@@ -1171,21 +1268,18 @@ export function mergeSession(previous: SavedSession | null, patch: RouteSessionP
     if (!WAITING_FOR.includes(waitingFor)) {
       throw new Error(`waiting-for must be one of ${WAITING_FOR.join(", ")}`);
     }
-    const mailboxCorrelationChanged =
+    const controlCorrelationChanged =
       checkpointTask !== previousCheckpoint?.taskId || checkpointTurn !== previousCheckpoint?.iteration;
-    const mailboxRequestId = clearMailbox
+    const controlRequestId = patch.clearControl
       ? undefined
-      : requestedMailboxRequestId ??
-        (mailboxCorrelationChanged ? undefined : previousCheckpoint?.mailboxRequestId);
-    const mailboxPhase = clearMailbox
+      : requestedControlRequestId ??
+        (controlCorrelationChanged ? undefined : previousCheckpoint?.controlRequestId);
+    const controlPhase = patch.clearControl
       ? undefined
-      : requestedMailboxPhase ?? (mailboxCorrelationChanged ? undefined : previousCheckpoint?.mailboxPhase);
-    const mailboxResultId = clearMailbox
-      ? undefined
-      : requestedMailboxResultId ??
-        (mailboxRequestChanged || mailboxCorrelationChanged ? undefined : previousCheckpoint?.mailboxResultId);
-    if (Boolean(mailboxRequestId) !== Boolean(mailboxPhase) || (mailboxResultId && !mailboxRequestId)) {
-      throw new Error("mailbox checkpoint requires request id and phase together");
+      : requestedControlPhase ??
+        (controlCorrelationChanged ? undefined : previousCheckpoint?.controlPhase);
+    if (Boolean(controlRequestId) !== Boolean(controlPhase)) {
+      throw new Error("control checkpoint requires request id and phase together");
     }
     checkpoint = {
       taskId: checkpointTask,
@@ -1212,9 +1306,8 @@ export function mergeSession(previous: SavedSession | null, patch: RouteSessionP
       // mirror and must never be allowed to create or change a session route.
       chatUrl: url,
       projectUrl,
-      mailboxRequestId,
-      mailboxPhase,
-      mailboxResultId,
+      controlRequestId,
+      controlPhase,
       updatedAt: new Date().toISOString(),
     };
   } else if (checkpoint && (patch.url !== undefined || patch.projectUrl !== undefined)) {

@@ -2,12 +2,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MachineGateway } from "../src/gateway/machine-gateway.js";
-import { openControlResultRequest } from "../src/control/mailbox.js";
+import { openControlRequest } from "../src/control/requests.js";
 import {
   TurnCapabilityBroker,
   TurnCapabilityError,
   type TurnCapabilityBinding,
 } from "../src/gateway/turn-capability.js";
+import { CONTROL_RESULT_FINAL_STABILITY_MS } from "../src/control/wait-policy.js";
 import {
   machineWorkspaceMembershipFile,
   WorkspaceRegistryError,
@@ -18,7 +19,7 @@ import {
   currentProjectUrl,
   currentSurfaceLease,
 } from "../src/session/surface-ownership.js";
-import { cleanup, git, isolateStateDir, makeGitRepo, makeTmpDir, write, projectSelection } from "./helpers.js";
+import { cleanup, git, isolateStateDir, makeGitRepo, makeTmpDir, write } from "./helpers.js";
 
 function binding(
   registration: ReturnType<MachineGateway["registerWorkspace"]>,
@@ -494,97 +495,6 @@ describe("machine gateway", () => {
     }
   });
 
-  it("rejects a completion fence from another context before publishing a result", () => {
-    const rootA = makeTmpDir("gateway-fence-context-a");
-    const rootB = makeTmpDir("gateway-fence-context-b");
-    try {
-      const gateway = new MachineGateway();
-      const registrationA = gateway.registerWorkspace(rootA);
-      const registrationB = gateway.registerWorkspace(rootB);
-      const identityA = {
-        workspaceId: registrationA.workspaceId,
-        projectId: registrationA.projectId,
-        registrationId: registrationA.registrationId,
-        localSessionId: "session-fence-a",
-      };
-      const identityB = {
-        workspaceId: registrationB.workspaceId,
-        projectId: registrationB.projectId,
-        registrationId: registrationB.registrationId,
-        localSessionId: "session-fence-b",
-      };
-      const requestA = gateway.openControlResultRequest(identityA, {
-        taskId: "task-fence-a",
-        iteration: 0,
-        phase: "PLAN",
-      });
-      const requestB = gateway.openControlResultRequest(identityB, {
-        taskId: "task-fence-b",
-        iteration: 0,
-        phase: "PLAN",
-      });
-      const grantA = gateway.issueTurn(binding(registrationA, "fence-a", {
-        ...identityA,
-        taskId: "task-fence-a",
-        iteration: 0,
-        phase: "PLAN",
-        requestId: requestA.request.requestId,
-        scopes: ["c2c.result.write"],
-      }));
-      const grantB = gateway.issueTurn(binding(registrationB, "fence-b", {
-        ...identityB,
-        taskId: "task-fence-b",
-        iteration: 0,
-        phase: "PLAN",
-        requestId: requestB.request.requestId,
-        scopes: ["c2c.result.write"],
-      }));
-      const leaseA = gateway.claimTurn(grantA.token, ["c2c.result.write"]);
-      const leaseB = gateway.claimTurn(grantB.token, ["c2c.result.write"]);
-      const fenceA = gateway.beginCompletion(grantA.token);
-      const fenceB = gateway.beginCompletion(grantB.token);
-      gateway.releaseTurn(grantA.token, leaseA.lease);
-      gateway.releaseTurn(grantB.token, leaseB.lease);
-
-      const resultB = {
-        kind: "PLAN",
-        payload: {
-          goal: "fence ownership",
-          rationale: "a context must own its completion fence",
-          actions: [{ change: "validate the fence owner", why: "prevent cross-context completion" }],
-          tests: ["cross-context fence"],
-          successCriteria: ["the foreign fence is rejected"],
-        },
-      };
-      expect(() => gateway.completeControlResult(grantB.token, fenceA, resultB)).toThrowError(
-        expect.objectContaining<Partial<TurnCapabilityError>>({ code: "COMPLETION_FENCE_INVALID" }),
-      );
-      expect(gateway.turnStatus(grantA.token).status).toBe("completing");
-      expect(gateway.turnStatus(grantB.token).status).toBe("completing");
-      expect(gateway.getControlResultStatus(identityB, requestB.request.requestId, {
-        taskId: "task-fence-b",
-        iteration: 0,
-        phase: "PLAN",
-      }).status).toBe("pending");
-
-      const resultA = {
-        kind: "PLAN",
-        payload: {
-          goal: "fence ownership",
-          rationale: "the matching context owns the fence",
-          actions: [{ change: "complete the matching turn", why: "publish one exact result" }],
-          tests: ["matching fence"],
-          successCriteria: ["the result is accepted"],
-        },
-      };
-      expect(gateway.completeControlResult(grantA.token, fenceA, resultA).accepted).toBe(true);
-      expect(gateway.completeControlResult(grantB.token, fenceB, resultB).accepted).toBe(true);
-    } finally {
-      cleanup(rootA);
-      cleanup(rootB);
-    }
-  });
-
   it("does not serialize raw gateway secrets", () => {
     const root = makeTmpDir("gateway-redaction");
     try {
@@ -605,93 +515,95 @@ describe("machine gateway", () => {
     }
   });
 
-  it("keeps final surface validation and mailbox publication atomic per session", () => {
-    const stateDir = isolateStateDir();
-    const root = makeTmpDir("gateway-mailbox-transaction");
-    let gateway!: MachineGateway;
-    let sameSessionRotation: TurnCapabilityError | null = null;
-    let otherSessionRotation: unknown = null;
-    let checked = false;
+  it("publishes an exact Computer Use terminal observation only after its stable candidate", async () => {
+    const root = makeTmpDir("gateway-control-terminal-atomic");
     try {
-      gateway = new MachineGateway({
-        surfaceValidator: (current) => {
-          if (!checked || current.localSessionId !== "session-a") return;
-          try {
-            gateway.surfaceClaim({ ...registered, localSessionId: "session-a" }, {
-              browserId: "iab",
-              surfaceId: "chatgpt",
-              tabId: "tab-a-rotated",
-              projectUrl: "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project",
-              chatUrl: "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/a-rotated",
-              ownerProcessEpoch: "owner-a-rotated",
-            });
-          } catch (error) {
-            sameSessionRotation = error as TurnCapabilityError;
-          }
-          try {
-            gateway.surfaceClaim({ ...registered, localSessionId: "session-b" }, {
-              browserId: "iab",
-              surfaceId: "chatgpt",
-              tabId: "tab-b",
-              projectUrl: "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project",
-              projectSelection: projectSelection("https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project"),
-              chatUrl: "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/b",
-              ownerProcessEpoch: "owner-b-session",
-            });
-          } catch (error) {
-            otherSessionRotation = error;
-          }
-        },
-      });
+      const gateway = new MachineGateway();
       const registered = gateway.registerWorkspace(root);
       const identity = {
-        workspaceId: registered.workspaceId,
-        projectId: registered.projectId,
-        registrationId: registered.registrationId,
+        ...registered,
         localSessionId: "session-a",
       };
-      const otherIdentity = { ...identity, localSessionId: "session-b" };
-      const request = openControlResultRequest(registered.workspaceId, {
+      const projectUrl = "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/project";
+      const page = claimSurface({
+        projectId: identity.projectId,
         localSessionId: identity.localSessionId,
-        taskId: "c2c_mailbox_atomic",
-        iteration: 0,
-        phase: "PLAN",
+        browserId: "iab",
+        surfaceId: "chatgpt",
+        tabId: "tab-control-terminal",
+        projectUrl,
+        chatUrl: "https://chatgpt.com/g/g-p-6a94399430e08191860ab5364b7748b8/c/control-terminal",
+        ownerProcessEpoch: "owner-control-terminal",
       });
+      const correlation = {
+        taskId: "task-control-terminal",
+        iteration: 0,
+        phase: "BOOT" as const,
+      };
+      const { request } = gateway.openControlRequest(identity, correlation);
       const grant = gateway.issueTurn({
-        ...registered,
         ...identity,
-        taskId: "c2c_mailbox_atomic",
-        iteration: 0,
-        phase: "PLAN",
+        ...correlation,
         requestId: request.requestId,
-        scopes: ["c2c.result.write"],
+        scopes: ["workspace.read"],
         compactionEpoch: 0,
-        generation: 1,
+        generation: page.generation,
       });
-      const lease = gateway.claimTurn(grant.token, ["c2c.result.write"]);
-      const fence = gateway.beginCompletion(grant.token);
-      gateway.releaseTurn(grant.token, lease.lease);
-      checked = true;
-      const receipt = gateway.completeControlResult(grant.token, fence, {
-        kind: "PLAN",
-        payload: {
-          goal: "atomic mailbox publication",
-          rationale: "surface generation and result publication share one gateway section",
-          actions: [{ change: "publish through the gateway", why: "prevent rotation races" }],
-          tests: ["transaction race"],
-          successCriteria: ["only the current surface can complete"],
-        },
+      const base = {
+        tabId: page.tabId,
+        generation: page.generation,
+        observedUrl: projectUrl,
+        observedAt: new Date().toISOString(),
+        responseToRequestId: request.requestId,
+      };
+      const observe = (input: Record<string, unknown>) =>
+        gateway.observeControlPage(identity, request.requestId, correlation, input);
+      observe({ ...base, observationSequence: 1, state: "send_attempted" });
+      observe({ ...base, observationSequence: 2, state: "sent" });
+      observe({ ...base, observationSequence: 3, responseId: "response-control-terminal", state: "response_created" });
+      const candidate = {
+        ...base,
+        observationSequence: 4,
+        responseId: "response-control-terminal",
+        state: "result_candidate",
+        responseIsFinal: true,
+        delivery: "computer_use",
+        terminalResult: { kind: "BOOT", payload: {} },
+        completionEvidence: { responseActionsVisible: true, stopControlAbsent: true },
+      };
+      expect(observe(candidate)).toMatchObject({
+        status: "pending",
+        pageObservation: { lastDefinitive: { state: "result_candidate" } },
       });
-      expect(receipt.accepted).toBe(true);
-      expect(sameSessionRotation?.code).toBe("COMPLETION_ALREADY_STARTED");
-      expect(otherSessionRotation).toBeNull();
-      expect(currentSurfaceLease(identity.projectId, otherIdentity.localSessionId)).toMatchObject({
-        tabId: "tab-b",
+
+      expectCode(() => observe({
+        ...candidate, tabId: "tab-other", observedAt: new Date(Date.now() + 1).toISOString(),
+        observationSequence: 5, state: "final",
+      }), "BINDING_MISMATCH");
+      expect(() => observe({
+        ...candidate, observedAt: new Date(Date.now() + 1).toISOString(),
+        observationSequence: 5, state: "final",
+      })).toThrow(/fresh stability recheck/);
+      const pending = gateway.getControlRequestStatus(identity, request.requestId, correlation);
+      expect(pending).toMatchObject({
+        status: "pending",
+        pageObservation: { lastDefinitive: { state: "result_candidate" } },
       });
+      expect(pending).not.toHaveProperty("hostObservedResult");
+
+      await new Promise((resolve) => setTimeout(resolve, CONTROL_RESULT_FINAL_STABILITY_MS + 10));
+      const final = observe({
+        ...candidate, observedAt: new Date().toISOString(), observationSequence: 5, state: "final",
+      });
+      expect(final).toMatchObject({
+        status: "cancelled",
+        hostObservedResult: { provenance: "host_observed", result: { kind: "BOOT", payload: {} } },
+        pageObservation: { latest: { state: "final", responseToRequestId: request.requestId } },
+      });
+      expect(final).not.toHaveProperty("result");
+      expect(gateway.turnStatus(grant.token).status).toBe("revoked");
     } finally {
       cleanup(root);
-      cleanup(stateDir);
-      delete process.env.C2C_STATE_DIR;
     }
   });
 });

@@ -1,6 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { browserTabIdSchema } from "../session/browser-tab-id.js";
 import { Workspace, WorkspaceError } from "../workspace/manager.js";
 import { MAX_IMAGE_BYTES, readWorkspaceImage } from "../workspace/read-image.js";
 import { readMany, readManyFilesSchema, READ_MANY_MAX_BYTES } from "../workspace/read-many.js";
@@ -18,29 +17,11 @@ import {
 } from "../execution/records.js";
 import { listExecutionOutputs, readExecutionOutput } from "../execution/output.js";
 import {
-  bootPayloadSchema,
-  blockedPayloadSchema,
   c2cIdSchema,
-  ControlMailboxError,
-  CONTROL_PHASES,
-  CONTROL_PROGRESS_STATES,
-  CONTROL_RESULT_KINDS,
-  donePayloadSchema,
+  ControlRequestError,
   MAX_C2C_ITERATION,
-  planPayloadSchema,
-  researchPayloadSchema,
-  reviewPayloadSchema,
-  parseControlResultSubmission,
 } from "../control/result-schema.js";
 import type { Logger } from "../logger/index.js";
-import {
-  controlHostFailureSchema,
-  controlHostObservedResultSchema,
-} from "../control/wait-policy.js";
-import {
-  ACTIVE_CONTROL_RESULT_TRANSPORT,
-  type ControlResultTransport,
-} from "../control/result-transport.js";
 import { PRODUCT_NAME, VERSION } from "../version.js";
 import {
   MachineGateway,
@@ -50,7 +31,6 @@ import {
 import {
   TurnCapabilityError,
   type TurnCapabilityBinding,
-  type TurnCompletionFence,
 } from "../gateway/turn-capability.js";
 
 const UNTRUSTED_NOTE =
@@ -85,7 +65,7 @@ function fail(code: string, message: string): ToolResult {
 }
 
 function mapError(error: unknown): ToolResult {
-  if (error instanceof ControlMailboxError) return fail(error.code, error.message);
+  if (error instanceof ControlRequestError) return fail(error.code, error.message);
   if (error instanceof TurnCapabilityError) return fail(error.code, error.message);
   if (error instanceof WorkspaceError) return fail(error.code, error.message);
   return fail("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
@@ -143,25 +123,6 @@ async function withClaimedWorkspace(
   } finally {
     if (renewalTimer) clearInterval(renewalTimer);
     if (context) gateway.releaseTurn(contextId, context.lease);
-  }
-}
-
-async function waitUntilCompletionReady(
-  gateway: MachineGateway,
-  contextId: string,
-  fence: TurnCompletionFence
-): Promise<void> {
-  const deadline = Date.parse(fence.capabilityExpiresAt);
-  for (;;) {
-    const status = gateway.turnStatus(contextId);
-    if (status.status !== "completing") {
-      throw new TurnCapabilityError("COMPLETION_FENCE_INVALID", "turn is no longer completing");
-    }
-    if (status.completionReady) return;
-    if (Date.now() >= deadline) {
-      throw new TurnCapabilityError("ACTIVE_LEASES_REMAIN", "active leases must be released before completion");
-    }
-    await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
 
@@ -342,70 +303,6 @@ const executionOutputOutputSchema = {
   text: z.string().optional().describe("Sanitized command output returned by the read operation"),
 };
 
-const submitControlResultOutputSchema = {
-  accepted: z.literal(true),
-  requestId: c2cIdSchema,
-  localSessionId: c2cIdSchema,
-  resultId: c2cIdSchema,
-  phase: z.enum(CONTROL_PHASES),
-  kind: z.enum(CONTROL_RESULT_KINDS),
-  receivedAt: timestampOutputSchema,
-  idempotentReplay: z.boolean(),
-};
-
-const reportControlProgressOutputSchema = {
-  accepted: z.literal(true),
-  requestId: c2cIdSchema,
-  localSessionId: c2cIdSchema,
-  progressId: c2cIdSchema,
-  phase: z.enum(CONTROL_PHASES),
-  status: z.enum(CONTROL_PROGRESS_STATES),
-  reportedAt: timestampOutputSchema,
-  idempotentReplay: z.boolean(),
-};
-
-const controlResultRequestOutputSchema = z.object({
-  schemaVersion: z.literal(2),
-  requestId: c2cIdSchema,
-  workspaceId: c2cIdSchema,
-  localSessionId: c2cIdSchema,
-  taskId: c2cIdSchema,
-  iteration: c2cIterationSchema,
-  phase: z.enum(CONTROL_PHASES),
-  allowedKinds: z.array(z.enum(CONTROL_RESULT_KINDS)),
-  surfaceGeneration: z.number().int().positive().nullable(),
-  surfaceTabId: browserTabIdSchema.nullable(),
-  createdAt: timestampOutputSchema,
-  expiresAt: timestampOutputSchema,
-});
-
-const controlProgressOutputSchema = z.object({
-  schemaVersion: z.literal(1),
-  requestId: c2cIdSchema,
-  workspaceId: c2cIdSchema,
-  localSessionId: c2cIdSchema,
-  taskId: c2cIdSchema,
-  iteration: c2cIterationSchema,
-  phase: z.enum(CONTROL_PHASES),
-  status: z.enum(CONTROL_PROGRESS_STATES),
-  message: z.string().nullable(),
-  reportedAt: timestampOutputSchema,
-  progressHash: c2cIdSchema,
-  progressId: c2cIdSchema,
-});
-
-const controlResultStatusOutputSchema = {
-  requestId: c2cIdSchema,
-  status: z.enum(["pending", "received", "acknowledged", "expired", "cancelled", "not_found"]),
-  request: controlResultRequestOutputSchema.nullable(),
-  // Result payloads are already validated by the phase-specific mailbox
-  // schema; preserve that structured payload without duplicating it here.
-  result: z.unknown().nullable(),
-  progress: controlProgressOutputSchema.nullable(),
-  hostFailure: controlHostFailureSchema.optional(),
-  hostObservedResult: controlHostObservedResultSchema.optional(),
-};
-
 export interface McpContext {
   gateway: MachineGateway;
   logger: Logger;
@@ -413,17 +310,8 @@ export interface McpContext {
   machine?: { machineId: string; associationId: string };
 }
 
-export interface McpServerOptions {
-  /** Tests may exercise the retained mailbox callbacks; production uses the active transport. */
-  resultTransport?: ControlResultTransport;
-}
-
-export function createMcpServer(ctx: McpContext, options: McpServerOptions = {}): McpServer {
+export function createMcpServer(ctx: McpContext): McpServer {
   const { gateway } = ctx;
-  const resultTransport = options.resultTransport ?? gateway.resultTransport ?? ACTIVE_CONTROL_RESULT_TRANSPORT;
-  if (resultTransport !== gateway.resultTransport) {
-    throw new Error("MCP result transport must match the machine gateway configuration");
-  }
   const server = new McpServer(
     { name: PRODUCT_NAME, version: VERSION },
     { capabilities: { tools: {} }, instructions: UNTRUSTED_NOTE }
@@ -835,128 +723,6 @@ export function createMcpServer(ctx: McpContext, options: McpServerOptions = {})
         });
       })
   );
-
-  if (resultTransport === "mailbox") {
-    server.registerTool(
-    "get_control_result_status",
-    {
-      title: "Get control result status",
-      description:
-        `Read the exact status bound to this turn's context. The context selects the request, local session, ` +
-        `task, iteration and phase; do not supply those fields. This does not consume or acknowledge the result. ${UNTRUSTED_NOTE}`,
-      inputSchema: z.object({
-        context_id: contextIdSchema,
-      }).strict(),
-      outputSchema: controlResultStatusOutputSchema,
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    },
-    async (args) =>
-      withClaimedWorkspace(gateway, args.context_id, ["c2c.result.write"], () =>
-        okStructured(gateway.controlResultStatusForTurn(args.context_id))
-      )
-  );
-
-    server.registerTool(
-    "report_control_progress",
-    {
-      title: "Report control progress",
-      description:
-        `Optionally report bounded progress for the active C2C question; it is never required before final submission. Progress can move only forward through ` +
-        `SEARCHING, READING_CODE, and SYNTHESIZING, with at most one accepted update per state. ` +
-        `This does not edit workspace files or run commands. Only use it when Codex supplied the ` +
-        `active turn context; that context selects all request correlation. ${UNTRUSTED_NOTE}`,
-      inputSchema: z.object({
-        context_id: contextIdSchema,
-        status: z.enum(CONTROL_PROGRESS_STATES).describe("Current monotonic progress state"),
-        message: z.string().min(1).max(500).optional().describe("Short user-safe progress detail"),
-      }).strict(),
-      outputSchema: reportControlProgressOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    },
-    async (args) =>
-      withClaimedWorkspace(gateway, args.context_id, ["c2c.result.write"], () => {
-        const { context_id: _contextId, ...input } = args;
-        return okStructured(gateway.controlProgressForTurn(args.context_id, input));
-      })
-  );
-
-    server.registerTool(
-    "submit_control_result",
-    {
-      title: "Submit control result",
-      description:
-        `Submit one bounded C2C BOOT, RESEARCH, PLAN, REVIEW, DONE, or BLOCKED result to the local control mailbox. ` +
-        `This does not edit workspace files or run commands, cannot choose a write path, and has no diff/log fields. ` +
-        `Each request represents exactly one Codex question and accepts exactly one answer. ` +
-        `For a business refusal or inability to complete, submit BLOCKED with {reason, needs} under the original phase, ` +
-        `provided this callback is authorized and permitted. No progress call is required. Never bypass a platform block or use revoked authorization. ` +
-        `For local-only RESEARCH use sources: [] and cite relative file paths/lines in conclusions. ` +
-        `External sources require title, a real HTTP(S) url, publishedDate (YYYY-MM-DD or null), and keyEvidence; ` +
-        `workspace:/ and file:// are not external sources. Never invent sources. ` +
-        `The context selects the exact request correlation; submit only kind and its matching payload. ${UNTRUSTED_NOTE}`,
-      inputSchema: z.object({
-        context_id: contextIdSchema,
-        kind: z.enum(CONTROL_RESULT_KINDS).describe("Control result kind"),
-        payload: z
-          .union([
-            bootPayloadSchema,
-            researchPayloadSchema,
-            planPayloadSchema,
-            reviewPayloadSchema,
-            donePayloadSchema,
-            blockedPayloadSchema,
-          ])
-          .describe("Kind-specific structured payload; its shape must match kind"),
-      }).strict(),
-      outputSchema: submitControlResultOutputSchema,
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    },
-    async (args) => {
-      let context: MachineTurnContext | null = null;
-      let fence: TurnCompletionFence | null = null;
-      let completed = false;
-      try {
-        context = gateway.claimTurn(args.context_id, ["c2c.result.write"]);
-        const { context_id: _contextId, ...input } = args;
-        const parsed = parseControlResultSubmission(input);
-
-        const status = gateway.controlResultStatusForTurn(args.context_id);
-        if (status.status === "not_found") {
-          return fail("MAILBOX_REQUEST_NOT_FOUND", "Control result request was not found.");
-        }
-        if (status.status === "cancelled") {
-          return fail("MAILBOX_REQUEST_CANCELLED", "Control result request was cancelled.");
-        }
-        if (status.status === "expired") {
-          return fail("MAILBOX_REQUEST_EXPIRED", "Control result request has expired.");
-        }
-        if (!status.request?.allowedKinds.includes(parsed.kind)) {
-          return fail("MAILBOX_KIND_NOT_ALLOWED", `${parsed.kind} is not allowed for this request phase.`);
-        }
-
-        fence = gateway.beginCompletion(args.context_id);
-        gateway.releaseTurn(args.context_id, context.lease);
-        context = null;
-        await waitUntilCompletionReady(gateway, args.context_id, fence);
-        const receipt = gateway.completeControlResult(args.context_id, fence, parsed);
-        completed = true;
-        return okStructured(receipt);
-      } catch (error) {
-        return mapError(error);
-      } finally {
-        if (context) gateway.releaseTurn(args.context_id, context.lease);
-        if (fence && !completed) {
-          try {
-            gateway.abortTurnCompletion(fence);
-          } catch {
-            // Expiry or cancellation may have already consumed the fence.
-          }
-        }
-      }
-    }
-  );
-
-  }
 
   return server;
 }

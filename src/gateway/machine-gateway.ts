@@ -14,45 +14,35 @@ import {
   type TurnLease,
   type TurnReleaseReceipt,
 } from "./turn-capability.js";
-import { ControlMailboxError } from "../control/result-schema.js";
-import {
-  ACTIVE_CONTROL_RESULT_TRANSPORT,
-  type ControlResultTransport,
-} from "../control/result-transport.js";
+import { ControlRequestError } from "../control/result-schema.js";
 import {
   WorkspaceRegistry,
   type WorkspaceRegistration,
 } from "./workspace-registry.js";
 import type { Workspace } from "../workspace/manager.js";
+import { clearLegacyControlCheckpointReferences } from "../session/state.js";
 import {
-  acknowledgeControlResult,
-  cancelControlResultRequest,
-  getActiveControlResultStatus,
-  inspectActiveControlResultStatus,
+  cancelControlRequest,
+  clearLegacyControlMailbox as clearLegacyControlMailboxStore,
+  getActiveControlRequestStatus,
+  inspectActiveControlRequestStatus,
   recordLateControlEvidence,
-  getControlResultStatus,
-  openControlResultRequestWithStatus,
-  observeControlResultRequest,
-  reportControlProgress,
+  getControlRequestStatus,
+  openControlRequestWithStatus,
+  observeControlRequest,
   requireBootControlResult,
-  retireControlResultSession,
-  submitControlResult,
-  waitForControlResult,
-  type ControlStatus,
-  type OpenControlResultRequestInput,
-  type OpenControlResultRequestStatus,
-  type RetireControlResultSessionSummary,
-} from "../control/mailbox.js";
+  retireControlRequestSession,
+  waitForControlRequest,
+  type ControlRequestSnapshot,
+  type LegacyControlMailboxCleanupResult,
+  type OpenControlRequestInput,
+  type OpenControlRequestStatus,
+  type RetireControlRequestSessionSummary,
+} from "../control/requests.js";
 import {
-  parseControlProgressUpdate,
   canonicalJson,
-  parseControlResultSubmission,
-  parseReportControlProgressInput,
-  parseSubmitControlResultInput,
   type ControlPhase,
-  type ControlProgressReceipt,
   type ControlResultCorrelation,
-  type ControlResultReceipt,
 } from "../control/result-schema.js";
 import {
   claimSurface,
@@ -128,8 +118,6 @@ export interface MachineGatewayOptions {
   readonly surfaceValidator?: SurfaceGenerationValidator;
   /** Machine-owned checkout membership index; omitted for isolated in-memory use. */
   readonly workspaceMembershipFile?: string;
-  /** Active completion source; mailbox is available only for explicit experiments. */
-  readonly resultTransport?: ControlResultTransport;
 }
 
 export interface MachineGatewayStats extends TurnCapabilityStats {
@@ -164,7 +152,7 @@ export interface MachineSurfaceView {
   projectUrl: string | null;
   lease: SurfaceLease | null;
   binding: SurfaceBinding | null;
-  control: ControlStatus | null;
+  control: ControlRequestSnapshot | null;
 }
 
 export type MachineSurfaceCommitOptions = Omit<
@@ -178,7 +166,7 @@ export type MachineSurfaceCommitOptions = Omit<
 export interface MachineSurfaceRetireResult extends RetireSurfaceSessionResult {
   /** Number of live turn capabilities revoked before ownership cleanup. */
   revokedContexts: number;
-  mailbox: RetireControlResultSessionSummary;
+  controlRequests: RetireControlRequestSessionSummary;
 }
 
 function bindingForStatus(
@@ -232,7 +220,7 @@ function fenceOf(input: string | Pick<TurnCompletionFence, "fence">): string {
  */
 function correlationFromStoredRequest(
   requestId: string,
-  request: ControlStatus["request"],
+  request: ControlRequestSnapshot["request"],
 ): ControlResultCorrelation {
   if (!request) {
     throw new TurnCapabilityError(
@@ -254,14 +242,12 @@ export class MachineGateway {
   private readonly broker: TurnCapabilityBroker;
   private readonly registry: WorkspaceRegistry;
   private readonly surfaceValidator?: SurfaceGenerationValidator;
-  readonly resultTransport: ControlResultTransport;
-  /** Synchronous per-session critical sections for final surface validation and mailbox publication. */
+  /** Synchronous per-session critical sections for final surface validation and request observation. */
   private readonly controlSubmissionSessions = new Set<string>();
   private readonly controlCompletionFences = new Map<string, string>();
 
   constructor(options: MachineGatewayOptions = {}) {
     const { broker, surfaceValidator, workspaceMembershipFile } = options;
-    this.resultTransport = options.resultTransport ?? ACTIVE_CONTROL_RESULT_TRANSPORT;
     this.broker = broker ?? new TurnCapabilityBroker();
     this.registry = new WorkspaceRegistry(
       this.broker,
@@ -291,7 +277,7 @@ export class MachineGateway {
       projectUrl: currentProjectUrl(identity.projectId),
       lease: currentSurfaceLease(identity.projectId, identity.localSessionId),
       binding: currentSurfaceBinding(identity.projectId, identity.localSessionId),
-      control: getActiveControlResultStatus(identity.workspaceId, identity.localSessionId),
+      control: getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId),
     };
   }
 
@@ -304,7 +290,7 @@ export class MachineGateway {
       registration: { workspaceId, projectId, registrationId, workspaceName: workspace.name },
       surface: {
         ...inspectSurface(projectId, localSessionId),
-        control: inspectActiveControlResultStatus(workspaceId, localSessionId),
+        control: inspectActiveControlRequestStatus(workspaceId, localSessionId),
       },
     };
   }
@@ -322,8 +308,8 @@ export class MachineGateway {
       previous.projectUrl === normalizeProjectUrl(input.projectUrl) &&
       previous.chatUrl === (input.chatUrl === undefined ? undefined : normalizeChatUrl(input.chatUrl));
     if (!idempotent) {
-      const control = getActiveControlResultStatus(identity.workspaceId, identity.localSessionId);
-      if (control?.status === "pending" || control?.status === "received") {
+      const control = getActiveControlRequestStatus(identity.workspaceId, identity.localSessionId);
+      if (control?.status === "pending") {
         const binding = currentSurfaceBinding(identity.projectId, identity.localSessionId);
         if (!previous && control.status === "pending" && binding &&
             binding.browserId === input.browserId && binding.surfaceId === input.surfaceId &&
@@ -335,7 +321,7 @@ export class MachineGateway {
         }
         throw new SurfaceOwnershipError(
           "SURFACE_CONTROL_UNRESOLVED",
-          "Resolve the active mailbox request before replacing this page: cancel pending work or consume and acknowledge a received result.",
+          "Resolve the active control request before replacing this page by cancelling it or waiting for its Computer Use result.",
         );
       }
     }
@@ -369,7 +355,6 @@ export class MachineGateway {
       identity.localSessionId,
       lease.generation,
       lease.tabId,
-      this.resultTransport,
     );
     const committed = commitVerifiedSurfaceRoute({
       lease,
@@ -377,13 +362,6 @@ export class MachineGateway {
       ...routeOptions,
       requireProjectSelection: true,
     });
-    if (this.resultTransport === "mailbox" && (boot.status === "received" || boot.status === "acknowledged")) {
-      acknowledgeControlResult(identity.workspaceId, bootRequestId, identity.localSessionId, {
-        taskId: boot.request!.taskId,
-        iteration: boot.request!.iteration,
-        phase: "BOOT",
-      });
-    }
     this.broker.revokeRequest({
       ...identity,
       taskId: boot.request!.taskId,
@@ -427,13 +405,13 @@ export class MachineGateway {
       identity.projectId,
       identity.localSessionId,
     );
-    const mailbox = retireControlResultSession(identity.workspaceId, identity.localSessionId);
+    const controlRequests = retireControlRequestSession(identity.workspaceId, identity.localSessionId);
     const retired = retireSurfaceSession({
       workspaceId: identity.workspaceId,
       projectId: identity.projectId,
       localSessionId: identity.localSessionId,
     });
-    return { ...retired, revokedContexts, mailbox };
+    return { ...retired, revokedContexts, controlRequests };
   }
 
   /**
@@ -444,7 +422,7 @@ export class MachineGateway {
   issueTurn(input: IssueTurnCapabilityInput): TurnCapabilityGrant {
     this.registry.lookup(input.workspaceId, input.projectId, input.registrationId);
     if ((["BOOT", "RESEARCH", "PLAN", "REVIEW"] as const).includes(input.phase as ControlPhase)) {
-      const control = getControlResultStatus(
+      const control = getControlRequestStatus(
         input.workspaceId,
         input.requestId,
         input.localSessionId,
@@ -457,7 +435,7 @@ export class MachineGateway {
       ) {
         throw new TurnCapabilityError(
           "BINDING_MISMATCH",
-          "turn capability must bind the exact pending mailbox request and current surface generation",
+          "turn capability must bind the exact pending control request and current surface generation",
         );
       }
     }
@@ -471,6 +449,52 @@ export class MachineGateway {
     this.assertSurfaceMutationAllowed(projectId);
     this.registry.lookup(workspaceId, projectId, registrationId);
     return this.registry.unregister(workspaceId, projectId, registrationId);
+  }
+
+  clearLegacyControlMailbox(identity: {
+    workspaceId: string;
+    projectId: string;
+    registrationId: string;
+  }): LegacyControlMailboxCleanupResult & { checkpointReferencesCleared: number } {
+    this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
+    const stats = this.stats();
+    if (stats.activeTurnCount > 0 || stats.drainingTurnCount > 0) {
+      throw new ControlRequestError(
+        "CONTROL_REQUEST_TURN_IN_PROGRESS",
+        "legacy control data cannot be cleared while machine turns are active or draining",
+      );
+    }
+    const result = clearLegacyControlMailboxStore(identity.workspaceId);
+    const checkpointReferencesCleared = clearLegacyControlCheckpointReferences(
+      identity.workspaceId,
+      (reference) => {
+        let snapshot: ControlRequestSnapshot;
+        try {
+          snapshot = getControlRequestStatus(
+            identity.workspaceId,
+            reference.requestId,
+            reference.localSessionId,
+          );
+        } catch (error) {
+          if (error instanceof ControlRequestError && error.code === "CONTROL_REQUEST_SESSION_MISMATCH") {
+            return false;
+          }
+          throw error;
+        }
+        const request = snapshot.request;
+        return Boolean(
+          request &&
+          request.workspaceId === identity.workspaceId &&
+          request.localSessionId === reference.localSessionId &&
+          request.taskId === reference.taskId &&
+          request.iteration === reference.iteration &&
+          request.phase === reference.phase &&
+          request.surfaceGeneration !== null &&
+          request.surfaceTabId !== null,
+        );
+      },
+    );
+    return { ...result, checkpointReferencesCleared };
   }
 
   /**
@@ -542,17 +566,17 @@ export class MachineGateway {
     return fence;
   }
 
-  /** Open a machine-owned mailbox request for a registered workspace/session. */
-  openControlResultRequest(
+  /** Open a machine-owned Computer Use request for a registered workspace/session. */
+  openControlRequest(
     identity: MachineSurfaceIdentity,
-    input: Omit<OpenControlResultRequestInput, "localSessionId"> & { localSessionId?: never },
-  ): OpenControlResultRequestStatus {
+    input: Omit<OpenControlRequestInput, "localSessionId"> & { localSessionId?: never },
+  ): OpenControlRequestStatus {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
     const surface = currentSurfaceLease(
       identity.projectId,
       identity.localSessionId,
     );
-    const opened = openControlResultRequestWithStatus(identity.workspaceId, {
+    const opened = openControlRequestWithStatus(identity.workspaceId, {
       ...input,
       localSessionId: identity.localSessionId,
       surfaceGeneration: surface?.generation,
@@ -568,70 +592,49 @@ export class MachineGateway {
         ));
       } catch (error) {
         // No prompt/capability has been issued yet. Do not leave an orphan pending request.
-        cancelControlResultRequest(identity.workspaceId, opened.request.requestId, identity.localSessionId, input);
+        cancelControlRequest(identity.workspaceId, opened.request.requestId, identity.localSessionId, input);
         throw error;
       }
     }
     return opened;
   }
 
-  getControlResultStatus(
+  getControlRequestStatus(
     identity: MachineSurfaceIdentity,
     requestId: string,
     expected?: ControlResultCorrelation,
-  ): ControlStatus {
+  ): ControlRequestSnapshot {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
-    return getControlResultStatus(identity.workspaceId, requestId, identity.localSessionId, expected);
+    return getControlRequestStatus(identity.workspaceId, requestId, identity.localSessionId, expected);
   }
 
-  waitForControlResult(
+  waitForControlRequest(
     identity: MachineSurfaceIdentity,
     requestId: string,
     timeoutMs: number,
     expected?: ControlResultCorrelation,
     signal?: AbortSignal,
-  ): Promise<ControlStatus> {
+  ): Promise<ControlRequestSnapshot> {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
-    return waitForControlResult(
+    return waitForControlRequest(
       identity.workspaceId,
       requestId,
       timeoutMs,
       identity.localSessionId,
       expected,
       signal,
-      // Computer Use is the producer; repeated mailbox reads cannot observe the page.
       CONTROL_PAGE_CHECK_INTERVAL_MS,
-      this.resultTransport,
     );
   }
 
-  acknowledgeControlResult(
+  cancelControlRequest(
     identity: MachineSurfaceIdentity,
     requestId: string,
     expected: ControlResultCorrelation,
-  ): ControlStatus {
-    this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
-    const status = getControlResultStatus(identity.workspaceId, requestId, identity.localSessionId, expected);
-    if (controlWaitPolicy(status, this.resultTransport).outcome === "transport_mismatch") {
-      throw new ControlMailboxError(
-        "CONTROL_RESULT_TRANSPORT_MISMATCH",
-        "control result was recorded by the inactive transport and cannot be acknowledged",
-      );
-    }
-    if (this.resultTransport !== "mailbox") {
-      throw new ControlMailboxError("MAILBOX_RESULT_NOT_READY", "control ack is available only when mailbox is the active transport");
-    }
-    return acknowledgeControlResult(identity.workspaceId, requestId, identity.localSessionId, expected);
-  }
-
-  cancelControlResultRequest(
-    identity: MachineSurfaceIdentity,
-    requestId: string,
-    expected: ControlResultCorrelation,
-  ): ControlStatus {
+  ): ControlRequestSnapshot {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
     try {
-      const status = cancelControlResultRequest(
+      const status = cancelControlRequest(
         identity.workspaceId,
         requestId,
         identity.localSessionId,
@@ -643,7 +646,7 @@ export class MachineGateway {
       return status;
     } catch (error) {
       try {
-        const latest = this.getControlResultStatus(identity, requestId, expected);
+        const latest = this.getControlRequestStatus(identity, requestId, expected);
         if (latest.status === "cancelled") {
           this.broker.revokeRequest({ ...identity, ...expected, requestId });
         }
@@ -660,9 +663,9 @@ export class MachineGateway {
     // must not follow an optional argument.
     expected: ControlResultCorrelation | undefined,
     input: unknown,
-  ): ControlStatus {
+  ): ControlRequestSnapshot {
     this.registry.lookup(identity.workspaceId, identity.projectId, identity.registrationId);
-    const status = this.getControlResultStatus(identity, requestId, expected);
+    const status = this.getControlRequestStatus(identity, requestId, expected);
     let observation: ControlPageObservation;
     try {
       observation = parseControlPageObservation(input);
@@ -670,7 +673,7 @@ export class MachineGateway {
       if (status.status === "cancelled" && status.pageObservation &&
           isExactLegacyControlPageObservationReplay(status.pageObservation, input)) {
         try {
-          return observeControlResultRequest(identity.workspaceId, requestId, identity.localSessionId, expected, input);
+          return observeControlRequest(identity.workspaceId, requestId, identity.localSessionId, expected, input);
         } finally {
           this.broker.revokeRequest({ ...identity, ...correlationFromStoredRequest(requestId, status.request), requestId });
         }
@@ -681,14 +684,6 @@ export class MachineGateway {
             lastDefinitive: status.lateEvidence,
           }, input)) return status;
       throw error;
-    }
-    if (this.resultTransport === "mailbox" &&
-        ((observation.state === "result_candidate" && "delivery" in observation) ||
-          (observation.state === "final" && "delivery" in observation))) {
-      throw new ControlMailboxError(
-        "CONTROL_RESULT_TRANSPORT_MISMATCH",
-        "Computer Use result observations cannot complete a mailbox transport request",
-      );
     }
     if (status.lateEvidence && status.status !== "pending" && canonicalJson(status.lateEvidence) === canonicalJson(observation)) return status;
     if (status.status !== "pending" && status.status !== "cancelled" && status.status !== "expired") return status;
@@ -707,7 +702,7 @@ export class MachineGateway {
       }
       const preserved = recordLateControlEvidence(identity.workspaceId, requestId, identity.localSessionId, correlation, observation);
       if (preserved.status !== "pending") return preserved;
-      return observeControlResultRequest(identity.workspaceId, requestId, identity.localSessionId, correlation, {
+      return observeControlRequest(identity.workspaceId, requestId, identity.localSessionId, correlation, {
         tabId: observation.tabId, generation: observation.generation,
         responseToRequestId: requestId, observedAt: observation.observedAt,
         observationSequence: observation.observationSequence,
@@ -721,7 +716,7 @@ export class MachineGateway {
     }
     if (status.status === "cancelled" && (status.hostFailure !== undefined || status.hostObservedResult !== undefined)) {
       try {
-        return observeControlResultRequest(
+        return observeControlRequest(
           identity.workspaceId,
           requestId,
           identity.localSessionId,
@@ -807,14 +802,14 @@ export class MachineGateway {
     }
     this.assertSurfaceMutationAllowed(identity.projectId, identity.localSessionId);
     try {
-      const resolved = observeControlResultRequest(
+      const resolved = observeControlRequest(
         identity.workspaceId,
         requestId,
         identity.localSessionId,
         expected,
         observation,
         observation.state === "generating" ? () => {
-          // The mailbox validates sequence and response identity before invoking this callback.
+          // Validate response identity before extending the request lease.
           if (recoverableRoute) lease = recoverSurface(binding!, currentOwnerProcessEpoch());
           if (!lease) {
             throw new TurnCapabilityError("LEASE_NOT_FOUND", "generating observation requires the exact live surface lease");
@@ -831,7 +826,7 @@ export class MachineGateway {
       }
       return resolved;
     } catch (error) {
-      const latest = this.getControlResultStatus(identity, requestId, expected);
+      const latest = this.getControlRequestStatus(identity, requestId, expected);
       if (latest.status === "cancelled") {
         this.broker.revokeRequest({ ...identity, ...correlation, requestId });
       }
@@ -840,79 +835,7 @@ export class MachineGateway {
   }
 
   /**
-   * Read mailbox state through the live capability. This prevents MCP callers
-   * from selecting another registered workspace by changing only request ids.
    */
-  controlResultStatusForTurn(
-    contextId: string,
-  ): ControlStatus {
-    const binding = this.controlBindingForTurn(contextId);
-    return getControlResultStatus(
-      binding.workspaceId,
-      binding.requestId,
-      binding.localSessionId,
-      { taskId: binding.taskId, iteration: binding.iteration, phase: binding.phase },
-    );
-  }
-
-  controlProgressForTurn(contextId: string, input: unknown): ControlProgressReceipt {
-    const binding = this.controlBindingForTurn(contextId);
-    const update = parseControlProgressUpdate(input);
-    const reported = parseReportControlProgressInput({
-      requestId: binding.requestId,
-      localSessionId: binding.localSessionId,
-      taskId: binding.taskId,
-      iteration: binding.iteration,
-      phase: binding.phase,
-      ...update,
-    });
-    return reportControlProgress(binding.workspaceId, reported);
-  }
-
-  /**
-   * Publish one result and consume its completion fence in one synchronous
-   * machine transaction. Surface mutations are rejected while this section is
-   * active, so the final generation check cannot be separated from publication.
-   */
-  completeControlResult(
-    contextId: string,
-    fenceInput: string | Pick<TurnCompletionFence, "fence">,
-    input: unknown,
-  ): ControlResultReceipt {
-    const binding = bindingForStatus(this.broker, contextId);
-    const sessionKey = this.controlSessionKey(binding.projectId, binding.localSessionId);
-    const fence = fenceOf(fenceInput);
-    if (this.controlCompletionFences.get(fence) !== sessionKey) {
-      throw new TurnCapabilityError("COMPLETION_FENCE_INVALID", "completion fence does not belong to this control session");
-    }
-    try {
-      // The fence is a second bearer secret, so bind it to the context before
-      // parsing or publishing the result. Otherwise context B could consume
-      // context A's fence after submitting B's mailbox result.
-      this.broker.assertCompletionFence(contextId, binding, fence);
-      const submission = parseControlResultSubmission(input);
-      const controlBinding = this.controlBindingForTurn(contextId);
-      const parsed = parseSubmitControlResultInput({
-        requestId: controlBinding.requestId,
-        localSessionId: controlBinding.localSessionId,
-        taskId: controlBinding.taskId,
-        iteration: controlBinding.iteration,
-        phase: controlBinding.phase,
-        ...submission,
-      });
-      const status = this.broker.status(contextId);
-      if (status.status !== "completing") {
-        throw new TurnCapabilityError("COMPLETION_FENCE_INVALID", "turn is no longer completing");
-      }
-      this.validateSurface(contextId, binding);
-      const receipt = submitControlResult(binding.workspaceId, parsed);
-      this.broker.complete(fence);
-      return receipt;
-    } finally {
-      this.controlSubmissionSessions.delete(sessionKey);
-      this.controlCompletionFences.delete(fence);
-    }
-  }
 
   completeTurn(
     fenceInput: string | Pick<TurnCompletionFence, "fence">
