@@ -906,6 +906,65 @@ describe("persistent ChatGPT surface ownership", () => {
     expect(currentSurfaceLease("project-alpha", leases[0].localSessionId, afterExpiry)).toBeNull();
   });
 
+  it("falls back to a retained binding generation when an expired replacement lease is reaped across projects", () => {
+    stateDir();
+    claim("session-preserved-binding", "tab-preserved-binding", {
+      projectId: "project-beta",
+      projectUrl: OTHER_PROJECT_URL,
+      chatUrl: OTHER_CHAT_URL,
+    });
+    for (let index = 0; index < 52; index += 1) {
+      claimOnly(`session-preserved-${index}`, `tab-preserved-${index}`, { chatUrl: undefined });
+    }
+
+    const bindingLease = claim("session-expired-candidate", "tab-generation-54", {
+      chatUrl: CHAT_URL.replace("chat-main", "chat-generation-54"),
+    });
+    const candidate55 = claimOnly("session-expired-candidate", "tab-generation-55", {
+      chatUrl: CHAT_URL.replace("chat-main", "chat-generation-55"),
+      leaseTtlMs: 1_000,
+      replaces: bindingLease,
+    });
+    const expiredCandidate = claimOnly("session-expired-candidate", "tab-generation-56", {
+      chatUrl: CHAT_URL.replace("chat-main", "chat-generation-56"),
+      leaseTtlMs: 1_000,
+      replaces: candidate55,
+    });
+    const afterExpiry = new Date(START.getTime() + 1_001);
+    const ownerKey = "project-alpha\u0000session-expired-candidate";
+    const before = JSON.parse(fs.readFileSync(machineSurfaceOwnershipFile(), "utf8")) as {
+      nextGeneration: number;
+      leases: Array<{ projectId: string; localSessionId: string; generation: number }>;
+      bindings: Array<{ projectId: string; localSessionId: string; lastGeneration: number }>;
+      generations: Record<string, number>;
+    };
+
+    expect(expiredCandidate.generation).toBe(56);
+    expect(before.nextGeneration).toBe(57);
+    expect(before.generations[ownerKey]).toBe(56);
+    expect(before.bindings.find((entry) => entry.localSessionId === "session-expired-candidate")?.lastGeneration).toBe(54);
+    const preservedLeases = before.leases.filter((entry) => entry.localSessionId !== "session-expired-candidate");
+
+    expect(listSurfaceLeases("project-beta", afterExpiry)).toHaveLength(1);
+    const afterReap = JSON.parse(fs.readFileSync(machineSurfaceOwnershipFile(), "utf8")) as typeof before;
+    expect(afterReap.leases).toEqual(preservedLeases);
+    expect(afterReap.bindings).toEqual(before.bindings);
+    expect(afterReap.generations[ownerKey]).toBe(54);
+    expect(afterReap.nextGeneration).toBe(57);
+
+    const nextProjectLease = claimOnly("session-new-project", "tab-new-project", {
+      projectId: "project-beta",
+      projectUrl: OTHER_PROJECT_URL,
+      chatUrl: OTHER_CHAT_URL.replace("chat-other", "chat-new-project"),
+      now: afterExpiry,
+    });
+    expect(nextProjectLease.generation).toBe(57);
+    expect(JSON.parse(fs.readFileSync(machineSurfaceOwnershipFile(), "utf8"))).toMatchObject({
+      nextGeneration: 58,
+      generations: { [ownerKey]: 54 },
+    });
+  });
+
   it("reclaims expired leases on restart while preserving tab binding and generation", () => {
     stateDir();
     const first = claim("session-a", "tab-a", {

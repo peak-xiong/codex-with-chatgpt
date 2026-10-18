@@ -1360,14 +1360,13 @@ function reapMachineExpiredLeases(machine: MachineSurfaceOwnershipState, at: Dat
 }
 
 function pruneMachineGenerations(machine: MachineSurfaceOwnershipState): void {
-  const activeSessions = new Set(
-    [...machine.leases, ...machine.bindings].map((entry) =>
-      sessionKey(entry.projectId, entry.localSessionId),
-    ),
-  );
-  machine.generations = Object.fromEntries(
-    Object.entries(machine.generations).filter(([key]) => activeSessions.has(key)),
-  );
+  // Session generations derive from surviving ownership; nextGeneration keeps the global high-water mark.
+  const generations: Record<string, number> = {};
+  for (const entry of [...machine.leases, ...machine.bindings]) {
+    const key = sessionKey(entry.projectId, entry.localSessionId);
+    generations[key] = Math.max(generations[key] ?? 0, entryGeneration(entry));
+  }
+  machine.generations = generations;
 }
 
 function assertMachineRequestAvailable(
