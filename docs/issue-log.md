@@ -73,11 +73,12 @@
   已有回归覆盖。两台真实电脑同时运行的跨设备网页验收仍需分别在各设备完成；本地
   模拟不能证明另一台电脑的实际安装或 ChatGPT 插件到公网地址的远端关联。
 
-## Computer Use 单通道对比模式
+## Computer Use 单通道对比模式（历史记录；回调已正式退役）
 
 - 2026-09-07：按用户要求临时停用 mailbox 结果回调。实现与历史数据保留，但生产
   MCP 不再注册 `get_control_result_status`、`report_control_progress` 和
-  `submit_control_result`，`control open` 不再授予 `c2c.result.write`。
+  `submit_control_result`，`control open` 不再授予 `c2c.result.write`。2026-10-18
+  C2C-032 已正式移除 callback/progress/ack 通道；以下为当时的历史状态，不代表当前能力。
 - ChatGPT 每次必须在精确回复末尾输出 `C2C_HOST_OBSERVED_RESULT`、对应的
   `RESULT_REQUEST_ID` 和一个阶段匹配的 `{kind,payload}`。Computer Use 只检查本地
   会话绑定的精确 tab/chat/generation/response，Gateway 再校验关联、时效、schema
@@ -85,7 +86,8 @@
 - 正常页面结果使用 `delivery: computer_use`，不再伪装成 `callback_missing`；
   `BLOCKED` 同样在首个最终回复中返回，无需用户打断或追问。BOOT 页面绑定也接受
   经过同样校验的 Computer Use 结果。
-- mailbox 回调仍有隔离测试入口，用于未来恢复后的 A/B 对比；它不是当前生产路径。
+- 当时记录保留了 mailbox 回调隔离测试入口，设想用于未来恢复后的 A/B 对比；该设想已随
+  C2C-032 正式退役结果通道而作废，当前不存在 callback 测试入口或恢复后的 A/B 路径。
 
 ## 拒绝与终止回传收口
 
@@ -398,3 +400,9 @@
 | ID | 问题 | 实现及验收状态 |
 | --- | --- | --- |
 | C2C-032 | 删除休眠 mailbox callback/progress/ack 与 `c2c.result.write`，迁移有效 Computer Use 请求历史并清理本工作区旧 root | **实现与自动验证：**`c2c control clear-legacy-mailbox -w <path> --local-session <id> --json` 调用 `/admin/control/clear-legacy-mailbox`；Gateway 按精确 workspace registration 执行，并要求全局 active/draining 为零。请求存储迁至 `control-requests/<workspaceId>`，迁移只保留完整有效的 Computer Use 请求历史；callback-only 请求不迁移。`session.checkpoint` 使用 `controlRequestId`/`controlPhase`，缺失或无效 marker 以 host-only `reason: result_invalid`、`source: host_observed` 表示；旧 `callback_missing` 仅供历史读取。最终 `full-final-04` 退出码 0，46 个文件、622 项通过，耗时 279.32 秒；typecheck 与 build 均退出码 0。测试请求并发 8 时曾遇到一次 `ECONNRESET`；将测试发送并发降至 4 后，定向与全量验证均通过，仍保留 100-session/grant 隔离断言，未增加重试或修改生产权限、超时。<br><br>**本机安装与运行：**提交 `054db72` 已安装，安装 source revision 与提交一致，全局 Skill 已同步。最终 `doctor` 为 healthy，autostart loaded 且无 drift，`activeTurnCount=0`、`draining=0`。公开 MCP 的 12 个只读工具全部带 `outputSchema`，callbacks 已不存在。<br><br>**旧数据清理：**迁移 13 项请求历史后，旧 root 已删除、1 个旧 checkpoint 引用已清除、live request 为 0；重放确认无重复删除。20 条旧 callback result 均已删除且不可再投递；其中 16 条的请求 metadata 为 `not_found`，另 4 条仅作为 Computer Use 绑定历史保留 expired request metadata；2 条旧 BLOCKED 记录均已 expired 且无 result。8 个已绑定 Computer Use 的 host marker 保留，1 个 unbound marker 排除。其余 138 个 roots 哈希不变，auth、另一 session 和原工作区三份文档均未改变；私有 probe 已删除。<br><br>**真实网页验收：**新 BOOT 与 RESEARCH 请求均在 generation 55 的专属 tab 完成；candidate 阶段均保持 `result=null`。RESEARCH 首次出现完整结果文本时停止控件仍可见，因此未判为完成；待页面显示完成及复制/重新生成操作且停止控件消失后才接受 candidate。fresh UI 对同一精确 URL 复查得到完全一致的回复文本，最终 wait 为 `delivered`、delivery 为 `computer_use`；public wait 退出码 0。隐藏 probe nonce 与实际现场读取值完全匹配，永久记录不包含该值。`read_many` 返回 2 项成功及 1 项可选 `FILE_NOT_FOUND`，`atomicSnapshot=false`，工具 `observedAt=2026-10-17T16:24:14.737Z`；页面 handoff 标记保留。详细证据见 `/tmp/c2c-remove-mailbox/closure-verification.json`、`research-ui-candidate.json`、`research-candidate-accepted.json`、`research-ui-final.json`、`research-final-accepted.json`、`research-public-wait.json`、`doctor-final.json`、`live-tool-discovery.json`、`cleanup-verification.json`。未 push 或 merge。 |
+
+## 2026-10-18 C2C-051 清理 callback 残留 API 与过时状态说明
+
+| ID | 问题 | 实现及验收状态 |
+| --- | --- | --- |
+| C2C-051 | 测试专用的 `recordControlHostFailure` 包装及 receipt 时代注释仍暗示 mailbox 回执路径；历史 A/B 说明未标出正式退役 | 移除仅被测试调用、未对外承诺为 package API 的包装，让 wait/终态测试直接验证 `observeControlRequest`；更正过时 receipt 注释。单通道章节标记为历史并说明 A/B 测试入口设想已随 C2C-032 作废。保留仍有消费者的旧数据迁移和通用 turn completion fence。定向 Vitest 4 个文件、88 项通过，Vitest 真实退出码 0，日志 `/tmp/c2c-mailbox-cleanup-20261018/logs/focused-vitest.log`；`pnpm typecheck` 与 `pnpm build` 真实退出码均为 0，日志分别见同目录 `typecheck.log`、`build.log`。未做真实网页或部署验收。 |

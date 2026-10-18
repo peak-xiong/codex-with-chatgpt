@@ -4,7 +4,7 @@ import path from "node:path";
 import {
   getActiveControlRequestStatus, getControlRequestStatus, getControlRequestsDir,
   pruneControlRequests,
-  openControlRequest, recordControlHostFailure, waitForControlRequest,
+  observeControlRequest, openControlRequest, waitForControlRequest,
 } from "../src/control/requests.js";
 import {
   advanceControlPageObservation,
@@ -949,14 +949,14 @@ describe("exact response terminal observations", () => {
     expect(controlWaitPolicy(acceptedCandidate)).toMatchObject({ outcome: "pending", nextAction: "confirm_response_final" });
 
     const wrongResponse = { ...finalForHostFailureCandidate(candidate), responseId: "replacement-response" };
-    expect(() => recordControlHostFailure(
+    expect(() => observeControlRequest(
       f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation, wrongResponse,
     )).toThrow(/replacement response or URL/);
     const earlyFinal = {
       ...finalForHostFailureCandidate(candidate),
       observedAt: new Date(Date.parse(candidate.observedAt) + 1).toISOString(),
     };
-    expect(() => recordControlHostFailure(
+    expect(() => observeControlRequest(
       f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation, earlyFinal,
     )).toThrow(/fresh stability recheck/);
     expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
@@ -969,7 +969,7 @@ describe("exact response terminal observations", () => {
       observationSequence: resumed.observationSequence + 1,
       observedAt: new Date(Date.parse(resumed.observedAt) + 1).toISOString(),
     };
-    expect(() => recordControlHostFailure(
+    expect(() => observeControlRequest(
       f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation, oldCandidateFinal,
     )).toThrow(/exact response lifecycle/);
     expect(f.gateway.getControlRequestStatus(f.identity, f.request.requestId, correlation).status).toBe("pending");
@@ -982,7 +982,7 @@ describe("exact response terminal observations", () => {
     f.gateway.observeControlPage(f.identity, f.request.requestId, correlation, resumedCandidate);
     vi.setSystemTime(Date.now() + 1_500);
     const final = finalForHostFailureCandidate(resumedCandidate);
-    const status = recordControlHostFailure(
+    const status = observeControlRequest(
       f.identity.workspaceId, f.request.requestId, f.identity.localSessionId, correlation, final,
     );
     expect(status).toMatchObject({

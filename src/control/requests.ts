@@ -1032,14 +1032,14 @@ function lateEvidenceFile(workspaceId: string, requestId: string, root?: string)
   return path.join(requestStoreRoot(workspaceId, root), "late-evidence", `${validateControlId(requestId, "request id")}.json`);
 }
 
-/** Preserve a verified exact response without renewing authority or publishing a receipt. */
+/** Preserve a verified exact response after authority ends; it remains evidence only. */
 export function recordLateControlEvidence(
   workspaceId: string, requestId: string, localSessionId: string,
   expected: ControlResultCorrelation, input: unknown,
 ): ControlRequestSnapshot {
   return withFileLock(requestLockFile(workspaceId, requestId), () => {
     const status = getControlRequestStatus(workspaceId, requestId, localSessionId, expected);
-    // A receipt or terminal outcome racing this observation wins unchanged.
+    // An existing terminal outcome remains authoritative.
     if (status.status !== "pending" && status.status !== "expired" &&
         !(status.status === "cancelled" && status.hostFailure && !status.hostObservedResult)) return status;
     if (status.lateEvidence?.state === "final" && isExactLegacyControlPageObservationReplay({
@@ -1452,23 +1452,7 @@ export function observeControlRequest(
   );
 }
 
-/** Host observations cancel pending work, never manufacture an MCP result. Receipt wins under the request lock. */
-export function recordControlHostFailure(
-  workspaceId: string,
-  requestId: string,
-  localSessionId: string,
-  expected: ControlResultCorrelation,
-  observation: ControlTerminalObservation,
-): ControlRequestSnapshot {
-  const parsed = controlTerminalObservationSchema.safeParse(observation);
-  if (!parsed.success) throw new ControlRequestError("INVALID_RESULT", "invalid host failure observation");
-  if (parsed.data.state === "final" && "delivery" in parsed.data) {
-    throw new ControlRequestError("INVALID_RESULT", "computer use results are not host failures");
-  }
-  return observeControlRequest(workspaceId, requestId, localSessionId, expected, parsed.data);
-}
-
-/** Extend only pending work under the same locks used by receipts and cancellation. */
+/** Extend only pending work under the same locks used by page observations and cancellation. */
 export function renewControlRequest(
   workspaceId: string,
   requestId: string,
